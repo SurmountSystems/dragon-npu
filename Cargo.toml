@@ -1,0 +1,70 @@
+[package]
+name = "dragon-npu"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dragonfire Project <contact@dragonfire.ai>"]
+description = "Production-quality Rust library for vendor-agnostic NPU acceleration on Linux (AMD XDNA, Intel VPU, Qualcomm Hexagon, simulation). Library-first rewrite with strict error handling."
+license = "MIT"
+repository = "https://github.com/dragonfire/dragon-npu"
+keywords = ["npu", "ai", "acceleration", "linux", "inference"]
+categories = ["science", "hardware-support"]
+readme = "README.md"
+
+[lib]
+name = "dragon_npu"
+
+[dependencies]
+thiserror = "2.0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Real ONNX protobuf parsing (chosen after autonomous 2026 research spike).
+# tract-onnx gives direct access to pb::ModelProto / GraphProto / NodeProto / TensorProto
+# via prost, plus convenient loaders. This is the fastest path to replacing our JSON/.txt
+# heuristics with real model loading (shapes, dtypes, weights, topology).
+# See session research subagent output for alternatives (rten-onnx, oxionnx-proto) if we
+# later want a leaner custom decoder.
+tract-onnx = "0.22.1"
+# prost is used for decoding the raw ONNX ModelProto (transitive from tract-onnx; pinned for reproducibility)
+prost = "0.11"
+
+# Used only for the lightweight direct amdxdna driver path (under the amd-xdna2 feature).
+# This keeps the direct implementation minimal and avoids pulling in heavier runtimes.
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Benchmarking and testing utilities (added when Phase 7 is reached)
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+default = ["simulation"]
+simulation = []          # Always-available CPU fallback backend
+amd-xdna2 = ["dep:libc"]   # AMD XDNA2 (Ryzen AI 300 / Strix Point & later) support — primary target for AMD backend work. Enables the lightweight direct driver (no heavy official runtimes).
+# OFF by default on purpose (2026-07-13 incident): scaffold EXEC_CMD oops'd amdxdna
+# (aie2_cmdlist_fill_slot) and wedged open(). NOT enabled by `amd-xdna2` alone.
+# Even with this feature, runtime still requires XDNA2_ALLOW_EXEC_CMD=1.
+# See docs/XDNA2_NEVER_AGAIN.md (L1 userspace permanent gate).
+xdna2-dangerous-exec-cmd = []
+intel-vpu = []           # Intel VPU (Meteor Lake+) support
+qualcomm-hexagon = []    # Qualcomm Hexagon (Snapdragon X) support
+
+[lints.rust]
+unsafe_code = "deny"   # relaxed to "deny" only to allow a narrow, well-scoped unsafe ioctl module under the amd-xdna2 feature for the lightweight direct driver. All other code remains strictly safe.
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Allow common patterns in early incremental development
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Relax pedantic lints that are too strict for Phase 1 stubs and docs
+missing_errors_doc = "allow"
+missing_const_for_fn = "allow"
+doc_markdown = "allow"
+# Expected when adding heavy crates like tract-onnx (brings older syn via build-deps or transitive)
+multiple_crate_versions = "allow"

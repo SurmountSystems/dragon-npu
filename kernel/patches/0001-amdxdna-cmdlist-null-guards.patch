@@ -1,0 +1,234 @@
+From: dragon-npu maintainers <devnull@localhost>
+Date: Mon, 13 Jul 2026 00:00:00 +0000
+Subject: [PATCH] accel/amdxdna: null-guard AIE2 cmdlist fill/execbuf paths
+
+Base: amd/xdna-driver @ 905717f5cd470580054a1635b9eea24b84dfd67f
+File revision (last touch of aie2_message.c): b9686b40a31149b4b2dd823d87be4567ba697618
+
+aie2_cmdlist_fill_slot immediately dereferences cmd_abo->client->xdna and
+calls EXEC_MSG_OPS(xdna)->fill_*_slot without validating pointers. A bad
+or scaffold EXEC_CMD from userspace (observed on 1022:17f0 / Ryzen AI 300)
+can NULL-deref in fill_slot; after the oops, amdxdna_drm_open waiters stick
+in D-state and module refcnt prevents unload.
+
+Add early -EINVAL/-ENODEV/-ENOMEM/-EOPNOTSUPP returns for:
+- null slot/cmd_abo/size/cmd_op and cmd_abo->client in fill_slot
+- null EXEC_MSG_OPS (and xdna/dev_handle) before ops callbacks
+- cmd BO vmap probe before amdxdna_cmd_get_op (helper still lacks NULL check)
+- null cmdbuf_abo/cmd_abo/chann/cmd_buf and job->ctx/priv in single/multi
+
+This does not implement TDR/FLR, open fail-fast, non-cmdlist aie2_execbuf
+guards, or full cmd-payload layout validation. Style mirrors aie4 cmd_submit
+ops null-check (PR #1441).
+
+SPDX-License-Identifier: GPL-2.0
+
+NOTE: Signed-off-by below is a dragon-npu in-tree placeholder for git am
+convenience only. Replace From/Signed-off-by with a real DCO identity before
+any amd/xdna-driver PR.
+
+Signed-off-by: dragon-npu maintainers <devnull@localhost>
+---
+--- a/src/driver/amdxdna/aie2_message.c
++++ b/src/driver/amdxdna/aie2_message.c
+@@ -1273,10 +1273,32 @@
+ aie2_cmdlist_fill_slot(void *slot, struct amdxdna_gem_obj *cmd_abo,
+ 		       size_t *size, u32 *cmd_op)
+ {
+-	struct amdxdna_dev *xdna = cmd_abo->client->xdna;
++	struct amdxdna_dev *xdna;
++	const struct aie2_exec_msg_ops *ops;
+ 	int ret;
+ 	u32 op;
+ 
++	/* Reject invalid args early; never deref NULL on the cmdlist path. */
++	if (!slot || !cmd_abo || !size || !cmd_op)
++		return -EINVAL;
++	if (!cmd_abo->client)
++		return -EINVAL;
++
++	xdna = cmd_abo->client->xdna;
++	if (!xdna || !xdna->dev_handle)
++		return -ENODEV;
++
++	ops = EXEC_MSG_OPS(xdna);
++	if (!ops)
++		return -EOPNOTSUPP;
++
++	/*
++	 * amdxdna_cmd_get_op() vmaps without a NULL check. Fail closed if the
++	 * command BO cannot be mapped (full fix belongs in the helper).
++	 */
++	if (!amdxdna_gem_vmap(cmd_abo))
++		return -ENOMEM;
++
+ 	op = amdxdna_cmd_get_op(cmd_abo);
+ 	if (*cmd_op == ERT_INVALID_CMD)
+ 		*cmd_op = op;
+@@ -1285,20 +1307,20 @@
+ 
+ 	switch (op) {
+ 	case ERT_START_CU:
+-		ret = EXEC_MSG_OPS(xdna)->fill_cf_slot(cmd_abo, slot, size);
++		ret = ops->fill_cf_slot(cmd_abo, slot, size);
+ 		break;
+ 	case ERT_START_NPU:
+-		ret = EXEC_MSG_OPS(xdna)->fill_dpu_slot(cmd_abo, slot, size);
++		ret = ops->fill_dpu_slot(cmd_abo, slot, size);
+ 		break;
+ 	case ERT_START_NPU_PREEMPT:
+ 		if (!AIE2_FEATURE_ON(xdna->dev_handle, AIE2_PREEMPT))
+ 			return -EOPNOTSUPP;
+-		ret = EXEC_MSG_OPS(xdna)->fill_preempt_slot(cmd_abo, slot, size);
++		ret = ops->fill_preempt_slot(cmd_abo, slot, size);
+ 		break;
+ 	case ERT_START_NPU_PREEMPT_ELF:
+ 		if (!AIE2_FEATURE_ON(xdna->dev_handle, AIE2_PREEMPT))
+ 			return -EOPNOTSUPP;
+-		ret = EXEC_MSG_OPS(xdna)->fill_elf_slot(cmd_abo, slot, size);
++		ret = ops->fill_elf_slot(cmd_abo, slot, size);
+ 		break;
+ 	default:
+ 		XDNA_INFO(xdna, "Unsupported op %d", op);
+@@ -1364,21 +1386,51 @@
+ 			       struct amdxdna_sched_job *job,
+ 			       int (*notify_cb)(void *, void __iomem *, size_t))
+ {
+-	struct amdxdna_gem_obj *cmdbuf_abo = aie2_cmdlist_get_cmd_buf(job);
+-	struct mailbox_channel *chann = ctx->priv->mbox_chann;
+-	struct amdxdna_gem_obj *cmd_abo = job->cmd_bo;
+-	void *cmd_buf = amdxdna_gem_vmap(cmdbuf_abo);
+-	struct amdxdna_client *client = ctx->client;
+-	struct amdxdna_dev *xdna = client->xdna;
++	struct amdxdna_gem_obj *cmdbuf_abo;
++	struct mailbox_channel *chann;
++	struct amdxdna_gem_obj *cmd_abo;
++	const struct aie2_exec_msg_ops *ops;
++	struct amdxdna_client *client;
++	struct amdxdna_dev *xdna;
+ 	struct amdxdna_cmd_chain *payload;
+ 	struct xdna_mailbox_msg msg;
+ 	union exec_chain_req req;
++	void *cmd_buf;
+ 	u32 op, i, ccnt;
+ 	u32 offset = 0;
+ 	u64 dev_addr;
+ 	size_t size;
+ 	int ret;
+ 
++	if (!ctx || !ctx->priv || !ctx->client || !job)
++		return -EINVAL;
++
++	client = ctx->client;
++	xdna = client->xdna;
++	if (!xdna || !xdna->dev_handle)
++		return -ENODEV;
++
++	chann = ctx->priv->mbox_chann;
++	if (!chann)
++		return -ENODEV;
++
++	ops = EXEC_MSG_OPS(xdna);
++	if (!ops)
++		return -EOPNOTSUPP;
++
++	/* get_cmd_buf does job->ctx->priv->cmd_buf[idx] without checks. */
++	if (!job->ctx || !job->ctx->priv)
++		return -EINVAL;
++
++	cmdbuf_abo = aie2_cmdlist_get_cmd_buf(job);
++	cmd_abo = job->cmd_bo;
++	if (!cmdbuf_abo || !cmd_abo)
++		return -EINVAL;
++
++	cmd_buf = amdxdna_gem_vmap(cmdbuf_abo);
++	if (!cmd_buf)
++		return -ENOMEM;
++
+ 	payload = amdxdna_cmd_get_chained_payload(cmd_abo, &ccnt);
+ 	if (!payload)
+ 		return -EINVAL;
+@@ -1408,13 +1460,13 @@
+ 			     amdxdna_gem_vmap(cmdbuf_abo), offset, false);
+ #endif
+ 
+-	msg.opcode = EXEC_MSG_OPS(xdna)->get_chain_msg_op(op);
++	msg.opcode = ops->get_chain_msg_op(op);
+ 	if (msg.opcode == MSG_OP_MAX_OPCODE)
+ 		return -EOPNOTSUPP;
+ 
+ 	/* The offset is the accumulated total size of the cmd buffer */
+ 	dev_addr = amdxdna_gem_dev_addr(cmdbuf_abo);
+-	EXEC_MSG_OPS(xdna)->init_chain_req(&req, dev_addr, offset, ccnt);
++	ops->init_chain_req(&req, dev_addr, offset, ccnt);
+ 	drm_clflush_virt_range(cmd_buf, offset);
+ 
+ 	msg.handle = job;
+@@ -1439,18 +1491,47 @@
+ 				struct amdxdna_sched_job *job,
+ 				int (*notify_cb)(void *, void __iomem *, size_t))
+ {
+-	struct amdxdna_gem_obj *cmdbuf_abo = aie2_cmdlist_get_cmd_buf(job);
+-	struct mailbox_channel *chann = ctx->priv->mbox_chann;
+-	struct amdxdna_dev *xdna = ctx->client->xdna;
+-	struct amdxdna_gem_obj *cmd_abo = job->cmd_bo;
+-	void *cmd_buf = amdxdna_gem_vmap(cmdbuf_abo);
++	struct amdxdna_gem_obj *cmdbuf_abo;
++	struct mailbox_channel *chann;
++	const struct aie2_exec_msg_ops *ops;
++	struct amdxdna_gem_obj *cmd_abo;
++	struct amdxdna_dev *xdna;
+ 	struct xdna_mailbox_msg msg;
+ 	union exec_chain_req req;
++	void *cmd_buf;
+ 	u32 op = ERT_INVALID_CMD;
+ 	u64 dev_addr;
+ 	size_t size;
+ 	int ret;
+ 
++	if (!ctx || !ctx->priv || !ctx->client || !job)
++		return -EINVAL;
++
++	xdna = ctx->client->xdna;
++	if (!xdna || !xdna->dev_handle)
++		return -ENODEV;
++
++	chann = ctx->priv->mbox_chann;
++	if (!chann)
++		return -ENODEV;
++
++	ops = EXEC_MSG_OPS(xdna);
++	if (!ops)
++		return -EOPNOTSUPP;
++
++	/* get_cmd_buf does job->ctx->priv->cmd_buf[idx] without checks. */
++	if (!job->ctx || !job->ctx->priv)
++		return -EINVAL;
++
++	cmdbuf_abo = aie2_cmdlist_get_cmd_buf(job);
++	cmd_abo = job->cmd_bo;
++	if (!cmdbuf_abo || !cmd_abo)
++		return -EINVAL;
++
++	cmd_buf = amdxdna_gem_vmap(cmdbuf_abo);
++	if (!cmd_buf)
++		return -ENOMEM;
++
+ 	size = cmdbuf_abo->mem.size;
+ 	ret = aie2_cmdlist_fill_slot(cmd_buf, cmd_abo, &size, &op);
+ 	if (ret)
+@@ -1460,12 +1541,12 @@
+ 			     amdxdna_gem_vmap(cmdbuf_abo), size, false);
+ #endif
+ 
+-	msg.opcode = EXEC_MSG_OPS(xdna)->get_chain_msg_op(op);
++	msg.opcode = ops->get_chain_msg_op(op);
+ 	if (msg.opcode == MSG_OP_MAX_OPCODE)
+ 		return -EOPNOTSUPP;
+ 
+ 	dev_addr = amdxdna_gem_dev_addr(cmdbuf_abo);
+-	EXEC_MSG_OPS(xdna)->init_chain_req(&req, dev_addr, size, 1);
++	ops->init_chain_req(&req, dev_addr, size, 1);
+ 	drm_clflush_virt_range(cmd_buf, size);
+ 
+ 	msg.handle = job;

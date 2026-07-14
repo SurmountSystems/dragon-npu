@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# L4 DKMS stage (full xdna-driver rsync — do not vendor into git)
+kernel/dkms/staging/
+
 # C extensions
 *.so
 
@@ -86,3 +89,6 @@ docs/api/
 # Test outputs
 test_outputs/
 benchmark_results/
+
+
+target/

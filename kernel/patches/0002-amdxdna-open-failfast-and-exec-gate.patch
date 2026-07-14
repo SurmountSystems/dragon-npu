@@ -1,0 +1,327 @@
+From: dragon-npu maintainers <devnull@localhost>
+Date: Mon, 13 Jul 2026 00:00:00 +0000
+Subject: [PATCH] accel/amdxdna: open fail-fast, exec_cmd_allow, killable dev_lock
+
+Base: amd/xdna-driver @ 905717f5cd470580054a1635b9eea24b84dfd67f
+
+Layer 3 hardening stacked after L2 cmdlist null-guards (apply 0001 then 0002).
+
+1. Sticky atomic_t dev_unhealthy on amdxdna_dev. Automatic mark is only on the
+   TDR dump-only stuck path (aie2_tdr_force_recover dump_only=true). Stock
+   module param tdr_dump_ctx defaults to false, so the periodic TDR worker
+   normally full-restarts and CLEARS the latch — open fail-fast does NOT
+   auto-arm under default params. Enable with tdr_dump_ctx=1 to latch after
+   stuck detect without restart. Do NOT mark from aie2_sched_job_run errno:
+   per-ctx mbox_chann NULL after unload returns -ENODEV while the scheduler
+   may still run. While latched: open, CREATE/CONFIG_HWCTX, EXEC_CMD, SET_STATE
+   return -EIO. DESTROY/WAIT/GET_INFO/BO remain for cleanup.
+
+2. Fail-fast open is the primary hang mitigation once latched. Secondary:
+   mutex_lock_killable(dev_lock) on the short client_list critical section;
+   re-check unhealthy after SVA and under dev_lock. iommu_sva_bind_device has
+   no killable/timeout API — residual hang risk documented; open is not
+   killable overall.
+
+3. Module param exec_cmd_allow = false (lab default) refuses the entire
+   DRM_IOCTL_AMDXDNA_EXEC_CMD ioctl (EXEC_BUF + DEPENDENCY + SIGNAL) with
+   -EPERM unless modprobe amdxdna exec_cmd_allow=1. Production/XRT needs =1.
+   Upstream may prefer default true.
+
+Always-on L3 under default module params: exec_cmd_allow=0, killable open
+dev_lock, latch infrastructure. Auto open fail-fast needs tdr_dump_ctx=1
+(or an explicit amdxdna_dev_mark_unhealthy call site).
+
+L3 alone does not latch after a hard oops (workqueue dies without clean
+errno) — stack L2 first so fill_slot cannot oops. Does not unstick already-D
+tasks. Automatic latch scope is AIE2 TDR path; AIE4 not covered yet.
+
+SPDX-License-Identifier: GPL-2.0
+
+NOTE: Signed-off-by below is a dragon-npu in-tree placeholder for git am
+convenience only. Replace From/Signed-off-by with a real DCO identity before
+any amd/xdna-driver PR.
+
+Signed-off-by: dragon-npu maintainers <devnull@localhost>
+---
+diff --git a/src/driver/amdxdna/aie2_ctx.c b/src/driver/amdxdna/aie2_ctx.c
+index a2f439b..25c9175 100644
+--- a/src/driver/amdxdna/aie2_ctx.c
++++ b/src/driver/amdxdna/aie2_ctx.c
+@@ -454,6 +454,20 @@ out:
+ 		mmput(job->mm);
+ 		fence = ERR_PTR(ret);
+ 		amdxdna_pm_suspend_put(ctx->client->xdna);
++		/*
++		 * Do NOT latch device-wide unhealthy on job errno here.
++		 * aie2_*_execbuf already returns -ENODEV when mbox_chann is
++		 * NULL; aie2_unload_hwctx() NULLs the channel while the DRM
++		 * scheduler may still run. Treating that -ENODEV as global
++		 * unhealthy would brick open/CREATE_HWCTX/EXEC_CMD after a
++		 * normal ctx teardown race. L2 also returns -ENODEV for
++		 * !dev_handle (structural) and -EINVAL/-ENOMEM/-EOPNOTSUPP
++		 * for bad cmdlist — all of which are per-job, not device-dead.
++		 *
++		 * Automatic latch is TDR dump-only (aie2_tdr_force_recover).
++		 * Explicit amdxdna_dev_mark_unhealthy() remains available for
++		 * true device-gone call sites.
++		 */
+ 	} else {
+ 		if (job->opcode != OP_NOOP)
+ 			amdxdna_stats_start(ctx->client);
+diff --git a/src/driver/amdxdna/aie2_tdr.c b/src/driver/amdxdna/aie2_tdr.c
+index 5b29d7c..55e29d0 100644
+--- a/src/driver/amdxdna/aie2_tdr.c
++++ b/src/driver/amdxdna/aie2_tdr.c
+@@ -41,10 +41,18 @@ void aie2_tdr_force_recover(struct amdxdna_dev *xdna, bool dump_only)
+ 
+ 	guard(mutex)(&xdna->dev_lock);
+ 	aie2_rq_dump_all(rq);
+-	if (dump_only)
++	if (dump_only) {
++		/*
++		 * Dump-only: device was stuck and we are not restarting — latch
++		 * unhealthy so new opens fail fast instead of D-state piling up.
++		 */
++		amdxdna_dev_mark_unhealthy(xdna, "tdr dump-only stuck detect");
+ 		return;
++	}
+ 	aie2_rq_stop_all(rq);
+ 	aie2_rq_restart_all(rq);
++	/* Best-effort: recover path completed; allow open/ioctls again. */
++	amdxdna_dev_clear_unhealthy(xdna);
+ }
+ 
+ static void aie2_tdr_work(struct work_struct *work)
+diff --git a/src/driver/amdxdna/amdxdna_ctx.c b/src/driver/amdxdna/amdxdna_ctx.c
+index 3cd0c5b..03ac0b4 100644
+--- a/src/driver/amdxdna/amdxdna_ctx.c
++++ b/src/driver/amdxdna/amdxdna_ctx.c
+@@ -15,6 +15,19 @@
+ #include "amdxdna_ctx.h"
+ #include "amdxdna_trace.h"
+ 
++/*
++ * Lab bring-up gate (Layer 3). Default false so a patched lab module cannot
++ * accept DRM_IOCTL_AMDXDNA_EXEC_CMD unless explicitly enabled — matches
++ * userspace double-gate posture. Gates the *entire* ioctl (EXEC_BUF,
++ * DEPENDENCY, and SIGNAL subtypes), not only EXEC_BUF.
++ * Production / XRT hosts should load with exec_cmd_allow=1 (modprobe option).
++ * An upstream PR may prefer default 1; this series documents the lab default.
++ */
++bool exec_cmd_allow = false;
++module_param(exec_cmd_allow, bool, 0644);
++MODULE_PARM_DESC(exec_cmd_allow,
++		 "Allow DRM_IOCTL_AMDXDNA_EXEC_CMD (all subtypes; default 0/lab; set 1 for production/XRT)");
++
+ #define MAX_CTX_ID		255
+ #define MAX_ARG_COUNT		4095
+ 
+@@ -97,6 +110,11 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
+ 
+ 	trace_amdxdna_debug_point(current->comm, client->pid, "create hwctx");
+ 
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		XDNA_ERR(xdna, "CREATE_HWCTX refused: device unhealthy");
++		return -EIO;
++	}
++
+ 	if (args->ext || args->ext_flags)
+ 		return -EINVAL;
+ 
+@@ -214,6 +232,11 @@ int amdxdna_drm_config_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
+ 
+ 	trace_amdxdna_debug_point(current->comm, client->pid, "config hwctx");
+ 
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		XDNA_ERR(xdna, "CONFIG_HWCTX refused: device unhealthy");
++		return -EIO;
++	}
++
+ 	if (!xdna->dev_info->ops->ctx_config)
+ 		return -EOPNOTSUPP;
+ 
+@@ -728,9 +751,21 @@ out:
+ int amdxdna_drm_submit_cmd_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct amdxdna_client *client = filp->driver_priv;
++	struct amdxdna_dev *xdna = client->xdna;
+ 	struct amdxdna_drm_exec_cmd *args = data;
+ 	int ret;
+ 
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		XDNA_ERR(xdna, "EXEC_CMD refused: device unhealthy");
++		return -EIO;
++	}
++
++	if (!exec_cmd_allow) {
++		XDNA_ERR(xdna,
++			 "EXEC_CMD refused (all subtypes): module param exec_cmd_allow=0 (lab default)");
++		return -EPERM;
++	}
++
+ 	if (args->ext || args->ext_flags)
+ 		return -EINVAL;
+ 
+diff --git a/src/driver/amdxdna/amdxdna_drm.c b/src/driver/amdxdna/amdxdna_drm.c
+index 357d5fc..3bd56a5 100644
+--- a/src/driver/amdxdna/amdxdna_drm.c
++++ b/src/driver/amdxdna/amdxdna_drm.c
+@@ -17,12 +17,39 @@
+ #define CREATE_TRACE_POINTS
+ #include "amdxdna_trace.h"
+ 
++
++void amdxdna_dev_mark_unhealthy(struct amdxdna_dev *xdna, const char *reason)
++{
++	if (!xdna)
++		return;
++	if (atomic_xchg(&xdna->dev_unhealthy, 1) == 0)
++		XDNA_ERR(xdna, "device marked unhealthy (%s): open/selected ioctls fail-fast -EIO",
++			 reason ? reason : "unknown");
++}
++
++void amdxdna_dev_clear_unhealthy(struct amdxdna_dev *xdna)
++{
++	if (!xdna)
++		return;
++	if (atomic_xchg(&xdna->dev_unhealthy, 0) != 0)
++		XDNA_WARN(xdna, "device unhealthy latch cleared");
++}
++
+ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
+ {
+ 	struct amdxdna_dev *xdna = to_xdna_dev(ddev);
+ 	struct amdxdna_client *client;
+ 	int ret;
+ 
++	/*
++	 * Fail fast before SVA bind / any long wait. Once unhealthy is latched,
++	 * new opens must not pile up in uninterruptible sleep (D-state wedge).
++	 */
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		XDNA_ERR(xdna, "open refused: device unhealthy");
++		return -EIO;
++	}
++
+ 	client = kzalloc(sizeof(*client), GFP_KERNEL);
+ 	if (!client)
+ 		return -ENOMEM;
+@@ -36,6 +63,11 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
+ 		goto skip_sva_bind;
+ #endif
+ 	if (!amdxdna_iova_enabled(xdna)) {
++		/*
++		 * iommu_sva_bind_device() has no killable/timeout API; residual
++		 * hang risk remains if the IOMMU path wedges after we pass the
++		 * unhealthy check. Prefer fail-fast latch above.
++		 */
+ 		client->sva = iommu_sva_bind_device(xdna->ddev.dev, current->mm);
+ 		if (IS_ERR(client->sva)) {
+ 			ret = PTR_ERR(client->sva);
+@@ -54,11 +86,35 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
+ #ifdef AMDXDNA_DEVEL
+ skip_sva_bind:
+ #endif
++	/*
++	 * Re-check after SVA: another path may have latched unhealthy during
++	 * bind (primary hang risk is still unkillable iommu_sva_bind_device).
++	 */
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		XDNA_ERR(xdna, "open refused after SVA: device unhealthy");
++		ret = -EIO;
++		goto unbind_sva;
++	}
++
+ 	init_srcu_struct(&client->ctx_srcu);
+ 	xa_init_flags(&client->ctx_xa, XA_FLAGS_ALLOC);
+ 	mutex_init(&client->mm_lock);
+ 
+-	mutex_lock(&xdna->dev_lock);
++	/*
++	 * Secondary: killable wait only for short dev_lock (list_add). Does not
++	 * make open killable overall — SVA bind remains unkillable.
++	 */
++	ret = mutex_lock_killable(&xdna->dev_lock);
++	if (ret) {
++		XDNA_ERR(xdna, "open: dev_lock killable wait failed, ret %d", ret);
++		goto destroy_client_partial;
++	}
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		mutex_unlock(&xdna->dev_lock);
++		XDNA_ERR(xdna, "open refused under dev_lock: device unhealthy");
++		ret = -EIO;
++		goto destroy_client_partial;
++	}
+ 	list_add_tail(&client->node, &xdna->client_list);
+ 	mutex_unlock(&xdna->dev_lock);
+ 
+@@ -73,9 +129,15 @@ skip_sva_bind:
+ 	XDNA_DBG(xdna, "PID %d opened", client->pid);
+ 	return 0;
+ 
++destroy_client_partial:
++	mutex_destroy(&client->mm_lock);
++	xa_destroy(&client->ctx_xa);
++	cleanup_srcu_struct(&client->ctx_srcu);
+ unbind_sva:
+ 	if (!IS_ERR_OR_NULL(client->sva))
+ 		iommu_sva_unbind_device(client->sva);
++	if (client->mm)
++		mmdrop(client->mm);
+ failed:
+ 	kfree(client);
+ 	return ret;
+@@ -297,6 +359,11 @@ static int amdxdna_drm_set_state_ioctl(struct drm_device *dev, void *data, struc
+ 	struct amdxdna_drm_set_state *args = data;
+ 	int ret, idx;
+ 
++	if (amdxdna_dev_is_unhealthy(xdna)) {
++		XDNA_ERR(xdna, "SET_STATE refused: device unhealthy");
++		return -EIO;
++	}
++
+ 	if (!xdna->dev_info->ops->set_aie_state)
+ 		return -EOPNOTSUPP;
+ 
+diff --git a/src/driver/amdxdna/amdxdna_drm.h b/src/driver/amdxdna/amdxdna_drm.h
+index ecc894d..4e60586 100644
+--- a/src/driver/amdxdna/amdxdna_drm.h
++++ b/src/driver/amdxdna/amdxdna_drm.h
+@@ -7,6 +7,7 @@
+ #define _AMDXDNA_DRM_H_
+ 
+ #include <linux/srcu.h>
++#include <linux/atomic.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_file.h>
+@@ -164,6 +165,15 @@ struct amdxdna_dev {
+ 	struct rw_semaphore		notifier_lock; /* for mmu notifier */
+ 	struct workqueue_struct		*notifier_wq;
+ 
++	/*
++	 * Sticky fail-fast latch: set on TDR dump-only stuck detect (and any
++	 * explicit amdxdna_dev_mark_unhealthy call). NOT set from ordinary job
++	 * -ENODEV (e.g. mbox_chann teardown races). open / CREATE/CONFIG_HWCTX /
++	 * EXEC_CMD / SET_STATE return -EIO while latched. Cleared after full
++	 * TDR restart. Zero-init via drm_dev_alloc.
++	 */
++	atomic_t			dev_unhealthy;
++
+ 	struct device			*cma_region_devs[MAX_MEM_REGIONS];
+ 
+ 	struct iommu_group		*group;
+@@ -233,6 +243,13 @@ int amdxdna_drm_copy_array_from_user(struct amdxdna_drm_get_array *src,
+ bool amdxdna_admin_access_allowed(struct amdxdna_dev *xdna);
+ bool amdxdna_ctx_access_allowed(struct amdxdna_ctx *ctx, bool root_only);
+ 
++void amdxdna_dev_mark_unhealthy(struct amdxdna_dev *xdna, const char *reason);
++void amdxdna_dev_clear_unhealthy(struct amdxdna_dev *xdna);
++static inline bool amdxdna_dev_is_unhealthy(struct amdxdna_dev *xdna)
++{
++	return atomic_read(&xdna->dev_unhealthy) != 0;
++}
++
+ int amdxdna_iommu_init(struct amdxdna_dev *xdna);
+ void amdxdna_iommu_fini(struct amdxdna_dev *xdna);
+ int amdxdna_iommu_map_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
