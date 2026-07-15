@@ -49,6 +49,27 @@ pub enum DragonNpuError {
         reason: String,
     },
 
+    /// Real XDNA2 `submit_and_run` is intentionally not ready for a silicon Pass claim.
+    ///
+    /// Used when the Real arm compiled the model successfully but cannot (or must not)
+    /// claim NPU inference: EXEC_CMD gated, missing instruction txn, fail-closed default
+    /// mode, or EXEC envelope completed without numerical verify (`ran_on_npu` still false).
+    /// See `docs/XDNA2_REAL_EXECUTION.md` Phase 4 and `docs/XDNA2_NEVER_AGAIN.md`.
+    #[error("Real XDNA2 submit not ready: {reason}")]
+    RealSubmitNotReady {
+        /// Actionable reason (gates, modes, device open, blob, honesty notes).
+        reason: String,
+    },
+
+    /// Graph contains operator types not supported for the selected real-submit mode.
+    #[error("Unsupported ops for real XDNA2 submit on model '{model}': {ops}")]
+    UnsupportedOps {
+        /// Model path or name.
+        model: String,
+        /// Comma-separated unsupported op type names (ONNX op_type / IR ops).
+        ops: String,
+    },
+
     /// Generic internal error (used only during early development).
     #[error("Internal error: {0}")]
     Internal(String),

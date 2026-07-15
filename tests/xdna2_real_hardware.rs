@@ -203,11 +203,55 @@ mod real_xdna2_on_target_platform {
         // Timed matmul surface (honest status; may still be hwctx_blocked).
         let timed = backend.timed_matmul(1, 64, 64, "f32");
         eprintln!(
-            "timed_matmul: status={} ran_on_npu={} total_s={:.6} detail={}",
-            timed.status, timed.ran_on_npu, timed.total_s, timed.detail,
+            "timed_matmul: status={} ran_on_npu={} real_ioctl={} total_s={:.6} detail={}",
+            timed.status, timed.ran_on_npu, timed.real_ioctl, timed.total_s, timed.detail,
         );
         assert_eq!(timed.op, "matmul");
         assert!(!timed.status.is_empty());
+        // Phase 3: never claim NPU GEMM Pass without numerical verify.
+        assert!(
+            !timed.ran_on_npu,
+            "ran_on_npu must stay false until Phase 3.5 numerical verify; status={}",
+            timed.status
+        );
+
+        // Safe silicon DMA path (no EXEC_CMD). When device is open, expect real ioctl path.
+        let bo = backend.timed_bo_roundtrip(4096);
+        eprintln!(
+            "timed_bo_roundtrip: status={} ran_on_device_path={} real_ioctl={} size_bytes={:?} detail={}",
+            bo.status, bo.ran_on_device_path, bo.real_ioctl, bo.size_bytes, bo.detail,
+        );
+        assert_eq!(bo.op, "bo_roundtrip");
+        assert!(!bo.ran_on_npu);
+        assert_eq!(bo.m, 0);
+        assert_eq!(bo.size_bytes, Some(4096));
+        if backend.real_device_open() {
+            assert!(
+                bo.real_ioctl,
+                "open device must use RealDirectSubmission (not silent stub)"
+            );
+            // Prefer success; soft-skip only if driver wedge / create fails.
+            if bo.status == "bo_roundtrip_ok" {
+                assert!(
+                    bo.ran_on_device_path,
+                    "bo_roundtrip_ok on real open must set ran_on_device_path"
+                );
+            } else {
+                assert!(
+                    !bo.ran_on_device_path,
+                    "failed bo_roundtrip must not claim device path"
+                );
+                eprintln!(
+                    "timed_bo_roundtrip soft-skip (status={}); driver may be wedged",
+                    bo.status
+                );
+            }
+        } else {
+            assert!(
+                !bo.ran_on_device_path,
+                "no open device must never set ran_on_device_path"
+            );
+        }
 
         // detected_npu_type must give useful info on real hardware
         let npu_type = backend.detected_npu_type();
@@ -243,32 +287,28 @@ mod real_xdna2_on_target_platform {
 
         let backend = AmdXdna2Backend::new_with_real_stub();
 
-        // Compile should reach the Real arm and produce the honest development error
-        // (this proves the call dispatched through Execution::Real and RealXdna2Executor).
-        let compile_err = backend
+        // Phase 4: compile succeeds on Real arm via ModelCompiler (host-side).
+        let model = backend
             .compile_model("any_real_model.onnx", 2, "bf16")
-            .expect_err("compile on real stub must fail until submission is wired");
+            .expect("Real arm compile_model must succeed (host ModelCompiler)");
+        assert!(!model.ops().is_empty());
 
-        let msg = format!("{compile_err:?}");
+        // Pin FailClosed so shell XDNA2_REAL_SUBMIT_MODE cannot flake this boundary test.
+        let submit_err = backend
+            .submit_and_run_with_mode(
+                &model,
+                &[0.0f32; 4],
+                dragon_npu::backends::amd_xdna2::RealSubmitMode::FailClosed,
+            )
+            .expect_err("FailClosed Real submit must be RealSubmitNotReady");
+        let msg = format!("{submit_err:?}");
         assert!(
-            msg.contains("real XDNA2 compilation/submission not yet wired")
-                || msg.contains("command submission logic in development"),
-            "error must clearly indicate the real path was attempted but submission not implemented: {msg}"
+            msg.contains("RealSubmitNotReady") || msg.contains("not ready"),
+            "error must be actionable Phase 4 fail-closed: {msg}"
         );
 
-        // submit_and_run directly (the primary production API) must also reach Real.
-        // We don't need a real model here; the error path is the signal.
-        // (In future when real submission lands, this will be the success path.)
-        let dummy_model = backend
-            .compile_model("any_real_model.onnx", 0, "fp32")
-            .expect_err("previous compile already failed as expected");
-        // We can't easily get a CompiledModel from the failing path today.
-        // The important coverage is that the Real arm's submit_and_run is reachable
-        // via the public trait surface and produces the correct class of error.
-        let _ = dummy_model; // keep compiler happy in this limited scaffolding state
-
         eprintln!(
-            "real_xdna2_submit_and_run: real execution arm error paths exercised cleanly on hardware"
+            "real_xdna2_submit_and_run: Phase 4 compile OK + fail-closed submit exercised on hardware"
         );
     }
 

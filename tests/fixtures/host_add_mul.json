@@ -1,0 +1,7 @@
+{
+  "ops": ["Add", "Mul"],
+  "initializers": [
+    {"name": "bias", "shape": [3], "data": [1.0, 1.0, 1.0]},
+    {"name": "scale", "shape": [1], "data": [2.0]}
+  ]
+}

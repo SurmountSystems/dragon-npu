@@ -14,6 +14,11 @@ This is **ops packaging**, not a claim that the host already runs the hardened
 module. Host install remains unchecked in [`docs/XDNA2_NEVER_AGAIN.md`](../../docs/XDNA2_NEVER_AGAIN.md)
 until a human completes clean boot → build → modprobe → diagnose.
 
+**When to use DKMS vs wait for upstream:** decision tree in
+[`docs/XDNA2_PACKAGING.md`](../../docs/XDNA2_PACKAGING.md). DKMS is a **bridge**
+while L2/L3 stay out-of-tree; prefer distro/mainline once equivalent guards land
+upstream ([`docs/upstream/CONTRIBUTION_PLAN.md`](../../docs/upstream/CONTRIBUTION_PLAN.md)).
+
 ## Prerequisites
 
 1. **Clean host** — no WEDGED_* from `bash scripts/diagnose_amdxdna.sh`.

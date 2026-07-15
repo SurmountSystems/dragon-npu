@@ -10,7 +10,7 @@
 //!
 //! ## Design Principles
 //!
-//! - **Library-first**: No binary until the core library is solid.
+//! - **Library-first**: Core API is the product; optional `dragon-npu` binary is a thin Phase 8 wrapper.
 //! - **TDD**: Tests are written first. Use `cargo test` as the primary loop.
 //! - **Zero panics in library code**: No `unwrap()`, `expect()`, `panic!()`,
 //!   or `unreachable!()`. Every fallible operation returns `Result<T, DragonNpuError>`.
@@ -19,22 +19,15 @@
 //!   and observable graph mutations are implemented. Remaining work focuses on
 //!   full ONNX/TorchScript loading and additional hardware backends.
 //!
-//! ## Current Status (autonomous execution, XDNA2 primary focus)
+//! ## Current Status (XDNA2 primary; Phase 9 packaging)
 //!
-//! - AMD XDNA2 backend (feature `amd-xdna2`): Rich probe (`AccelDevice` with npu_name + modalias),
-//!   pure `parse_xdna2_variant_from_modalias` (NPU4/5/6, heavily TDD'd), stores/exposes
-//!   `detected_device()` + `detected_npu_type()`, realistic params (50 TOPS, bf16), `simulated: bool`
-//!   on `NpuStatus`, preferred in `DragonNpu::new()` under the feature. Best-effort simulation
-//!   with honest fallback.
-//! - Real ONNX loading (tract-onnx): op extraction + full value_info dtype + shape extraction
-//!   (TensorShapeProto + Dimension oneof) now live in the protobuf path (onx-03 complete).
-//! - Compiler: all optimization passes perform real `ModelGraph` mutations (including weight-aware
-//!   MemoryPlanning + folding via as_f32_data). Initializer now has zero dead_code allows; small
-//!   onx-16 micro-improvement (better content hashing) landed.
-//! - All gates (fmt/clippy -D/test +/- features) clean after every change. Continuing autonomous
-//!   work on remaining small non-HITL items (see todo list and PLAN.md).
+//! - AMD XDNA2 backend (feature `amd-xdna2`): direct path bring-up + product CLI/benches.
+//!   **No** default silicon GEMM Pass / `ran_on_npu` without numerical verify.
+//! - Secondary features `intel-vpu` / `qualcomm-hexagon`: honest stubs only (not auto-selected).
+//! - Optional `xrt-bridge`: research refuse-stub only — never default or hot path.
+//! - Real ONNX + Phase 7 typed `DragonNpuIR`; Phase 8 CLI (`dragon-npu`).
 //!
-//! See `PLAN.md` for roadmap and `AGENTS.md` for process. HITL limited to user's real XDNA2 hardware testing.
+//! See `PLAN.md`, `AGENTS.md`, `docs/SECONDARY_BACKENDS.md`, `docs/PACKAGING.md`.
 
 /// Error types for the DragonNPU library.
 ///
@@ -63,11 +56,35 @@ pub use backends::simulation::SimulationBackend;
 pub mod compiler;
 pub use compiler::ModelCompiler;
 
+/// Phase 7 typed IR (`DragonNpuIR`) alongside `ModelGraph` parallel Vecs.
+///
+/// Shape inference, constant fold, DCE, and heuristic XDNA2 cost model.
+/// Dual representation — does not replace host_ref / fuse paths.
+pub mod ir;
+pub use ir::{
+    AttrValue, CostEstimate, DType, DragonNpuIR, IrNode, IrOptStats, NodeAttrs, NodeId, NodeOp,
+    TensorDesc, TensorId, estimate_xdna2_cost, node_attrs_from_onnx_attributes,
+};
+
+/// Colibrì / `npu_direct_bench` JSON schema version for timed-op and related objects.
+///
+/// Feature-free so default builds and feature-disabled example arms share one constant.
+/// Bump only when removing/renaming fields or changing honesty semantics.
+/// See `docs/COLIBRI_ADAPTER.md`.
+pub const TIMED_OP_JSON_SCHEMA_VERSION: u32 = 1;
+
+/// CLI argv helpers for the optional `dragon-npu` binary (Phase 8).
+///
+/// Pure parse/load helpers are unit-tested here so default `cargo test --lib`
+/// never opens `/dev/accel` or enables EXEC_CMD.
+pub mod cli;
+
 /// Re-exports for convenient `use dragon_npu::prelude::*;`
 pub mod prelude {
     pub use crate::CompiledModel;
     pub use crate::DragonNpu;
     pub use crate::DragonNpuError;
+    pub use crate::DragonNpuIR;
     pub use crate::ModelCompiler;
     pub use crate::NpuStatus;
 }

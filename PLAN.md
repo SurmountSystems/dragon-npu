@@ -1,9 +1,190 @@
 # DragonNPU Rust Rewrite Plan
 
-## Latest (L2 materials — driver null-guard patch shippable)
-- **L2 complete in-tree (not installed on host):** `kernel/patches/0001-amdxdna-cmdlist-null-guards.patch` vs amd/xdna-driver @ `905717f5…`; README + design notes + paste-ready issue body under `docs/upstream/`.
+## Latest (final re-review polish)
+- Full BO alloc zero; ofm_decide_error; weight path stub tests; CI synth extract + dangerous clippy; LAB_WEIGHT MVP limits enforced.
+- **Next:** npu4 known-good txn HITL; sudo L3 apply; silicon Pass.
+
+## Previous (review round-2 polish)
+- extract out-by-platform + staged sha256 names; drop suggested_m; fill exact; golden m*n; skip-verify+stock; pure lab_weight_requires_ofm; CI research-blob/skip-verify; LAB_WEIGHT docs.
+- **Next:** npu4 known-good txn HITL; sudo L3 apply; silicon Pass.
+
+## Previous (review closeout Issues 1–8)
+- extract script hardening (sha256 rewrite, force/stage, VE2 lab_instr allow flag, recipe); Gemm transB select; gitignore PROVENANCE; lab research-blob refuse; CI extract smokes; IR tests; `XDNA2_LAB_WEIGHT=1` fail-closed timed wire.
+- **Next:** npu4 known-good txn HITL; sudo L3 apply; silicon Pass.
+
+## Previous (offline residual closeout — extract + weight bind + IR host_ref)
+- **A:** `scripts/extract_instruction_offline.sh` inventory default exit 0; `--stage-ve2-nop` + PROVENANCE `NOT_AIE2_KNOWN_GOOD=1`; never EXEC/ALLOW/auto lab_instr.
+- **B:** `select_lab_matmul_weight` / `WeightExecBind` / `create_and_fill_weight_io_bos` + `lab_decide_from_ofm_bytes_with_golden`; stub TDD; no ALLOW.
+- **C:** `evaluate_host_ir` / `_with_options` (IR→ModelGraph→host_graph); fixture parity + Conv refuse; never `ran_on_npu`.
+- **D:** RESIDUAL rewrite; TXN_RESEARCH + checklist + testdata README: VE2 research-only.
+- **Honesty:** silicon Pass still HITL (npu4 blob + sudo L3).
+- **Next:** operator known-good npu4 txn; sudo lab apply; optional timed model-WTS wire.
+
+## Previous (Phase 3.5 lab review round 2)
+- lab_exec_once: RESTORE_RC, L3_WE_ENABLED-only sysfs restore, cargo→4, cargo-args array, source guard.
+- Pure `classify_lab_matmul_status` / `build_lab_arg_bo_handles` + tests; sparse oversize blob refuse.
+- Docs/checklist/inventory residual “not wired” cleaned; SIGKILL residual documented only.
+- **Next:** known-good blob HITL; operator apply; weight BO EXEC.
+
+## Previous (Phase 3.5 lab review fixes Issues 1–10)
+- Probe `arg_bo_handles`; OFM host-zero; LAB_OFM fail-closed setup; always pin inst BO.
+- lab_exec_once: LAB_OFM=1 on apply; timeout/wait ≥1; exit mapping vs npu_direct_bench (2→4).
+- Docs drift fixed; CI lab-script dry-run + bash -n; extra lab_io tests.
+- **Next:** known-good blob HITL; operator apply; weight BO EXEC.
+
+## Previous (Phase 3.5 lab harness + OFM plumbing + honest ran_on_npu wire)
+- **Pure lab_io:** f32 LE encode/decode; IFM/WTS/OFM nbytes (row-major f32); ones fill; `pack_start_npu_kernel_args` (PARTIAL_ELF, prop_count=0); `lab_decide_from_ofm_bytes`; env `XDNA2_LAB_OFM`.
+- **Builder:** `build_ert_start_npu_cmd_bo_ex` + `_with_kernel_args` (prop_count separate from flexible-array len); legacy builder keeps all-as-props for tests.
+- **Command.arg_bo_handles** pinned on Real EXEC_CMD; empty = historical arg_count=0.
+- **Timed path:** LAB_OFM=1 → create/fill IFM/WTS, zero OFM, pack paddrs, submit with arg handles, readback, decide → `ran_on_npu` only if true (`ok_npu_verified`); default hard-false.
+- **Script:** `scripts/lab_exec_once.sh` default dry-run; apply needs risk+blob; trap restore L3/L1.
+- **Docs:** EXEC_CMD_LAB, TXN_RESEARCH OFM note, DIRECT Phase 3.5, RESIDUAL rewrite.
+- **Honesty:** no default EXEC/ALLOW; no fake Pass; blob HITL + sudo still block live product Pass.
+- **Next:** known-good blob HITL; operator apply with sudo; weight BO EXEC bind; IR-native host_ref.
+
+## Previous (Phase 3.5 review round 2)
+- **Untrack** `kernel/amdxdna_rescue/` build debris via `git rm --cached` (sources kept).
+- **Numerical tests:** empty golden + non-empty device; length mismatch → `AllcloseFailed`; Inf on device.
+- **CI `exec-gate`:** test with `amd-xdna2,xdna2-dangerous-exec-cmd` and ALLOW unset.
+- **CLI raw input:** refuse oversize before full read (`max_raw_input_bytes`); sparse-file unit test.
+- **Gates:** fmt; clippy both; test --lib both; dangerous-exec no ALLOW; inventory smoke report.
+- **Next:** blob HITL; OFM readback + wire `decide_ran_on_npu`; weight BO EXEC bind.
+
+## Previous (Phase 3.5 prep review fixes — Issues 1–N)
+- **BUG:** `decide_ran_on_npu` fail-closed on empty golden/candidate; `max_abs_diff_f32` fail-closed on NaN/Inf (with tests).
+- **TDD:** allclose len mismatch; rtol-only / atol-only / boundary; bad rtol/atol; ones_vec over max; decide NaN + criteria wiring; `decide_ran_on_npu_reason`.
+- **Security/hygiene:** `MAX_INSTRUCTION_BLOB_BYTES` (64 MiB) path+hex; broader gitignore lab bins/elf + rescue kmod debris (tracked historic `.ko` residual note, not auto-untracked); Cargo exclude staging bins.
+- **API:** shared `HOST_REF_MAX_ELEMENTS`; ones_vec uses `u32` dims; public re-exports for block reason + caps.
+- **Docs:** REAL_EXECUTION / NEVER_AGAIN / DIRECT EXEC payload / README → TXN_RESEARCH; inventory = smoke report not gate; checklist lab-file validate + restore criterion.
+- **Gates:** fmt + clippy -D both sets; `cargo test --lib` (~111); `cargo test --features amd-xdna2 --lib` (~280+1 ignored); inventory exit 0 report-only.
+- **Next:** operator blob HITL; OFM readback; wire decide; weight BO EXEC bind.
+
+## Previous (Opaque-txn research sprint — Phase 3.5 prep)
+- **Docs:** `docs/XDNA2_TXN_RESEARCH.md` (Cmd vs instruction BO diagram, known vs opaque, host XRT 2.21 inventory, capture A/B/C + licenses, hooks map, what blocks `ran_on_npu`); pointers in CMD_PAYLOAD / DIRECT_CAPABILITIES Phase 3.5 / EXEC_CMD_LAB.
+- **Scripts:** `scripts/inventory_txn_sources.sh` (read-only, exit 0); `scripts/capture_instruction_blob_checklist.md` (operator only; no auto EXEC).
+- **Staging:** `testdata/xdna2_cmd/README.md` + `.gitignore` keeps README, ignores lab binaries.
+- **Pure verify (TDD):** `src/backends/amd_xdna2/numerical.rs` — pure policy + re-exports; timed path hard-false.
+- **Honesty:** no EXEC enablement; no proprietary blobs committed.
+- **Process:** `RESIDUAL.md` residual + validation commands.
+- **Next:** operator blob capture HITL; single-shot lab record; bind OFM/weight BOs into EXEC; wire `decide_ran_on_npu` after readback.
+
+## Previous (Phase 9 review fixes — Issues 1–7)
+- **CI MSRV:** job pins `1.87` (`test --lib` + `check --lib --features amd-xdna2`).
+- **xrt tests:** `submit_and_run` refuse via Simulation-built model; rename + strict asserts (`no libxrt`, `Do not enable`).
+- **CI PATH:** prepend `/usr/bin` per step; no workflow-level PATH wipe.
+- **exclude:** Python/kmod debris out of crates.io tarball; patches/docs retained.
+- **clippy:** `--all-targets` on feature matrix; bins + dual `bench --no-run` on bin job.
+- **Gates:** 111 / 248+1 / 121 / 117 (`xrt-bridge`); fmt + clippy -D all feature sets; bin clean.
+
+## Previous (Phase 9 — Secondary backends and packaging)
+- **9.1 Intel VPU / Hexagon:** honest stubs (`available=false`, `simulated=true`, run/submit refuse `BackendError`); host-only `compile_model` via `ModelCompiler`; **not** selected by `DragonNpu::new`; tests under feature flags; `docs/SECONDARY_BACKENDS.md`.
+- **9.2 DKMS vs upstream:** decision tree `docs/XDNA2_PACKAGING.md`; cross-links HARDENED_INSTALL, `kernel/dkms/README`, CONTRIBUTION_PLAN, NEVER_AGAIN. Lab OOT/DKMS bridge vs long-term upstream; materials ≠ host fixed.
+- **9.3 Packaging / MSRV:** `rust-version = "1.87"` (edition 2024 + `is_multiple_of`/`cast_unsigned`); `exclude` for kernel out/staging/Python/evidence; `docs/PACKAGING.md` version policy + gates; `.github/workflows/ci.yml` feature matrix (fmt/clippy/test, no hardware).
+- **9.4 `xrt-bridge`:** opt-in research stub only — never default, never enabled by `amd-xdna2`, no libxrt, no EXEC_CMD, refuses all real calls; NEVER_AGAIN + REAL_EXECUTION notes.
+- **Honesty:** no fake `ran_on_npu`; no default EXEC_CMD; secondary backends never silent sim-as-hardware.
+- **Product packaging map (Phases 0–9) closed** for stubs/docs/CI; **silicon MVP still open** (known-good txn + numerical verify → `ran_on_npu`).
+- **Gates:** 111 default lib; 248+1 ignored `amd-xdna2`; 121 `intel-vpu,qualcomm-hexagon`; 116 `xrt-bridge`; fmt + clippy -D all four feature sets; `cargo build --bin dragon-npu` clean.
+
+## Previous (Phase 8 review fixes — Issues 1–7)
+- **Issue 1:** `flag_value` refuses next token that looks like a flag (`-q --json` → usage exit 2); unit tests for -q/--input/-i/-O swallow cases.
+- **Issue 2:** CLI `run` always labels `execution=host_or_simulation_run`; `status_simulated` is detection-only; help clarifies Simulation arm under amd-xdna2.
+- **Issue 3:** `MAX_INPUT_ELEMENTS` (16_777_216) on `--input-len` + load paths.
+- **Issue 4:** `TIMED_OP_JSON_SCHEMA_VERSION` moved to crate root (feature-free); npu_direct_bench disabled arm shares constant.
+- **Issue 5:** JSON/raw LE f32 load tests, missing file, non-mod-4, cap refusal.
+- **Issue 6:** help lists `--opt` / `--quantization` / `-i` aliases.
+- **Issue 7:** compile JSON `quantization_requested` + applied quant; `compile_host_only` + `status_simulated` (dropped misleading `simulated_backend`).
+- **Gates:** 111 default lib; 248+1 ignored `amd-xdna2`; fmt + clippy -D lib/bins both sets; bin + `bench --no-run` green.
+
+## Previous (Phase 8 — Product surface)
+- **8.1 CLI:** `[[bin]] dragon-npu` → `src/bin/dragon_npu.rs` + library-testable `src/cli.rs` (status / compile / run / probe / help). Exit 0/1/2; no EXEC_CMD flags; `ran_on_npu=false` honesty.
+- **8.2 Benches:** Criterion `benches/sim_compile_run.rs` (always); `benches/xdna2_direct.rs` (`required-features = ["amd-xdna2"]`) — status/GET_INFO/bo_roundtrip only, never EXEC_CMD. Compile via `cargo bench --no-run`.
+- **8.3 Examples:** `examples/minimal_infer.rs` host/sim fixture path; keep `xdna2_probe` + `npu_direct_bench`.
+- **8.4 Colibrì:** `docs/COLIBRI_ADAPTER.md` JSON contract + exit codes; `TIMED_OP_JSON_SCHEMA_VERSION=1` on `TimedOpResult::to_json_value` + checklist/feature-disabled objects.
+- **8.5 README:** Garuda/zen PATH, hardened module + NEVER_AGAIN, CLI/examples/benches, works-vs-blocked table.
+- **Honesty:** no fake `ran_on_npu`; no default EXEC_CMD; CLI help matches real behavior.
+- **Gates:** fmt; clippy -D default + `amd-xdna2` (+ bins); 100 default lib; 237+1 ignored `amd-xdna2`; bin/examples/`bench --no-run` green both feature sets.
+- **Next:** known-good txn + numerical verify → `ran_on_npu`; bind weight BOs into EXEC; IR-native host_ref; optional richer CLI host_ref mode.
+
+## Previous (Phase 7 re-review — Issue 12)
+- Default-feature compile: foldable-const host_ref test no longer imports `amd_xdna2` from `compiler` tests.
+- Compiler: feature-free `Constant` ops + folded initializer assert; host golden in `host_graph` under feature.
+- Default clippy: `try_open_accel_device` allow(dead_code) without `amd-xdna2`.
+- **Gates:** 228+1 ignored (`amd-xdna2`), 91 default; fmt + clippy -D both sets.
+
+## Previous (Phase 7 review fixes — Issues 1–11)
+- **Issue 1:** `constant_fold` → `Constant` + materialize initializer; host allowlist + load act from init (host_ref opt≥2 safe).
+- **Issue 2:** fold fixed-point loop (cap 64) + second wave in `optimize_level2`.
+- **Issue 3:** `graph_input_names` / `graph_output_names` on ModelGraph; ONNX/JSON fill; DCE uses explicit sinks.
+- **Issue 4:** `CompiledModel.node_attrs`; host Gemm applies `alpha`/`beta`/`transA`/`transB`.
+- **Issue 5:** ONNX `graph.input`/`output` + value_info → `named_shapes` seed IR activations.
+- **Issue 6:** attr extras use AttributeProto type (zeros not dropped).
+- **Issue 7:** document MatMul batch prefix = A-only limitation.
+- **Issue 8–11:** level2 host tests, op_raw/layouts roundtrip, public re-exports (`AttrValue`, `IrOptStats`, …).
+- **Gates:** 227 lib + 1 ignored (`amd-xdna2`); fmt/clippy -D clean.
+
+## Previous (Phase 7 — Compiler IR modernization + ONNX depth)
+- **Typed IR:** `src/ir.rs` — `DragonNpuIR` / `IrNode` / `NodeOp` / `NodeAttrs` / `DType` dual to `ModelGraph` parallel Vecs (not deleted).
+- **Conversion:** `from_model_graph` / `to_model_graph` roundtrip; attrs + initializers preserved.
+- **ONNX depth:** Gemm/Conv attribute extraction (`alpha`/`beta`/`trans*`, pads/strides); JSON `"attrs"`; unit + protobuf tests.
+- **Passes (opt ≥2):** shape infer (MatMul/Add/Relu/…), constant fold, DCE; then existing fuse/layout/quantize/memory.
+- **Cost model:** `estimate_xdna2_cost` heuristic (`host_ops` / `npu_candidate_ops` / `rough_macs` / DevHeap notes) — **not** silicon time.
+- **Honesty:** no EXEC_CMD, no `/dev/accel` in Phase 7, no fake `ran_on_npu`.
+- **Gates:** fmt + clippy -D `amd-xdna2` + lib tests (221 + 1 ignored with feature; 87 default).
+- **Next:** known-good txn + numerical verify → `ran_on_npu`; optional IR-driven host_ref path; further ONNX ops.
+
+## Previous (Phase 6 — Efficiency and hardware quality)
+- **Host:** dtype-aware MatMul (int8 borrow / once f32 convert); fused MatMul/Gemm+Relu; `fill_weight_bos_batch`.
+- **HW config:** `suggest_hwctx_tiles` (4/8 ×4 from tops); `set_direct_power_mode` from uAPI SET_STATE; `efficiency_notes` on TimedOpResult.
+- **Compiler:** matmul/gemm/conv + bias/relu fusions; NHWC still level≥2.
+- **Docs:** REAL_EXECUTION Phase 6; DIRECT_CAPABILITIES env/API; EXEC_CMD_LAB L3+WAIT note.
+- **Honesty:** efficiency ≠ silicon GEMM tops; no EXEC by default; no fake `ran_on_npu`.
+- **Next:** known-good txn + numerical verify → `ran_on_npu`; optional live power SET lab record.
+
+## Previous (Phase 5 — Host graph pipeline + weight BO plan)
+- **Host interpreter:** `host_graph::evaluate_host_graph` for Identity/Relu/Add/Mul/MatMul/Gemm; Real `host_ref` uses it.
+- **Weights:** JSON `initializers` + ONNX path; `build_weight_bo_plan` / optional Shmem upload plumbing (not inference).
+- **Fixtures:** `tests/fixtures/host_matmul_relu.json`, `host_add_mul.json`; golden unit tests with known numbers.
+- **Honesty:** host only; NPU graph still blocked on opaque txn; no EXEC without double gate.
+- **Next:** known-good instruction txn + bind weight BOs into EXEC path + numerical verify → `ran_on_npu`.
+
+## Previous (Phase 3 review — stub ≠ silicon DMA Pass)
+- `ran_on_device_path` only on Real ioctl path; stub → `bo_roundtrip_stub_ok` + false; bench/checklist need open+real_ioctl+path.
+- Exclusive BO stage timings + `read_bo_bytes_no_sync`; submit status classification; `size_bytes` field; HW integration locks.
+
+## Previous (Phase 3 — Minimal timed metrics + honesty)
+- **Product-shaped metrics:** richer `TimedOpResult` (`hwctx_s`, `fill_s`, `submit_wait_s`, `host_ref_*`, `ran_on_device_path`); JSON via `to_json_value`.
+- **Host golden:** `host_matmul_f32_ones` + optional attach (`XDNA2_HOST_REF` / small f32) — always labeled CPU, never NPU.
+- **Instruction blob hook:** env load → device BO → START_NPU buffer addr; statuses `ok_submit_wait_with_inst_blob` vs `_envelope`; **`ran_on_npu=false`** until Phase 3.5 numerical verify.
+- **Safe silicon timed path:** `timed_bo_roundtrip_direct` + capability `bo_roundtrip` + bench `--bo-roundtrip` (no EXEC_CMD).
+- **Docs / checklist:** timed_gemm still blocked for NPU compute; true `ran_on_npu` GEMM criteria listed in DIRECT_CAPABILITIES.
+- **Not claimed:** full GEMM on silicon; Phase 3 ≠ Pass.
+- **Next (Phase 3.5 / 4):** known-good txn + verify → `ran_on_npu`; operator lab single-shot record.
+
+## Previous (Phase 2 — First safe EXEC_CMD + wait/completion)
+- **Lab doc:** `docs/XDNA2_EXEC_CMD_LAB.md` — preconditions, enable order, restore `exec_cmd_allow=0`, timeouts, no scaffold loops.
+- **APIs:** `wait_command` on `DirectSubmission` (Real ioctl; not L1-gated); gated `submit_and_wait_command` + `SubmitWaitResult`; public re-exports.
+- **timed_matmul / probe:** L1-open path uses START_NPU builder + submit+wait; statuses honest (`ok_submit_wait` ≠ Pass; default `hwctx_ok`).
+- **Tests:** refuse-when-gated unit tests; `cargo test --features amd-xdna2,xdna2-dangerous-exec-cmd --lib` without ALLOW still refuses; HW test `#[ignore]`.
+- **Not claimed:** silicon single-shot proven; known-good txn BO; `ran_on_npu` product Pass.
+- **Next:** operator single-shot under lab doc; mmap write of Cmd BO payload; optional XRT instruction capture; Phase 3+ real compute.
+
+## Previous (Phase 1 — Command format research complete)
+- **Phase 1.4 offline complete:** `docs/XDNA2_CMD_PAYLOAD.md` enriched (envelopes, COUNT/CU masks, AIE2 vs AIE4/VE2, known vs opaque, Phase 2 lab steps not claimed).
+- Typed builders in `direct.rs`: header pack/unpack/parse-from-bytes, START_NPU, CHAIN, PREEMPT, DPU; `amdxdna_cmd_num_cu_masks`; WAIT_CMD struct only; scaffold remains legacy.
+- Unit tests cover max bitfields, LE parse, empty/non-empty START_NPU, empty/multi CHAIN, preempt/DPU, wait_cmd size 16 — no hardware, no EXEC_CMD.
+- **Does not** claim silicon compute; txn instruction bytes still opaque. Phase 2 = gated EXEC_CMD+WAIT with known-good payload only.
+
+## Previous (Phase 0 — Platform hygiene materials)
+- **Phase 0 done in-repo:** doc truth for hardened host (L2+L3 under `updates/amdxdna-hardened/`, `exec_cmd_allow=0`, hwctx Pass); Garuda notes (wild linker PATH, firmware alias, no softdep); post-reboot checklist honest (unchecked until user reboots).
+- **`scripts/verify_amdxdna_hardened_host.sh`:** read-only host verify (modinfo path, L3 param, firmware, modprobe.d, diagnose); exit 0/1; no `/dev/accel` open.
+- Upstream status: cryptoquick fork `amdxdna/cmdlist-null-guards` @ `a9ef3c4…` documented; **no** auto issue/PR; L3 PR optional only.
+- Kernel upgrade rebuild recipe in `docs/XDNA2_HARDENED_INSTALL.md`.
+- Phase 1 payload research already started separately (`XDNA2_CMD_PAYLOAD.md`); Phase 0 does not enable EXEC_CMD.
+
+## Previous (L2 materials — driver null-guard patch shippable)
+- **L2 complete in-tree (later installed on lab host):** `kernel/patches/0001-amdxdna-cmdlist-null-guards.patch` vs amd/xdna-driver @ `905717f5…`; README + design notes + paste-ready issue body under `docs/upstream/`.
 - Dry-run apply verified against fetched `aie2_message.c`. Null-guards fill_slot + single/multi execbuf.
-- NEVER_AGAIN checklist: L2 materials [x]; host install / issue filed / L3 fail-fast still open.
+- NEVER_AGAIN checklist: L2 materials [x]; lab host install later [x]; issue filed / reboot proof still open.
 - **L1 unchanged** (userspace double gate). No Phase B payload work.
 
 ## Previous (L1 hardened — userspace permanent EXEC_CMD gates)

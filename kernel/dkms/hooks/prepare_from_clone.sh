@@ -48,10 +48,11 @@ CLONE_PATH     Path to amd/xdna-driver tree with L2+L3 already applied
 STAGE_PATH     Stage dir (default: $DEFAULT_STAGE)
                Must stay under kernel/dkms/staging/ unless --force-stage
 --force-stage  Allow STAGE outside default prefix (still refuses /, empty, etc.)
---allow-unpatched  Do not fail if L2/L3 markers missing (WARN only)
+--allow-unpatched  Do not fail if L2/L3 markers missing (research staging only).
+                   Prints a hard DO-NOT-dkms-install banner; NEVER install that stage.
 --replace-stage    Use rsync --delete (default: no --delete)
 
-Then (root, clean host only):
+Then (root, clean host only — **only if L2+L3 markers present**, l2_ok=1 l3_ok=1):
   sudo rsync -a "\$STAGE_PATH/" /usr/src/${PKG_NAME}-${PKG_VER}/
   sudo cp ${DKMS_DIR}/dkms.conf /usr/src/${PKG_NAME}-${PKG_VER}/dkms.conf
   # Edit MAKE[] paths in dkms.conf if your tree layout differs; AUTOINSTALL=no by default
@@ -175,23 +176,36 @@ if grep -qE "$L3_MARKER_RE" "$msg_drm_c" "$msg_drm_h" 2>/dev/null; then
   l3_ok=1
 fi
 
+print_do_not_dkms_banner() {
+  cat <<'BANNER' >&2
+========================================================================
+  *** DO NOT DKMS-INSTALL / do NOT modprobe this staged tree ***
+  Stage was built with --allow-unpatched (L2 and/or L3 markers MISSING).
+  Stock/unpatched amdxdna can NULL-deref on EXEC_CMD and wedge open().
+  This path is for research inspection of sources ONLY.
+  Apply 0001 then 0002 (scripts/install_amdxdna_hardened.sh --apply)
+  and re-run prepare WITHOUT --allow-unpatched before any DKMS install.
+========================================================================
+BANNER
+}
+
 if [[ $l2_ok -eq 0 ]]; then
   echo "prepare: L2 marker missing in aie2_message.c (null-guards not applied?)" >&2
   echo "  expected substring: $L2_MARKER" >&2
   if [[ $ALLOW_UNPATCHED -eq 0 ]]; then
-    echo "  apply 0001 first, or pass --allow-unpatched" >&2
+    echo "  apply 0001 first, or pass --allow-unpatched (research only — never DKMS that stage)" >&2
     exit 1
   fi
-  echo "  WARN: continuing due to --allow-unpatched" >&2
+  print_do_not_dkms_banner
 fi
 if [[ $l3_ok -eq 0 ]]; then
   echo "prepare: L3 markers (exec_cmd_allow / dev_unhealthy) not found" >&2
   if [[ $ALLOW_UNPATCHED -eq 0 ]]; then
     echo "  apply 0002 first: scripts/install_amdxdna_hardened.sh --apply" >&2
-    echo "  or pass --allow-unpatched" >&2
+    echo "  or pass --allow-unpatched (research only — never DKMS that stage)" >&2
     exit 1
   fi
-  echo "  WARN: continuing due to --allow-unpatched" >&2
+  print_do_not_dkms_banner
 fi
 
 mkdir -p "$STAGE"
@@ -231,10 +245,25 @@ clone_HEAD: $clone_head
 expected_base_SHA: $EXPECTED_SHA
 package: ${PKG_NAME}-${PKG_VER}
 patches: L2 0001 + L3 0002 (l2_ok=$l2_ok l3_ok=$l3_ok)
+allow_unpatched: $ALLOW_UNPATCHED
 host_kernel: $(uname -r)
 next: see kernel/dkms/README.md
 EOF
 
+if [[ $l2_ok -eq 0 || $l3_ok -eq 0 ]]; then
+  {
+    echo ""
+    echo "DO NOT DKMS-INSTALL THIS STAGE"
+    echo "  l2_ok=$l2_ok l3_ok=$l3_ok allow_unpatched=$ALLOW_UNPATCHED"
+    echo "  Research inspection only. Re-prepare with L2+L3 applied first."
+  } >>"${STAGE}/README.dragon-npu-stage"
+fi
+
 echo "prepare: staged at $STAGE"
-echo "prepare: next — see kernel/dkms/README.md (dkms add/build/install as root after clean boot)"
+if [[ $l2_ok -eq 0 || $l3_ok -eq 0 ]]; then
+  print_do_not_dkms_banner
+  echo "prepare: stage is NOT safe for dkms add/build/install (see banner above)" >&2
+else
+  echo "prepare: next — see kernel/dkms/README.md (dkms add/build/install as root after clean boot)"
+fi
 exit 0

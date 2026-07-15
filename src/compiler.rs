@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use crate::backends::Backend;
+use crate::ir::{DragonNpuIR, NodeAttrs, node_attrs_from_onnx_attributes};
 use crate::{CompiledModel, DragonNpuError};
 
 /// Type-safe representation of optimization passes performed by the compiler.
@@ -111,9 +112,17 @@ impl Initializer {
                     })
                     .collect()
             }
-            3 | 2 => {
-                // INT8 / UINT8 -> f32
+            3 => {
+                // INT8 -> f32 (signed)
                 self.data_i8.iter().map(|&v| f32::from(v)).collect()
+            }
+            2 => {
+                // UINT8 stored in data_i8 as raw bytes reinterpreted as i8; promote
+                // **unsigned** so 200 → 200.0 (not -56.0). Matches BO host bytes.
+                self.data_i8
+                    .iter()
+                    .map(|&v| f32::from(v.cast_unsigned()))
+                    .collect()
             }
             6 => {
                 // INT32 -> f32 (may lose precision for very large values — acceptable for v1)
@@ -165,64 +174,65 @@ fn fp16_bits_to_f32(bits: u16) -> f32 {
 /// All four OptimizationPass variants (FuseOperations, LayoutOptimization,
 /// QuantizeWeights, MemoryPlanning) perform real mutations on it.
 /// See dragon_npu_compiler.py for the reference implementation.
+///
+/// Phase 7: dual with typed [`crate::ir::DragonNpuIR`] — fields are `pub(crate)`
+/// so IR conversion can read/write without a big-bang rewrite. Prefer IR APIs
+/// for new multi-op analysis; keep parallel Vec hygiene on every mutation.
 #[derive(Debug, Clone, Default)]
 pub struct ModelGraph {
     /// Simulated operator list (real models would contain typed nodes, shapes, etc.).
     /// Upgraded to Vec<String> to support pattern-based fusion (replacing pairs
     /// with "fused_*" operators). See dragon_npu_compiler.py for reference.
-    ops: Vec<String>,
+    pub(crate) ops: Vec<String>,
     /// Memory plan populated by the MemoryPlanning pass (real side-effect).
-    memory_plan: u64,
+    pub(crate) memory_plan: u64,
     /// Layout chosen by the LayoutOptimization pass (e.g. "NHWC" or "NCHW").
     /// Real mutation target for LayoutOptimization.
-    layout: Option<String>,
+    pub(crate) layout: Option<String>,
     /// Quantization dtype chosen by the QuantizeWeights pass (e.g. "int8", "fp16").
     /// Real mutation target for QuantizeWeights.
-    quantization: Option<String>,
+    pub(crate) quantization: Option<String>,
     /// Optional node names extracted from ONNX-style JSON (for future graph inspection).
-    node_names: Vec<Option<String>>,
+    pub(crate) node_names: Vec<Option<String>>,
     /// Optional shapes extracted from richer ONNX-style JSON.
     /// This is the first step toward real tensor metadata in the IR.
-    shapes: Vec<Option<Vec<i64>>>,
+    pub(crate) shapes: Vec<Option<Vec<i64>>>,
     /// Optional dtypes extracted from richer ONNX-style JSON.
     /// Companion to shapes for building real tensor IR.
-    dtypes: Vec<Option<String>>,
+    pub(crate) dtypes: Vec<Option<String>>,
     /// Optional input names for each node (real ONNX structure).
-    inputs: Vec<Vec<String>>,
+    pub(crate) inputs: Vec<Vec<String>>,
     /// Optional output names for each node (real ONNX structure).
-    outputs: Vec<Vec<String>>,
+    pub(crate) outputs: Vec<Vec<String>>,
     /// Optional per-node layout (set by LayoutOptimization).
-    layouts: Vec<Option<String>>,
+    pub(crate) layouts: Vec<Option<String>>,
     /// Number of initializers (weights / constants) present in the model when
     /// loaded from a real ONNX protobuf. 0 for heuristic/JSON fallbacks or
     /// models without initializers. First concrete step toward weight extraction.
-    initializer_count: usize,
+    pub(crate) initializer_count: usize,
     /// Actual initializer tensors extracted from real ONNX protobuf (onx-06).
     /// Empty for non-.onnx or fallback paths.
-    initializers: Vec<Initializer>,
+    pub(crate) initializers: Vec<Initializer>,
+    /// Per-node attributes (Gemm alpha/beta/trans*, Conv pads/strides, …).
+    /// Phase 7 — kept in sync on remove/push/fuse like other parallel Vecs.
+    pub(crate) node_attrs: Vec<NodeAttrs>,
+    /// Graph-level input value names (ONNX `graph.input` / JSON `graph_inputs`).
+    /// Used by IR as explicit live roots when non-empty.
+    pub(crate) graph_input_names: Vec<String>,
+    /// Graph-level output value names (ONNX `graph.output` / JSON `graph_outputs`).
+    /// Used by IR DCE as explicit sinks when non-empty (Issue 3).
+    pub(crate) graph_output_names: Vec<String>,
+    /// Named tensor shapes from value_info + graph I/O (name → dims).
+    /// Seeds IR activation shapes when per-node `shapes` are empty (Issue 5).
+    pub(crate) named_shapes: Vec<(String, Vec<i64>)>,
+    /// Named tensor dtypes from value_info + graph I/O (name → short dtype str).
+    pub(crate) named_dtypes: Vec<(String, String)>,
 }
 
-// IR maturation note (safe hygiene, onx / ir-maturity track):
-//
-// Current design uses many parallel Vec<T> fields (ops, node_names, shapes, dtypes,
-// inputs, outputs, layouts, initializers, etc.) that are kept in sync by every
-// structural mutation (remove_node, push_node, fuse_consecutive, etc.).
-//
-// This was a pragmatic v1 choice that enabled real passes and weight data to land
-// quickly while preserving full TDD coverage and strict hygiene (no dead_code,
-// all parallel fields updated on every mutation).
-//
-// Future direction (when real typed IR work begins):
-// - Replace with a proper DragonNpuIR / Graph / Node / TensorValue structure
-//   (closer to ONNX GraphProto + type/shape inference).
-// - The existing parallel-Vec machinery and all mutation sites will be the
-//   migration surface; the public CompiledModel surface and Backend trait
-//   remain stable.
-// - Until then, any new parallel metadata must be wired through remove_node +
-//   push_node (and the two ModelGraph constructors) exactly like the existing fields.
-//
-// This comment exists so future contributors (and the author) do not have to
-// rediscover the synchronization contract when the IR evolves.
+// Phase 7: typed `DragonNpuIR` coexists with this parallel-Vec graph.
+// Conversion: `DragonNpuIR::from_model_graph` / `to_model_graph`.
+// Any new parallel metadata must stay in sync via remove_node + push_node +
+// apply_fuse_span (and all ModelGraph constructors).
 
 impl ModelGraph {
     fn new() -> Self {
@@ -241,6 +251,11 @@ impl ModelGraph {
             layouts: vec![None; 100],
             initializer_count: 0,
             initializers: vec![],
+            node_attrs: vec![NodeAttrs::default(); 100],
+            graph_input_names: vec![],
+            graph_output_names: vec![],
+            named_shapes: vec![],
+            named_dtypes: vec![],
         }
     }
 
@@ -360,6 +375,9 @@ impl ModelGraph {
         if i < self.layouts.len() {
             self.layouts.remove(i);
         }
+        if i < self.node_attrs.len() {
+            self.node_attrs.remove(i);
+        }
     }
 
     pub(crate) fn push_node(
@@ -376,6 +394,7 @@ impl ModelGraph {
         self.inputs.push(vec![]);
         self.outputs.push(vec![]);
         self.layouts.push(None);
+        self.node_attrs.push(NodeAttrs::default());
     }
 
     /// Real LayoutOptimization pass: records the chosen tensor layout.
@@ -428,43 +447,104 @@ impl ModelGraph {
     }
 
     /// Perform actual fusion of consecutive fusable ops.
-    /// Now implements real pattern-based fusion using the self-documenting helpers.
+    ///
+    /// Pattern-based on **case-insensitive** op names (ONNX `op_type` is often
+    /// `MatMul`/`Relu`; match uses the same `trim` + `to_ascii_lowercase` rule as
+    /// host graph). Stored fused names are lowercase (`fused_matmul_relu`, …).
+    ///
+    /// - **3-op (Phase 6 XDNA2-oriented):** `conv+add+relu` → `fused_conv_bias_relu`,
+    ///   `matmul+add+relu` → `fused_matmul_add_relu`, `gemm+add+relu` → `fused_gemm_add_relu`
+    /// - **2-op:** `conv+relu/sigmoid/conv/batchnorm`, `matmul+relu`, `gemm+relu`,
+    ///   `matmul+add`, `gemm+add`
+    ///
+    /// Prefer longer matches first so bias+relu collapses in one step.
     fn fuse_consecutive(&mut self) -> usize {
         let mut fused = 0usize;
         let mut i = 0;
         while i + 1 < self.node_count() {
-            let curr = self.get_op(i);
-            let next = self.get_op(i + 1);
+            // Case-insensitive match (Issue 1): production ONNX keeps PascalCase.
+            let curr = Self::normalize_fuse_op(self.get_op(i));
+            let next = Self::normalize_fuse_op(self.get_op(i + 1));
+            let third = if i + 2 < self.node_count() {
+                Some(Self::normalize_fuse_op(self.get_op(i + 2)))
+            } else {
+                None
+            };
 
-            if curr == "conv" {
-                let fused_name = match next {
-                    "relu" => "fused_conv_relu",
-                    "sigmoid" => "fused_conv_sigmoid",
-                    "conv" => "fused_conv_conv",
-                    "batchnorm" => "fused_conv_batchnorm",
-                    _ => "fused_conv_activation",
+            // Phase 6: three-op linear fusions first (bias + relu).
+            if let Some(ref t) = third {
+                let triple = match (curr.as_str(), next.as_str(), t.as_str()) {
+                    ("conv", "add", "relu") => Some("fused_conv_bias_relu"),
+                    ("matmul", "add", "relu") => Some("fused_matmul_add_relu"),
+                    ("gemm", "add", "relu") => Some("fused_gemm_add_relu"),
+                    _ => None,
                 };
+                if let Some(name) = triple {
+                    self.apply_fuse_span(i, 3, name);
+                    fused += 1;
+                    // Stay at i to allow chain fusions with the new op; advance by 1.
+                    i += 1;
+                    continue;
+                }
+            }
 
-                self.set_op(i, fused_name.to_string());
+            let fused_name = match (curr.as_str(), next.as_str()) {
+                ("conv", "relu") => Some("fused_conv_relu"),
+                ("conv", "sigmoid") => Some("fused_conv_sigmoid"),
+                ("conv", "conv") => Some("fused_conv_conv"),
+                ("conv", "batchnorm") => Some("fused_conv_batchnorm"),
+                ("conv", _) => Some("fused_conv_activation"),
+                ("matmul", "relu") => Some("fused_matmul_relu"),
+                ("gemm", "relu") => Some("fused_gemm_relu"),
+                ("matmul", "add") => Some("fused_matmul_add"),
+                ("gemm", "add") => Some("fused_gemm_add"),
+                _ => None,
+            };
 
-                // Merge inputs/outputs for the fused node (simple concatenation for now)
-                let merged_inputs = [self.inputs[i].clone(), self.inputs[i + 1].clone()].concat();
-                let merged_outputs =
-                    [self.outputs[i].clone(), self.outputs[i + 1].clone()].concat();
-
-                self.inputs[i] = merged_inputs;
-                self.outputs[i] = merged_outputs;
-
-                // Drop shape/dtype for the fused node (would need real shape inference in a full IR)
-                self.shapes[i] = None;
-                self.dtypes[i] = None;
-
-                self.remove_node(i + 1);
+            if let Some(name) = fused_name {
+                self.apply_fuse_span(i, 2, name);
                 fused += 1;
             }
             i += 1;
         }
         fused
+    }
+
+    /// Same normalization as host_graph (`trim` + ASCII lower) for fuse matching.
+    fn normalize_fuse_op(op: &str) -> String {
+        op.trim().to_ascii_lowercase()
+    }
+
+    /// Collapse `count` consecutive nodes starting at `i` into one fused op name.
+    fn apply_fuse_span(&mut self, i: usize, count: usize, fused_name: &str) {
+        debug_assert!(count >= 2);
+        self.set_op(i, fused_name.to_string());
+        let mut merged_inputs = self.inputs.get(i).cloned().unwrap_or_default();
+        let mut merged_outputs = self.outputs.get(i).cloned().unwrap_or_default();
+        for j in 1..count {
+            if i + j < self.inputs.len() {
+                merged_inputs.extend(self.inputs[i + j].clone());
+            }
+            if i + j < self.outputs.len() {
+                merged_outputs.extend(self.outputs[i + j].clone());
+            }
+        }
+        if i < self.inputs.len() {
+            self.inputs[i] = merged_inputs;
+        }
+        if i < self.outputs.len() {
+            self.outputs[i] = merged_outputs;
+        }
+        self.shapes[i] = None;
+        self.dtypes[i] = None;
+        // Keep first node's attrs (Gemm alpha etc.); drop fused-away node attrs.
+        if i < self.node_attrs.len() {
+            // attrs already at i; trailing nodes removed below
+        }
+        // Remove trailing nodes high-to-low so indices stay valid.
+        for j in (1..count).rev() {
+            self.remove_node(i + j);
+        }
     }
 
     /// Real MemoryPlanning pass: records a memory plan.
@@ -538,15 +618,135 @@ struct ModelSpec {
     layout: Option<String>,
     #[serde(default)]
     quantization: Option<String>,
+    /// Phase 5: optional weight / constant tensors for host graph fixtures.
+    #[serde(default)]
+    initializers: Vec<JsonInitializer>,
 }
 
-/// A single node in a model graph (name + operator type).
+/// A single node in a model graph (name + operator type + optional tensor names).
 /// Used when loading richer JSON models that mimic ONNX node structure.
+/// Phase 5: `inputs` enables named weight/bias binding in host graph.
+/// Phase 7: optional `attrs` for Gemm alpha/beta/trans* etc.
 #[derive(serde::Deserialize, Default, Clone)]
 struct ModelNode {
     #[serde(default)]
     name: Option<String>,
     op: String,
+    /// ONNX-style input tensor names (e.g. `["x", "W", "b"]` for Gemm).
+    #[serde(default)]
+    inputs: Vec<String>,
+    /// ONNX-style output tensor names.
+    #[serde(default)]
+    outputs: Vec<String>,
+    /// Optional attributes object (`{"alpha": 1.0, "transB": 1}`).
+    #[serde(default)]
+    attrs: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// JSON fixture form of an ONNX-style initializer (Phase 5 host graph tests).
+///
+/// Example:
+/// ```json
+/// {"name": "W", "shape": [2, 3], "data": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]}
+/// ```
+#[derive(serde::Deserialize, Default, Clone)]
+struct JsonInitializer {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    shape: Vec<i64>,
+    /// Optional ONNX data_type (default 1 = FLOAT).
+    #[serde(default)]
+    data_type: Option<i32>,
+    /// Float payload (preferred for host f32 fixtures).
+    #[serde(default)]
+    data: Vec<f32>,
+    /// Alias accepted for `data`.
+    #[serde(default)]
+    data_f32: Vec<f32>,
+}
+
+impl JsonInitializer {
+    fn into_initializer(self) -> Result<Initializer, String> {
+        let data_f32 = if self.data.is_empty() {
+            self.data_f32
+        } else {
+            self.data
+        };
+        // Refuse shape product ≠ payload when both are present (plan/execute consistency).
+        if !self.shape.is_empty() && !data_f32.is_empty() {
+            let shape_elems =
+                self.shape.iter().try_fold(
+                    1_i64,
+                    |acc, &d| {
+                        if d < 0 { None } else { acc.checked_mul(d) }
+                    },
+                );
+            match shape_elems {
+                None => {
+                    return Err(format!(
+                        "initializer '{}': invalid shape {:?}",
+                        self.name, self.shape
+                    ));
+                }
+                Some(n) if n > 0 && usize::try_from(n).ok() != Some(data_f32.len()) => {
+                    return Err(format!(
+                        "initializer '{}': shape product {n} != data length {} (shape={:?})",
+                        self.name,
+                        data_f32.len(),
+                        self.shape
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(Initializer {
+            name: self.name,
+            shape: self.shape,
+            data_type: self.data_type.unwrap_or(1),
+            data_f32,
+            data_i8: vec![],
+            data_int32: vec![],
+            data_int64: vec![],
+            raw_data: vec![],
+        })
+    }
+}
+
+/// Parse a top-level or `graph.`-prefixed string array (e.g. `graph_outputs`).
+fn parse_json_string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .or_else(|| value.get("graph").and_then(|g| g.get(key)))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse `initializers` array from a JSON object (top-level or under `graph`).
+///
+/// # Errors
+///
+/// Returns `Err(reason)` when an initializer has inconsistent shape vs data.
+fn parse_json_initializers(value: &serde_json::Value) -> Result<Vec<Initializer>, String> {
+    let arr = value
+        .get("initializers")
+        .or_else(|| value.get("graph").and_then(|g| g.get("initializers")))
+        .and_then(|v| v.as_array());
+    let Some(arr) = arr else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        if let Ok(j) = serde_json::from_value::<JsonInitializer>(item.clone()) {
+            out.push(j.into_initializer()?);
+        }
+    }
+    Ok(out)
 }
 
 /// Trait for loading model graphs from different formats.
@@ -606,7 +806,10 @@ impl ModelLoader for OnnxModelLoader {
                             let mut inputs = vec![];
                             let mut outputs = vec![];
 
+                            let mut node_attrs = Vec::new();
                             for node in graph.node {
+                                // Phase 7: extract Gemm/Conv attributes (alpha/beta/trans*, pads, …).
+                                node_attrs.push(node_attrs_from_onnx_attributes(&node.attribute));
                                 ops.push(node.op_type);
                                 node_names.push(Some(node.name).filter(|s| !s.is_empty()));
                                 inputs.push(node.input);
@@ -626,18 +829,16 @@ impl ModelLoader for OnnxModelLoader {
                                     (Option<Vec<i64>>, Option<String>),
                                 > = HashMap::new();
 
-                                for vi in &graph.value_info {
+                                // value_info + graph.input + graph.output (Issue 5).
+                                let mut ingest_vi = |vi: &tract_onnx::pb::ValueInfoProto| {
                                     let tname = vi.name.clone();
                                     if tname.is_empty() {
-                                        continue;
+                                        return;
                                     }
                                     let mut shape: Option<Vec<i64>> = None;
                                     let mut dtype: Option<String> = None;
 
                                     if let Some(ref tp) = vi.r#type {
-                                        // The prost-generated ONNX TypeProto uses a oneof `value`
-                                        // (tract_onnx::pb::type_proto::Value). We only use the
-                                        // TensorType arm here for onx-03 basic extraction.
                                         if let Some(
                                             tract_onnx::pb::type_proto::Value::TensorType(tt),
                                         ) = &tp.value
@@ -658,9 +859,6 @@ impl ModelLoader for OnnxModelLoader {
                                                     .dim
                                                     .iter()
                                                     .map(|d| {
-                                                        // Dimension oneof path proven for this tract-onnx
-                                                        // pb version: tensor_shape_proto::dimension::Value
-                                                        // (DimValue / DimParam). -1 for symbolic/unknown.
                                                         if let Some(
                                                             tract_onnx::pb::tensor_shape_proto::dimension::Value::DimValue(v),
                                                         ) = &d.value
@@ -683,6 +881,38 @@ impl ModelLoader for OnnxModelLoader {
                                         }
                                     }
                                     value_info_map.insert(tname, (shape, dtype));
+                                };
+                                for vi in &graph.value_info {
+                                    ingest_vi(vi);
+                                }
+                                for vi in &graph.input {
+                                    ingest_vi(vi);
+                                }
+                                for vi in &graph.output {
+                                    ingest_vi(vi);
+                                }
+
+                                let graph_input_names: Vec<String> = graph
+                                    .input
+                                    .iter()
+                                    .map(|v| v.name.clone())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                let graph_output_names: Vec<String> = graph
+                                    .output
+                                    .iter()
+                                    .map(|v| v.name.clone())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                let mut named_shapes = Vec::new();
+                                let mut named_dtypes = Vec::new();
+                                for (name, (sh, dt)) in &value_info_map {
+                                    if let Some(s) = sh {
+                                        named_shapes.push((name.clone(), s.clone()));
+                                    }
+                                    if let Some(d) = dt {
+                                        named_dtypes.push((name.clone(), d.clone()));
+                                    }
                                 }
 
                                 // Populate parallel metadata using each node's first output name as key
@@ -828,6 +1058,11 @@ impl ModelLoader for OnnxModelLoader {
                                     layouts: vec![None; node_count],
                                     initializer_count: graph.initializer.len(),
                                     initializers,
+                                    node_attrs,
+                                    graph_input_names,
+                                    graph_output_names,
+                                    named_shapes,
+                                    named_dtypes,
                                 });
                             }
                         }
@@ -856,6 +1091,11 @@ impl ModelLoader for OnnxModelLoader {
                     layouts: vec![None; 20],
                     initializer_count: 0,
                     initializers: vec![],
+                    node_attrs: vec![NodeAttrs::default(); 20],
+                    graph_input_names: vec![],
+                    graph_output_names: vec![],
+                    named_shapes: vec![],
+                    named_dtypes: vec![],
                 });
             }
             return Ok(ModelGraph::new()); // 100-node default
@@ -877,6 +1117,7 @@ impl ModelLoader for OnnxModelLoader {
                 let mut dtypes = vec![];
                 let mut inputs = vec![];
                 let mut outputs = vec![];
+                let mut node_attrs = vec![];
                 for node in nodes {
                     // Support both "op" and "op_type" (real ONNX uses op_type)
                     if let Some(op) = node
@@ -921,11 +1162,28 @@ impl ModelLoader for OnnxModelLoader {
                             })
                             .unwrap_or_default();
                         outputs.push(node_outputs);
+
+                        // Phase 7: optional attrs object (Gemm alpha/beta/trans*, …)
+                        let attrs = node
+                            .get("attrs")
+                            .and_then(|a| a.as_object())
+                            .map(NodeAttrs::from_json_map)
+                            .unwrap_or_default();
+                        node_attrs.push(attrs);
                     }
                 }
 
                 if !ops.is_empty() {
                     let shape_count = ops.len();
+                    let initializers = parse_json_initializers(&value).map_err(|reason| {
+                        DragonNpuError::ModelParseError {
+                            model: model_path.to_string(),
+                            reason,
+                        }
+                    })?;
+                    let initializer_count = initializers.len();
+                    let graph_input_names = parse_json_string_list(&value, "graph_inputs");
+                    let graph_output_names = parse_json_string_list(&value, "graph_outputs");
                     return Ok(ModelGraph {
                         ops,
                         memory_plan: 0,
@@ -937,8 +1195,13 @@ impl ModelLoader for OnnxModelLoader {
                         inputs,
                         outputs,
                         layouts: vec![None; shape_count],
-                        initializer_count: 0,
-                        initializers: vec![],
+                        initializer_count,
+                        initializers,
+                        node_attrs,
+                        graph_input_names,
+                        graph_output_names,
+                        named_shapes: vec![],
+                        named_dtypes: vec![],
                     });
                 }
             }
@@ -952,6 +1215,13 @@ impl ModelLoader for OnnxModelLoader {
                 if !ops.is_empty() {
                     let node_names = vec![None; ops.len()];
                     let shape_count = node_names.len();
+                    let initializers = parse_json_initializers(&value).map_err(|reason| {
+                        DragonNpuError::ModelParseError {
+                            model: model_path.to_string(),
+                            reason,
+                        }
+                    })?;
+                    let initializer_count = initializers.len();
                     return Ok(ModelGraph {
                         ops,
                         memory_plan: 0,
@@ -963,8 +1233,13 @@ impl ModelLoader for OnnxModelLoader {
                         inputs: vec![vec![]; shape_count],
                         outputs: vec![vec![]; shape_count],
                         layouts: vec![None; shape_count],
-                        initializer_count: 0,
-                        initializers: vec![],
+                        initializer_count,
+                        initializers,
+                        node_attrs: vec![NodeAttrs::default(); shape_count],
+                        graph_input_names: vec![],
+                        graph_output_names: vec![],
+                        named_shapes: vec![],
+                        named_dtypes: vec![],
                     });
                 }
             }
@@ -1013,23 +1288,64 @@ fn parse_model_impl(model_path: &str) -> Result<ModelGraph, DragonNpuError> {
         })?;
 
         // Prefer richer `nodes` representation when present (forward path to real ONNX).
-        // Also collect optional node names so the dead_code allow on ModelNode::name
-        // can be removed.
-        let (ops, node_names) = if spec.nodes.is_empty() {
+        // Phase 5: also collect per-node inputs/outputs for named weight/bias binding.
+        // Phase 7: optional per-node attrs.
+        let (ops, node_names, node_inputs, node_outputs, node_attrs) = if spec.nodes.is_empty() {
             let ops = spec.ops;
             let names = vec![None; ops.len()];
-            (ops, names)
+            let n = ops.len();
+            (
+                ops,
+                names,
+                vec![vec![]; n],
+                vec![vec![]; n],
+                vec![NodeAttrs::default(); n],
+            )
         } else {
             let mut ops = Vec::new();
             let mut names = Vec::new();
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut attrs = Vec::new();
             for n in spec.nodes {
                 ops.push(n.op);
                 names.push(n.name);
+                inputs.push(n.inputs);
+                outputs.push(n.outputs);
+                attrs.push(
+                    n.attrs
+                        .as_ref()
+                        .map(NodeAttrs::from_json_map)
+                        .unwrap_or_default(),
+                );
             }
-            (ops, names)
+            (ops, names, inputs, outputs, attrs)
         };
 
         let shape_count = ops.len();
+        // Phase 5: also accept initializers from raw JSON (ModelSpec path) so
+        // fixtures work for both DefaultModelLoader and richer ONNX-style JSON.
+        let mut initializers: Vec<Initializer> = Vec::new();
+        for j in spec.initializers {
+            initializers.push(j.into_initializer().map_err(|reason| {
+                DragonNpuError::ModelParseError {
+                    model: model_path.to_string(),
+                    reason,
+                }
+            })?);
+        }
+        if initializers.is_empty() {
+            // Re-parse raw for graph.initializers / alternate spellings.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                initializers = parse_json_initializers(&value).map_err(|reason| {
+                    DragonNpuError::ModelParseError {
+                        model: model_path.to_string(),
+                        reason,
+                    }
+                })?;
+            }
+        }
+        let initializer_count = initializers.len();
         return Ok(ModelGraph {
             ops,
             memory_plan: 0,
@@ -1038,11 +1354,16 @@ fn parse_model_impl(model_path: &str) -> Result<ModelGraph, DragonNpuError> {
             node_names,
             shapes: vec![None; shape_count],
             dtypes: vec![None; shape_count],
-            inputs: vec![vec![]; shape_count],
-            outputs: vec![vec![]; shape_count],
+            inputs: node_inputs,
+            outputs: node_outputs,
             layouts: vec![None; shape_count],
-            initializer_count: 0,
-            initializers: vec![],
+            initializer_count,
+            initializers,
+            node_attrs,
+            graph_input_names: vec![],
+            graph_output_names: vec![],
+            named_shapes: vec![],
+            named_dtypes: vec![],
         });
     }
 
@@ -1093,6 +1414,11 @@ fn parse_model_impl(model_path: &str) -> Result<ModelGraph, DragonNpuError> {
                 layouts: vec![None; node_count],
                 initializer_count: 0,
                 initializers: vec![],
+                node_attrs: vec![NodeAttrs::default(); node_count],
+                graph_input_names: vec![],
+                graph_output_names: vec![],
+                named_shapes: vec![],
+                named_dtypes: vec![],
             });
         }
         // empty .txt is treated as parse error (no operators)
@@ -1122,6 +1448,11 @@ fn parse_model_impl(model_path: &str) -> Result<ModelGraph, DragonNpuError> {
             layouts: vec![None; 20],
             initializer_count: 0,
             initializers: vec![],
+            node_attrs: vec![NodeAttrs::default(); 20],
+            graph_input_names: vec![],
+            graph_output_names: vec![],
+            named_shapes: vec![],
+            named_dtypes: vec![],
         })
     } else if lower.contains("large")
         || ext.as_deref() == Some("onnx")
@@ -1143,6 +1474,11 @@ fn parse_model_impl(model_path: &str) -> Result<ModelGraph, DragonNpuError> {
             layouts: vec![None; 20],
             initializer_count: 0,
             initializers: vec![],
+            node_attrs: vec![NodeAttrs::default(); 20],
+            graph_input_names: vec![],
+            graph_output_names: vec![],
+            named_shapes: vec![],
+            named_dtypes: vec![],
         })
     }
 }
@@ -1171,11 +1507,15 @@ impl ModelCompiler {
     ///
     /// Level 3 now exercises all four passes (including MemoryPlanning).
     ///
+    /// Phase 7 (level ≥ 2): before ModelGraph fuse/layout passes, convert to
+    /// [`DragonNpuIR`], run shape inference + constant fold + DCE, then lower
+    /// back. Host_ref / fused op names remain the Phase 6 allowlist.
+    ///
     /// # Errors
     ///
     /// Returns `DragonNpuError::CompilationFailed` for invalid paths or unsupported options.
     /// The cast is safe because node reduction is always non-negative (100 - node_count >= 0).
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn compile(
         &self,
         model_path: &str,
@@ -1222,6 +1562,16 @@ impl ModelCompiler {
                 model: model_path.to_string(),
                 reason: format!("unsupported quantization '{quantization}'"),
             });
+        }
+
+        // Phase 7: IR shape infer + constant fold + DCE at optimization_level ≥ 2.
+        // Runs *before* fuse so dead Identity / folded consts do not block fusion.
+        // Does not invent silicon sizes; does not enable EXEC_CMD.
+        if optimization_level >= 2 {
+            let mut ir = DragonNpuIR::from_model_graph(&graph)?;
+            let _stats = ir.optimize_level2()?;
+            // Write inferred shapes back onto nodes when present.
+            graph = ir.to_model_graph();
         }
 
         // Execute the passes on the parsed graph (real logic; see dragon_npu_compiler.py for full graph transforms)
@@ -1300,6 +1650,8 @@ impl ModelCompiler {
             graph.layouts,
             graph.initializer_count,
             graph.initializers,
+            graph.ops,
+            graph.node_attrs,
         ))
     }
 
@@ -1660,12 +2012,125 @@ mod tests {
             "conv".to_string(),
             "batchnorm".to_string(),
         ];
+        // Parallel metadata must match node count for remove_node hygiene.
+        let n = graph.ops.len();
+        graph.node_names = vec![None; n];
+        graph.shapes = vec![None; n];
+        graph.dtypes = vec![None; n];
+        graph.inputs = vec![vec![]; n];
+        graph.outputs = vec![vec![]; n];
+        graph.layouts = vec![None; n];
+        graph.node_attrs = vec![NodeAttrs::default(); n];
         let fused = graph.fuse_consecutive();
         // Three fusions are possible: conv+relu, conv+sigmoid, conv+batchnorm
         assert_eq!(fused, 3);
         assert_eq!(graph.ops[0], "fused_conv_relu");
         assert_eq!(graph.ops[1], "fused_conv_sigmoid");
         assert_eq!(graph.ops[2], "fused_conv_batchnorm");
+    }
+
+    #[test]
+    fn compile_fuse_matmul_relu_and_gemm_relu() {
+        let mut graph = ModelGraph::new();
+        graph.ops = vec![
+            "matmul".to_string(),
+            "relu".to_string(),
+            "gemm".to_string(),
+            "relu".to_string(),
+        ];
+        let n = graph.ops.len();
+        graph.node_names = vec![None; n];
+        graph.shapes = vec![None; n];
+        graph.dtypes = vec![None; n];
+        graph.inputs = vec![vec![]; n];
+        graph.outputs = vec![vec![]; n];
+        graph.layouts = vec![None; n];
+        graph.node_attrs = vec![NodeAttrs::default(); n];
+        let fused = graph.fuse_consecutive();
+        assert_eq!(fused, 2);
+        assert_eq!(graph.ops[0], "fused_matmul_relu");
+        assert_eq!(graph.ops[1], "fused_gemm_relu");
+    }
+
+    #[test]
+    fn compile_fuse_matmul_add_relu_three_op() {
+        let mut graph = ModelGraph::new();
+        graph.ops = vec![
+            "matmul".to_string(),
+            "add".to_string(),
+            "relu".to_string(),
+            "conv".to_string(),
+            "add".to_string(),
+            "relu".to_string(),
+            "gemm".to_string(),
+            "add".to_string(),
+            "relu".to_string(),
+        ];
+        let n = graph.ops.len();
+        graph.node_names = vec![None; n];
+        graph.shapes = vec![None; n];
+        graph.dtypes = vec![None; n];
+        graph.inputs = vec![vec![]; n];
+        graph.outputs = vec![vec![]; n];
+        graph.layouts = vec![None; n];
+        graph.node_attrs = vec![NodeAttrs::default(); n];
+        let fused = graph.fuse_consecutive();
+        assert_eq!(fused, 3);
+        assert_eq!(graph.ops[0], "fused_matmul_add_relu");
+        assert_eq!(graph.ops[1], "fused_conv_bias_relu");
+        assert_eq!(graph.ops[2], "fused_gemm_add_relu");
+    }
+
+    #[test]
+    fn compile_fuse_matmul_add_and_gemm_add_two_op() {
+        // Issue 7: 2-op add fusions without trailing relu.
+        let mut graph = ModelGraph::new();
+        graph.ops = vec![
+            "matmul".to_string(),
+            "add".to_string(),
+            "gemm".to_string(),
+            "add".to_string(),
+        ];
+        let n = graph.ops.len();
+        graph.node_names = vec![None; n];
+        graph.shapes = vec![None; n];
+        graph.dtypes = vec![None; n];
+        graph.inputs = vec![vec![]; n];
+        graph.outputs = vec![vec![]; n];
+        graph.layouts = vec![None; n];
+        graph.node_attrs = vec![NodeAttrs::default(); n];
+        let fused = graph.fuse_consecutive();
+        assert_eq!(fused, 2);
+        assert_eq!(graph.ops[0], "fused_matmul_add");
+        assert_eq!(graph.ops[1], "fused_gemm_add");
+    }
+
+    #[test]
+    fn compile_fuse_pascal_case_onnx_op_types() {
+        // Issue 1: ONNX op_type case (MatMul/Relu/Gemm) must fuse.
+        let mut graph = ModelGraph::new();
+        graph.ops = vec![
+            "MatMul".to_string(),
+            "Relu".to_string(),
+            "Gemm".to_string(),
+            "Relu".to_string(),
+            "MatMul".to_string(),
+            "Add".to_string(),
+            "Relu".to_string(),
+        ];
+        let n = graph.ops.len();
+        graph.node_names = vec![None; n];
+        graph.shapes = vec![None; n];
+        graph.dtypes = vec![None; n];
+        graph.inputs = vec![vec![]; n];
+        graph.outputs = vec![vec![]; n];
+        graph.layouts = vec![None; n];
+        graph.node_attrs = vec![NodeAttrs::default(); n];
+        let fused = graph.fuse_consecutive();
+        assert_eq!(fused, 3, "ops after={:?}", graph.ops);
+        assert_eq!(graph.ops[0], "fused_matmul_relu");
+        assert_eq!(graph.ops[1], "fused_gemm_relu");
+        assert_eq!(graph.ops[2], "fused_matmul_add_relu");
     }
 
     #[test]
@@ -2474,6 +2939,190 @@ mod tests {
         assert_eq!(approx.len(), 2);
         // data_f32 is also populated by the loader for bf16 now
         assert_eq!(b.data_f32.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn onnx_loader_extracts_gemm_attributes() -> Result<(), DragonNpuError> {
+        // Phase 7: Gemm alpha/beta/transB must surface on ModelGraph.node_attrs.
+        use std::io::Write;
+        use tract_onnx::pb::{AttributeProto, GraphProto, ModelProto, NodeProto};
+
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_gemm_attrs.onnx");
+
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            let model = ModelProto {
+                ir_version: 7,
+                graph: Some(GraphProto {
+                    node: vec![NodeProto {
+                        op_type: "Gemm".to_string(),
+                        name: "linear".to_string(),
+                        input: vec!["a".to_string(), "b".to_string()],
+                        output: vec!["c".to_string()],
+                        attribute: vec![
+                            AttributeProto {
+                                name: "alpha".to_string(),
+                                f: 0.5,
+                                ..Default::default()
+                            },
+                            AttributeProto {
+                                name: "beta".to_string(),
+                                f: 1.0,
+                                ..Default::default()
+                            },
+                            AttributeProto {
+                                name: "transB".to_string(),
+                                i: 1,
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            prost::Message::encode(&model, &mut buf).expect("encode");
+            f.write_all(&buf).expect("write");
+        }
+
+        let graph = OnnxModelLoader.load(path.to_str().unwrap())?;
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(graph.ops.len(), 1);
+        assert_eq!(graph.ops[0], "Gemm");
+        assert_eq!(graph.node_attrs.len(), 1);
+        assert_eq!(graph.node_attrs[0].alpha, Some(0.5));
+        assert_eq!(graph.node_attrs[0].beta, Some(1.0));
+        assert_eq!(graph.node_attrs[0].trans_b, Some(1));
+
+        // Roundtrip through typed IR.
+        let ir = DragonNpuIR::from_model_graph(&graph)?;
+        assert_eq!(ir.nodes[0].attrs.alpha, Some(0.5));
+        assert_eq!(ir.nodes[0].attrs.trans_b, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn compile_level2_runs_ir_shape_and_fold_pipeline() -> Result<(), DragonNpuError> {
+        // Level ≥2 must not break the baseline heuristic model path.
+        let compiler = ModelCompiler::new();
+        let backend = Arc::new(crate::backends::SimulationBackend::new());
+        let model = compiler.compile("model.onnx", 2, "fp32", backend)?;
+        // 100 conv → IR (no DCE of conv) → fuse 50 pairs of fused_conv_conv.
+        assert_eq!(model.node_count(), 50);
+        assert!(model.optimization_level >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn compile_level2_foldable_const_graph_emits_constant_ops() -> Result<(), DragonNpuError> {
+        // Issue 1 (feature-free): fold must emit `Constant` (host allowlisted) not unknown
+        // op strings. Full host_ref golden lives under `amd-xdna2` host_graph tests (Issue 12).
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_level2_fold_ops.json");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            writeln!(
+                &mut f,
+                r#"{{
+                  "nodes": [
+                    {{"op": "Relu", "inputs": ["c0"], "outputs": ["r"]}},
+                    {{"op": "Add", "inputs": ["r", "c1"], "outputs": ["out"]}}
+                  ],
+                  "initializers": [
+                    {{"name": "c0", "shape": [3], "data": [-1.0, 2.0, -3.0]}},
+                    {{"name": "c1", "shape": [3], "data": [1.0, 1.0, 1.0]}}
+                  ],
+                  "graph_outputs": ["out"]
+                }}"#
+            )
+            .expect("write");
+        }
+        let compiler = ModelCompiler::new();
+        let backend = Arc::new(crate::backends::SimulationBackend::new());
+        let model = compiler.compile(path.to_str().unwrap(), 2, "fp32", backend)?;
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!model.ops().is_empty(), "expected folded Constant node(s)");
+        for op in model.ops() {
+            let n = op.trim().to_ascii_lowercase();
+            assert_eq!(
+                n,
+                "constant",
+                "level2 fold must leave only Constant (host-safe), got {op:?} in {:?}",
+                model.ops()
+            );
+        }
+        // Folded value must be materialised as initializer for host Constant load.
+        assert!(
+            model
+                .initializers()
+                .iter()
+                .any(|i| i.name == "out" && i.as_f32_data().len() == 3),
+            "expected folded 'out' initializer, got {:?}",
+            model
+                .initializers()
+                .iter()
+                .map(|i| (&i.name, i.as_f32_data().len()))
+                .collect::<Vec<_>>()
+        );
+        let out_init = model
+            .initializers()
+            .iter()
+            .find(|i| i.name == "out")
+            .expect("out");
+        let data = out_init.as_f32_data();
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[1] - 3.0).abs() < 1e-5);
+        assert!((data[2] - 1.0).abs() < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn json_loader_extracts_node_attrs() -> Result<(), DragonNpuError> {
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_attrs.json");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            writeln!(
+                &mut f,
+                r#"{{ "nodes": [ {{"op": "Gemm", "inputs": ["a","b"], "outputs": ["c"], "attrs": {{"alpha": 2.0, "transB": 1}} }} ] }}"#
+            )
+            .expect("write");
+        }
+        let graph = DefaultModelLoader.load(path.to_str().unwrap())?;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(graph.node_attrs[0].alpha, Some(2.0));
+        assert_eq!(graph.node_attrs[0].trans_b, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn compile_exposes_gemm_attrs_on_compiled_model() -> Result<(), DragonNpuError> {
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_gemm_compiled_attrs.json");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            writeln!(
+                &mut f,
+                r#"{{ "nodes": [ {{"op": "Gemm", "inputs": ["x","W"], "outputs": ["y"], "attrs": {{"alpha": 0.5, "transB": 1}} }} ] }}"#
+            )
+            .expect("write");
+        }
+        let compiler = ModelCompiler::new();
+        let backend = Arc::new(crate::backends::SimulationBackend::new());
+        let model = compiler.compile(path.to_str().unwrap(), 0, "fp32", backend)?;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(model.node_attrs().len(), 1);
+        assert_eq!(model.node_attrs()[0].alpha, Some(0.5));
+        assert_eq!(model.node_attrs()[0].trans_b, Some(1));
         Ok(())
     }
 }

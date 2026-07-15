@@ -52,13 +52,16 @@ fn main() {
         let real_stub = AmdXdna2Backend::new_with_real_stub();
         print_backend_state("real_stub", &real_stub);
 
-        // Exercise the primary submit_and_run boundary on the real stub path.
-        // This is the exact method real XDNA2 NPU submission will implement.
-        println!(
-            "\n=== submit_and_run on real stub (expected to error until real path is wired) ==="
-        );
+        // Phase 4: Real arm compile uses ModelCompiler; default submit is fail-closed
+        // (XDNA2_REAL_SUBMIT_MODE=host_ref for host outputs; npu_exec needs EXEC gates).
+        println!("\n=== submit_and_run on Real arm (Phase 4: compile OK, default fail-closed) ===");
         match real_stub.compile_model("model.onnx", 1, "fp32") {
             Ok(model) => {
+                println!("real_stub.compile_ok=true");
+                println!("real_stub.ops_count={}", model.ops().len());
+                let plan = AmdXdna2Backend::xdna2_compile_plan(&model);
+                println!("real_stub.host_ref_supported={}", plan.host_ref_supported);
+                println!("real_stub.plan_notes={}", plan.notes);
                 // Real .onnx files now populate model.initializers() with actual
                 // weight tensor data (float32 + int8/int32 + bf16 raw_data) when present.
                 if model.has_real_weights() {
@@ -67,7 +70,9 @@ fn main() {
                 }
                 let input = vec![0.0f32; 10];
                 match real_stub.submit_and_run(&model, &input) {
-                    Ok(_) => println!("submit_and_run_unexpected_success=true"),
+                    Ok(_) => println!(
+                        "submit_and_run_ok=true (only expected with XDNA2_REAL_SUBMIT_MODE=host_ref + allowlisted ops; not NPU)"
+                    ),
                     Err(e) => println!("submit_and_run_error={e:?}"),
                 }
             }
@@ -234,10 +239,13 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
     // Track one successful hwctx (if any) for real-hwctx submit only when
     // exec_cmd_is_enabled() (feature + XDNA2_ALLOW_EXEC_CMD=1). Always cleaned up.
     let mut successful_ctx_for_submit: Option<HardwareContext> = None;
+    let mut hwctx_successes: usize = 0;
+    let mut hwctx_failures: usize = 0;
 
     for (i, (tiles, mem, umq_sz, log_sz)) in hwctx_variants.iter().enumerate() {
         match backend.create_direct_hwctx_with_sizes(*tiles, *mem, *umq_sz, *log_sz, None) {
             Ok(ctx) => {
+                hwctx_successes += 1;
                 println!(
                     "{label}.direct_hwctx[{i}].SUCCESS tiles={tiles} mem={mem} umq={umq_sz} log={log_sz} handle={}",
                     ctx.handle
@@ -250,6 +258,7 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
                 }
             }
             Err(e) => {
+                hwctx_failures += 1;
                 let err_str = format!("{e:?}");
                 let display = if err_str.len() > 600 {
                     format!(
@@ -318,55 +327,91 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
         );
 
         let sub2 = backend.direct_submission();
-        let cmd_bo_size: u64 = 4096;
+        // Prefer submit+wait (finite timeout) over bare EXEC_CMD when gates are open.
+        // See docs/XDNA2_EXEC_CMD_LAB.md — single-shot only; never loop; never empty Cmd BO.
+        let wait_ms = std::env::var("XDNA2_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(dragon_npu::backends::amd_xdna2::DEFAULT_WAIT_CMD_TIMEOUT_MS);
 
-        match sub2.create_buffer(0, cmd_bo_size, BufferType::Cmd) {
-            Ok(cmd_handle) => {
-                println!(
-                    "{label}.submit_real_hwctx.cmd_bo.created handle={} size={}",
-                    cmd_handle.0, cmd_bo_size
-                );
-
-                let real_cmd = Command {
-                    ty: CommandType::SubmitExecBuf,
-                    hwctx_handle: real_ctx.handle,
-                    payload: vec![],
-                    cmd_bo_handle: Some(cmd_handle.0),
-                };
-
-                match sub2.submit_command(0, &real_cmd) {
-                    Ok(seq) => {
+        // Phase 1 START_NPU envelope + host fill is mandatory before EXEC_CMD.
+        // inst_buffer=0 is structural research only (not GEMM). Refuse rather than
+        // empty-submit (2026-07-13 wedge class). No no-cmd-bo fallback.
+        match dragon_npu::backends::amd_xdna2::build_ert_start_npu_cmd_bo(0, 0, &[], 0x1) {
+            Ok(payload) => {
+                let cmd_bo_size = payload.len() as u64;
+                match sub2.create_buffer(0, cmd_bo_size, BufferType::Cmd) {
+                    Ok(cmd_handle) => {
                         println!(
-                            "{label}.submit_real_hwctx.success seq={} (cmd_bo={})",
-                            seq, cmd_handle.0
+                            "{label}.submit_real_hwctx.cmd_bo.created handle={} size={} \
+                             (START_NPU envelope)",
+                            cmd_handle.0, cmd_bo_size
                         );
+                        match dragon_npu::backends::amd_xdna2::fill_cmd_bo_with_payload(
+                            sub2.as_ref(),
+                            0,
+                            cmd_handle.0,
+                            &payload,
+                        ) {
+                            Ok(()) => {
+                                println!(
+                                    "{label}.submit_real_hwctx.cmd_bo.host_filled bytes={}",
+                                    payload.len()
+                                );
+                                let real_cmd = Command {
+                                    ty: CommandType::SubmitExecBuf,
+                                    hwctx_handle: real_ctx.handle,
+                                    payload,
+                                    cmd_bo_handle: Some(cmd_handle.0),
+                                    // Envelope-only probe path: no IFM/WTS/OFM pin list.
+                                    arg_bo_handles: Vec::new(),
+                                };
+                                match dragon_npu::backends::amd_xdna2::submit_and_wait_command(
+                                    sub2.as_ref(),
+                                    0,
+                                    &real_cmd,
+                                    wait_ms,
+                                ) {
+                                    Ok(r) => {
+                                        println!(
+                                            "{label}.submit_real_hwctx.success seq={} wait_ms={} \
+                                             cmd_bo={} (EXEC_CMD+WAIT accept only — not ran_on_npu)",
+                                            r.seq, r.timeout_ms, cmd_handle.0
+                                        );
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "{label}.submit_real_hwctx.error cmd_bo={} \
+                                             wait_ms={wait_ms} -> {e:?}",
+                                            cmd_handle.0
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!(
+                                    "{label}.submit_real_hwctx.cmd_bo_fill_failed handle={} -> {e:?} \
+                                     (refusing EXEC_CMD; empty Cmd BO is the wedge class)",
+                                    cmd_handle.0
+                                );
+                            }
+                        }
+                        let _ = sub2.destroy_buffer(0, cmd_handle.0);
                     }
                     Err(e) => {
-                        // Gold: first time a real hwctx + real Cmd BO + EXEC_CMD (with handle)
-                        // is exercised on this hardware. Rich error will show driver/firmware reaction.
                         println!(
-                            "{label}.submit_real_hwctx.error cmd_bo={} -> {e:?}",
-                            cmd_handle.0
+                            "{label}.submit_real_hwctx.cmd_bo.creation_failed -> {e:?} \
+                             (refusing EXEC_CMD without host-filled Cmd BO; no empty fallback)"
                         );
                     }
                 }
-
-                // Cleanup: destroy the Cmd BO we just created for this experiment.
-                let _ = sub2.destroy_buffer(0, cmd_handle.0);
             }
             Err(e) => {
-                println!("{label}.submit_real_hwctx.cmd_bo.creation_failed -> {e:?}");
-                // Still attempt the submit (with no cmd_bo_handle) so we at least exercise the path.
-                let fallback_cmd = Command {
-                    ty: CommandType::SubmitExecBuf,
-                    hwctx_handle: real_ctx.handle,
-                    payload: vec![0u8; 32],
-                    cmd_bo_handle: None,
-                };
-                match sub2.submit_command(0, &fallback_cmd) {
-                    Ok(seq) => println!("{label}.submit_real_hwctx.fallback_success seq={seq}"),
-                    Err(e2) => println!("{label}.submit_real_hwctx.fallback_error={e2:?}"),
-                }
+                println!(
+                    "{label}.submit_real_hwctx.payload_build_failed -> {e:?} \
+                     (refusing EXEC_CMD)"
+                );
             }
         }
 
@@ -386,31 +431,53 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
     // =====================================================================
     // Bring-up summary & recommended next experiments (for the user on real hardware)
     // =====================================================================
-    // This section uses the patterns observed across all previous detailed
-    // hardware runs (including the user's 2026-05-30 multi-grid log) to give
-    // actionable suggestions for the next `cargo run` invocation.
     println!("\n=== Bring-up summary & recommended next experiments ===");
     println!(
-        "{label}.bringup_status=CREATE_HWCTX still EINVAL across all matrices so far (flags via XDNA2_BO_FLAGS, sizes, sync dirs, DevHeap, etc.)."
+        "{label}.bringup_status=CREATE_HWCTX grid: {hwctx_successes} ok, {hwctx_failures} fail (of {} variants)",
+        hwctx_variants.len()
+    );
+    if hwctx_successes > 0 {
+        println!(
+            "{label}.bringup_status=CREATE_HWCTX works on this host (Real arm + current amdxdna/firmware)."
+        );
+        println!(
+            "{label}.bringup_status=Open/GET_INFO/create+destroy hwctx path is usable for payload research."
+        );
+    } else {
+        println!(
+            "{label}.bringup_status=CREATE_HWCTX still failing all variants — check driver (stock vs hardened), DevHeap, qos_p, tiles×4."
+        );
+        println!(
+            "{label}.bringup_status=Note: Simulation/normal backend path cannot create real hwctx (needs Real arm)."
+        );
+    }
+    println!(
+        "{label}.bringup_status=EXEC_CMD permanently gated (feature xdna2-dangerous-exec-cmd + XDNA2_ALLOW_EXEC_CMD=1); lab kernel may also need exec_cmd_allow=1."
     );
     println!(
-        "{label}.bringup_status=DevHeap only ever succeeds the *first* time in a process (EBUSY forever after because all DESTROY_BO nrs fail)."
-    );
-    println!(
-        "{label}.bringup_status=Shmem + good sync (0/2) reaches CREATE_HWCTX but still EINVAL; get_bo_info remains dead (zeros/None)."
-    );
-    println!(
-        "{label}.bringup_status=EXEC_CMD is permanently gated (feature xdna2-dangerous-exec-cmd + XDNA2_ALLOW_EXEC_CMD=1); see docs/XDNA2_NEVER_AGAIN.md."
+        "{label}.bringup_status=Never claim ran_on_npu / microbench Pass from scaffold EXEC_CMD (docs/XDNA2_NEVER_AGAIN.md)."
     );
 
+    if hwctx_successes > 0 {
+        println!(
+            "{label}.recommended_next=Research real Cmd BO / txn payload (public ERT/cmdlist only; no default submit)."
+        );
+        println!(
+            "{label}.recommended_next=Keep L1+L3 gates closed until a known-good payload exists."
+        );
+        println!(
+            "{label}.recommended_next=Optional: wire timed_matmul host-side path to report hwctx_ok timings more richly."
+        );
+    } else {
+        println!(
+            "{label}.recommended_next=Use new_with_real_stub / Real arm; verify L2+L3 or stock amdxdna + firmware alias."
+        );
+        println!(
+            "{label}.recommended_next=Diagnose: bash scripts/diagnose_amdxdna.sh (never open /dev/accel while WEDGED_*)."
+        );
+    }
     println!(
-        "{label}.recommended_next=Try higher-bit or specific flag values with: XDNA2_BO_FLAGS=0x10,0x20,0x100,0x200"
-    );
-    println!(
-        "{label}.recommended_next=Never enable EXEC_CMD until a known-good firmware payload exists (docs/XDNA2_NEVER_AGAIN.md)."
-    );
-    println!(
-        "{label}.recommended_next=The compact error summaries + DevHeap spam mitigation should make long runs much more readable now."
+        "{label}.recommended_next=Hardened install / never-again: docs/XDNA2_NEVER_AGAIN.md + docs/XDNA2_HARDENED_INSTALL.md"
     );
 }
 

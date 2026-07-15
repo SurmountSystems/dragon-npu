@@ -14,8 +14,10 @@ remain the primary shield until a patched `amdxdna` is built, installed after a
 | [`0002-amdxdna-open-failfast-and-exec-gate.patch`](./0002-amdxdna-open-failfast-and-exec-gate.patch) | **L3** — unhealthy latch, killable open lock, `exec_cmd_allow` |
 | [`amdxdna-cmdlist-null-guards.md`](./amdxdna-cmdlist-null-guards.md) | L2 design notes |
 | [`amdxdna-open-failfast.md`](./amdxdna-open-failfast.md) | L3 design notes |
-| Upstream issue body | [`docs/upstream/AMDXDNA_ISSUE_cmdlist_null_open_wedge.md`](../../docs/upstream/AMDXDNA_ISSUE_cmdlist_null_open_wedge.md) (do not auto-post) |
-| L3 issue addendum | [`docs/upstream/AMDXDNA_ISSUE_L3_open_failfast_addendum.md`](../../docs/upstream/AMDXDNA_ISSUE_L3_open_failfast_addendum.md) (do not auto-post) |
+| Upstream contribution pack | [`docs/upstream/README.md`](../../docs/upstream/README.md) (plan, evidence, filing checklist — do not auto-post) |
+| Combined issue body | [`docs/upstream/AMDXDNA_ISSUE_combined.md`](../../docs/upstream/AMDXDNA_ISSUE_combined.md) (do not auto-post) |
+| L2 issue body | [`docs/upstream/AMDXDNA_ISSUE_cmdlist_null_open_wedge.md`](../../docs/upstream/AMDXDNA_ISSUE_cmdlist_null_open_wedge.md) |
+| L3 issue addendum | [`docs/upstream/AMDXDNA_ISSUE_L3_open_failfast_addendum.md`](../../docs/upstream/AMDXDNA_ISSUE_L3_open_failfast_addendum.md) |
 
 Related repo docs:
 

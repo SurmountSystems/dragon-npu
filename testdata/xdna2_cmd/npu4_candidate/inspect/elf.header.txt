@@ -1,0 +1,1 @@
+readelf: Error: /tmp/npu4_fake.elf: Failed to read file's magic number

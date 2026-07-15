@@ -1,0 +1,4 @@
+XRT Build Version: 2.21.75 (makepkg)
+       Build Date: 2026-06-21 20:57:42
+          Hash ID: 4eb1f4392a012b4e6eca759762389c612537f7c7
+ERROR: The '--list-sections' argument is a stand alone option.  No other options can be specified with it.

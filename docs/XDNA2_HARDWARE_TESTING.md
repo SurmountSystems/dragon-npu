@@ -166,7 +166,9 @@ status.dtypes=["fp32", "fp16", "bf16", "int8"]
 real_execution_active=true   # because the probe used new_with_real_stub()
 
 --- submit_and_run on real stub (expected) ---
-compile_for_submit_and_run_error=CompilationFailed { model: "model.onnx", reason: "real XDNA2 execution not fully implemented yet (device detected; production submission logic under active development)" }
+real_stub.compile_ok=true
+# default XDNA2_REAL_SUBMIT_MODE fail-closed (Phase 4):
+submit_and_run_error=RealSubmitNotReady { reason: "model 'model.onnx' compiled OK ... Set XDNA2_REAL_SUBMIT_MODE=host_ref ..." }
 ```
 
 Notes from this run:

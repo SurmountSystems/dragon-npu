@@ -1,1 +1,0 @@
-savedcmd_amdxdna_rescue.ko := /usr/bin/ld.bfd -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/lib/modules/7.1.3-zen1-2-zen/build/scripts/module.lds -o amdxdna_rescue.ko amdxdna_rescue.o amdxdna_rescue.mod.o .module-common.o

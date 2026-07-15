@@ -6,6 +6,12 @@ __pycache__/
 # L4 DKMS stage (full xdna-driver rsync — do not vendor into git)
 kernel/dkms/staging/
 
+# Built .ko copies (host-specific; do not commit binaries)
+kernel/out/
+
+# Upstream evidence snapshots (may contain host-local detail)
+docs/upstream/evidence/
+
 # C extensions
 *.so
 
@@ -90,5 +96,43 @@ docs/api/
 test_outputs/
 benchmark_results/
 
+# Lab instruction / txn blobs (operator-captured; never default CI)
+# Keep README + optional non-binary provenance notes tracked.
+# Git cannot re-include files under an ignored directory unless dirs are un-ignored first.
+testdata/xdna2_cmd/**
+!testdata/xdna2_cmd/**/
+!testdata/xdna2_cmd/README.md
+!testdata/xdna2_cmd/**/PROVENANCE.md
+!testdata/xdna2_cmd/**/*.sha256
+!testdata/xdna2_cmd/**/*.txt
+
+# Belt-and-suspenders: common mis-staged instruction paths outside staging dir
+**/lab_instr.bin
+**/ml_txn.bin
+**/*_instr.bin
+testdata/**/*.bin
+testdata/**/*.elf
+**/pm_ctrlpkt.bin
+
+# Instruction ELFs often drop at repo root or tests/fixtures by mistake
+*.elf
+
+# Rescue kmod build debris (keep .c / Makefile; rebuild on host)
+kernel/amdxdna_rescue/*.ko
+kernel/amdxdna_rescue/*.o
+kernel/amdxdna_rescue/*.mod
+kernel/amdxdna_rescue/*.mod.c
+kernel/amdxdna_rescue/*.mod.o
+kernel/amdxdna_rescue/*.cmd
+kernel/amdxdna_rescue/.*.cmd
+kernel/amdxdna_rescue/..*.cmd
+kernel/amdxdna_rescue/Module.symvers
+kernel/amdxdna_rescue/modules.order
+kernel/amdxdna_rescue/.module-common.o
+kernel/amdxdna_rescue/.*.o
+
+# Local env / secrets footguns
+.env
+.env.*
 
 target/

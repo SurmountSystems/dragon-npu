@@ -3,18 +3,22 @@
 Contract for colibrì tools and dragon-npu bring-up. IDs are stable strings from
 `DirectCapability::all_ids()` / `AmdXdna2Backend::direct_capability_ids()`.
 
+**JSON adapter schema** (`schema_version`, exit codes, field table):
+[COLIBRI_ADAPTER.md](./COLIBRI_ADAPTER.md).
+
 ## Checklist
 
-| ID | Meaning | Host status (2026-07-13, 1022:17f0 + amdxdna, FW 1.1.2.64) |
+| ID | Meaning | Host status (2026-07-15, 1022:17f0 + **hardened OOT** amdxdna 1.0.0, FW 1.1.2.64, `exec_cmd_allow=0`) |
 |----|---------|--------------------------------------------------------------|
 | `open` | Open `/dev/accel/accelN` | **Pass** |
-| `get_info` | Typed GET_INFO (FW, power, TOPS, AIE, sensors) | **Pass** |
+| `get_info` | Typed GET_INFO (FW, power, TOPS, AIE, sensors) | **Pass** (FW 1.1.2.64, tops_max=58) |
 | `create_bo` | CREATE_BO (Shmem / DevHeap / Cmd) | **Pass** (DevHeap: one per client fd) |
 | `sync_bo` | SYNC_BO | **Pass** |
-| `create_hwctx` | CREATE_HWCTX (+ 64 MiB DevHeap mmap + valid `qos_p`) | **Iterate** — qos_p + `#[repr(C)]` QosInfo + tile×4 fixed; sizes wired via `create_hwctx_with_sizes`. Re-probe after driver reload if prior EXEC_CMD oops wedged amdxdna |
-| `destroy_hwctx` | DESTROY_HWCTX + GEM_CLOSE | **Wired** (tracked UMQ/log BOs closed on destroy) |
-| `submit` | EXEC_CMD ioctl path | **Permanently gated** — feature `xdna2-dangerous-exec-cmd` + `XDNA2_ALLOW_EXEC_CMD=1` (see `docs/XDNA2_NEVER_AGAIN.md`). Scaffold oopsed driver 2026-07-13. **L2+L3 materials** (null-guards + open fail-fast + lab `exec_cmd_allow=0`): `kernel/patches/0001-…` + `0002-…` — **not** claimed installed on host until after clean boot/DKMS. |
-| `timed_gemm` | Timed matmul / buffer op with JSON timings | **API present** — default stops at `hwctx_ok` / `hwctx_blocked`; never fakes Pass; EXEC_CMD opt-in |
+| `create_hwctx` | CREATE_HWCTX (+ 64 MiB DevHeap mmap + valid `qos_p`) | **Pass** on Real arm — multi-size grid (4/8 tiles, UMQ/log variants) succeeds; destroy cleans up |
+| `destroy_hwctx` | DESTROY_HWCTX + GEM_CLOSE | **Pass** (create+destroy in probe/checklist) |
+| `submit` | EXEC_CMD ioctl path | **Permanently gated** — L1: feature `xdna2-dangerous-exec-cmd` + `XDNA2_ALLOW_EXEC_CMD=1`; L3 lab: `exec_cmd_allow=0` on host. Scaffold oopsed stock driver 2026-07-13. Phase 2: `submit_and_wait_command` + lab doc; silicon single-shot **operator-only** (not proven by default tests). |
+| `timed_gemm` | Timed matmul / buffer op with JSON timings | **API present — NPU GEMM still blocked** — default `hwctx_ok`; L1 open: START_NPU + host-fill + submit+wait → `ok_submit_wait_envelope` or `ok_submit_wait_with_inst_blob` (≠ Pass). Stage timings: `hwctx_s` / `fill_s` / `submit_wait_s`. Optional CPU `host_ref_*`. **`ran_on_npu` false** until instruction blob + numerical verify (Phase 3.5). |
+| `bo_roundtrip` | Timed Shmem CREATE_BO + fill + SYNC TO/FROM + verify | **Honest silicon DMA path** — no EXEC_CMD; default gates OK. `ran_on_device_path=true` **only** on `RealDirectSubmission` verify (`bo_roundtrip_ok`). Stub in-memory → `bo_roundtrip_stub_ok` + `ran_on_device_path=false`. Product Pass also needs `real_device_open`. **Never** maps to `timed_gemm` / `ran_on_npu`. |
 
 ## Probe baseline
 
@@ -22,6 +26,7 @@ Contract for colibrì tools and dragon-npu bring-up. IDs are stable strings from
 cargo run --features amd-xdna2 --example xdna2_probe
 cargo run --features amd-xdna2 --example npu_direct_bench -- --checklist
 cargo run --features amd-xdna2 --example npu_direct_bench -- --shape q_a
+cargo run --features amd-xdna2 --example npu_direct_bench -- --bo-roundtrip
 ```
 
 ## CREATE_HWCTX requirements (from public xdna-driver)
@@ -34,12 +39,33 @@ Source: `amdxdna_drm_create_hwctx_ioctl` / `aie2_ctx_init` (GPL-2.0, amd/xdna-dr
 4. Client must own exactly one **64 MiB** `AMDXDNA_BO_DEV_HEAP`, **mmap'd** so heap UVA is valid (else ENOENT / EINVAL “Invalid dev heap userptr”).
 5. UMQ/log BOs optional on KMQ devices.
 
-## EXEC_CMD payload (research)
+## EXEC_CMD payload (research) — next hard problem
+
+With **hwctx create/destroy working**, the remaining blocker for real compute is the
+**command BO contents**, not the ioctl plumbing.
 
 - Public headers define ioctl + BO types only.
 - Driver uses ERT-style command state / `OP_USER` / cmdlist path (`force_cmdlist=true`).
 - Full firmware **txn op** encoding is **not** documented in redistributable headers.
-- Scaffold: `build_exec_cmd_payload_scaffold()` + `ExecCmdPayloadHeader` (LE header words only).
+- **Phase 1 offline complete:** packed `amdxdna_cmd` header + typed builders
+  (`build_ert_start_npu_cmd_bo`, chain, preempt, DPU envelope) + unit tests —
+  see **`docs/XDNA2_CMD_PAYLOAD.md`** (known vs opaque table; txn still opaque).
+- Instruction **txn** bytes at `start_npu.buffer` remain the hard unknown.
+- **Phase 3.5 prep (offline done):** consolidated research
+  [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md); read-only inventory
+  `bash scripts/inventory_txn_sources.sh` (**report only, always exit 0 — not a
+  Pass gate**); operator capture checklist
+  `scripts/capture_instruction_blob_checklist.md`; pure
+  `decide_ran_on_npu` / allclose helpers exist (see Phase 3.5 section below) but
+  are **not** auto-wired — product Pass still needs known-good blob + OFM readback.
+- **Do not** enable L1 (`xdna2-dangerous-exec-cmd` + `XDNA2_ALLOW_EXEC_CMD`) or L3
+  (`exec_cmd_allow=1`) to “try” empty scaffolds — that oopsed stock amdxdna (2026-07-13).
+- Safer research paths: GPL shim reverse-eng; optional XRT capture of known-good
+  instruction BOs; never claim `ran_on_npu` until verified payload + WAIT complete.
+- Phase 2 **infrastructure ready** (`wait_command`, `submit_and_wait_command`, unit
+  refuse-when-gated tests). Full lab procedure:
+  [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md). Silicon single-shot **not**
+  claimed unless operator-recorded.
 
 ## Env knobs (bring-up)
 
@@ -52,12 +78,79 @@ Source: `amdxdna_drm_create_hwctx_ioctl` / `aie2_ctx_init` (GPL-2.0, amd/xdna-dr
 | `XDNA2_HWCTX_SKIP_HEAP=1` | Skip DevHeap (expect ENOENT) |
 | `XDNA2_HWCTX_TILES` / `MEM` / `UMQ` / `LOG` | Probe grid |
 | `XDNA2_ALLOW_EXEC_CMD=1` | Only with Cargo feature `xdna2-dangerous-exec-cmd`; still may oops if payload is garbage |
+| `XDNA2_WAIT_TIMEOUT_MS` | Finite WAIT_CMD timeout for timed_matmul / lab; default **`DEFAULT_WAIT_CMD_TIMEOUT_MS` = 5000**; `submit_and_wait` refuses 0 |
+| `XDNA2_WAIT_ALLOW_INFINITE=1` | Opt-in only for `timeout_ms=0` WAIT (lab rare); default refuse infinite |
+| `XDNA2_HW_EXEC=1` | Operator-only ignored HW test marker; never set in default CI |
 | `XDNA2_HWCTX_UMQ` / `LOG` | Pin BO sizes (also API: `create_hwctx_with_sizes`) |
+| `XDNA2_HWCTX_TILES` / `TILES_SINGLE` | Probe / timed single-shot tile count; library heuristic `suggest_hwctx_tiles` → 4 or 8 (×4) from `tops_max` when not overridden |
+| `XDNA2_INSTRUCTION_BLOB` | Path to raw instruction/txn bytes for START_NPU `buffer` (optional; no proprietary default) |
+| `XDNA2_INSTRUCTION_HEX` | Hex instruction bytes if no file (optional `0x`, whitespace ok) |
+| `XDNA2_HOST_REF=1` | Force host f32 golden matmul baseline in `TimedOpResult.host_ref_*` (also auto for small f32 shapes) |
+| `XDNA2_REAL_SUBMIT_MODE` | Phase 4–5 Real `submit_and_run`: unset = fail-closed `RealSubmitNotReady`; `host_ref` / `host_validate` = Phase 5 host f32 graph (Identity/Relu/Add/Mul/MatMul/Gemm when weights allow; not NPU); `npu_exec` = gated EXEC attempt via `timed_matmul_direct` (still not numerical Pass) |
+| `XDNA2_HOST_MATMUL_K` | Optional: pin MatMul `K` when weight shape missing (Phase 5 host graph only) |
+
+### Phase 6 APIs (efficiency / observability — not GEMM tops)
+
+| API | Role |
+|-----|------|
+| `suggest_hwctx_tiles` / `AmdXdna2Backend::suggested_hwctx_tiles` | Heuristic tiles 4 or 8 from resource TOPS |
+| `set_direct_power_mode` / `power_mode::*` | SET_STATE power (uAPI); operator-tested |
+| `fill_weight_bos_batch` | Multi-BO fill, one submission session |
+| `TimedOpResult::efficiency_notes` | Stage ratios; bo_roundtrip = DMA-only |
 
 ## Honesty rule
 
-Do **not** report microbench Pass from probe-only or scaffold submit. Gate needs
-`ran_on_npu=true` with real device time for product shapes.
+Do **not** report microbench **GEMM / NPU** Pass from probe-only, envelope submit, or
+instruction-blob submit without numerical verify. Product `timed_gemm` Pass requires
+`ran_on_npu=true` (Phase 3.5 criterion below).
+
+**Safe timed path today:** `bo_roundtrip` / `timed_bo_roundtrip` → `ran_on_device_path`
+(driver DMA only). Do not rename that to NPU compute.
+
+### What is required for true `ran_on_npu` GEMM
+
+All of:
+
+1. L1 open (`xdna2-dangerous-exec-cmd` + `XDNA2_ALLOW_EXEC_CMD=1`) and lab L3 `exec_cmd_allow=1` if applicable.
+2. Working CREATE_HWCTX + host-filled Cmd BO (never empty).
+3. **Known-good instruction/txn blob** loaded (`XDNA2_INSTRUCTION_BLOB` / `_HEX`), device BO filled, non-zero `xdna_addr` in START_NPU.
+4. EXEC_CMD + WAIT complete without error.
+5. **Numerical verify** against host golden (or fixed test vector).
+
+#### Phase 3.5 — pure verify + lab OFM wire (silicon Pass still HITL)
+
+| Piece | Status |
+|-------|--------|
+| `max_abs_diff_f32` / `verify_f32_allclose` | **Implemented** (pure; unit-tested) |
+| `host_matmul_f32_ones_vec` | **Implemented** (full golden vector) |
+| `NumericalVerifyCriteria` / `NumericalVerifyInput` | **Implemented** |
+| `decide_ran_on_npu` | **Implemented** — true **only** if non-empty buffers ∧ `submit_wait_ok` ∧ `had_instruction_blob` ∧ `real_ioctl_path` ∧ allclose |
+| Default tolerances | `DEFAULT_VERIFY_ATOL=1e-4`, `DEFAULT_VERIFY_RTOL=1e-3` (`NumericalVerifyCriteria::default`) |
+| Lab packing (`lab_io`, kernel args `prop_count=0`) | **Implemented** + unit tests |
+| Wire into `timed_matmul_direct` → set `ran_on_npu` | **Lab-only:** `XDNA2_LAB_OFM=1` + OFM readback + decide; **default still hard-false** |
+| Status when decide true | `ok_npu_verified` (never from envelope alone) |
+| `scripts/lab_exec_once.sh` | **Implemented** — default dry-run; apply needs risk+blob |
+| Known-good txn blob on host/CI | **Blocked** — capture HITL; see [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) |
+
+**Still no product Pass without a known-good blob + real non-empty device OFM compare.**
+Empty golden/candidate → `decide_ran_on_npu` **false**. Envelope or
+`ok_submit_wait_with_inst_blob` alone keeps **`ran_on_npu=false`**.
+Host has no passwordless sudo / no known-good blob → live L3 apply may exit 3.
+
+Cross-links: [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) · [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) · [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md) · [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md).
+
+## Host install status (lab)
+
+| Item | Horizon (2026-07-15) |
+|------|----------------------|
+| Module | OOT L2+L3 under `updates/amdxdna-hardened/amdxdna.ko` (DRM 1.0.0) |
+| `exec_cmd_allow` | **0 / N** (modprobe.d options-only; **no** softdep on `gpu_sched`) |
+| Firmware | `npu.dev.sbin.zst` → `npu_7.sbin.zst` → 1.1.2.64 |
+| CREATE_HWCTX | **Pass** (see checklist above) |
+| Reboot persistence | **Not proven** until post-reboot verify |
+
+Read-only check: `bash scripts/verify_amdxdna_hardened_host.sh`  
+Playbook: [`XDNA2_HARDENED_INSTALL.md`](./XDNA2_HARDENED_INSTALL.md) · Policy: [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md) · Payload research: [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md) · Upstream pack: [`upstream/README.md`](./upstream/README.md)
 
 ## Driver wedge recovery
 
@@ -71,6 +164,8 @@ prefer reboot (or the recovery docs). Reloading only works when the module is
 unused and not stuck.
 
 ```bash
+bash scripts/verify_amdxdna_hardened_host.sh
+bash scripts/diagnose_amdxdna.sh
 # Only if diagnose shows no D-state / unload is possible; may require root.
 # If rmmod hangs or refcnt is high → reboot instead.
 sudo modprobe -r amdxdna && sudo modprobe amdxdna
@@ -80,8 +175,7 @@ sudo modprobe -r amdxdna && sudo modprobe amdxdna
 Then re-run `npu_direct_bench --checklist` **without** `XDNA2_ALLOW_EXEC_CMD` and
 **without** the `xdna2-dangerous-exec-cmd` feature (legacy `XDNA2_TRY_SUBMIT` is ignored).
 
-Optional after **clean boot**: install L2+L3-patched `amdxdna` from
-[`kernel/patches/README.md`](../kernel/patches/README.md) (apply **0001 then 0002**)
-so scaffold EXEC_CMD returns errno instead of oopsing and open fails fast when
-unhealthy (userspace double gate stays on regardless; lab module default
-`exec_cmd_allow=0`).
+Lab host already has L2+L3 under `updates/`. Other machines / after kernel upgrade:
+[`XDNA2_HARDENED_INSTALL.md`](./XDNA2_HARDENED_INSTALL.md) (apply **0001 then 0002**,
+rebuild for new `uname -r`). Userspace double gate stays on regardless; lab module
+default `exec_cmd_allow=0`.

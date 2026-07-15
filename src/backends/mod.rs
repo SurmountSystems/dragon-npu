@@ -1,11 +1,12 @@
 //! NPU backend implementations for DragonNPU.
 //!
-//! This module contains pluggable backends for different NPU hardware
-//! and simulation. The simulation backend is always available and is
-//! used during development and testing.
-//!
-//! Future backends (AMD XDNA, Intel VPU, Qualcomm Hexagon, etc.) will
-//! be added behind feature flags as described in `PLAN.md`.
+//! - **Simulation** — always available (default).
+//! - **AMD XDNA2** (`amd-xdna2`) — primary hardware path (lightweight direct
+//!   `amdxdna`); see `docs/XDNA2_REAL_EXECUTION.md`.
+//! - **Intel VPU / Qualcomm Hexagon** (`intel-vpu`, `qualcomm-hexagon`) —
+//!   **honest stubs** only until XDNA2 MVP is green. Not auto-selected by
+//!   `DragonNpu::new`. See `docs/SECONDARY_BACKENDS.md`.
+//! - **XRT bridge** (`xrt-bridge`) — research-only, never default, never hot path.
 //!
 //! # Example
 //!
@@ -23,6 +24,9 @@ pub mod intel_vpu;
 
 #[cfg(feature = "qualcomm-hexagon")]
 pub mod qualcomm_hexagon;
+
+#[cfg(feature = "xrt-bridge")]
+pub mod xrt_bridge;
 
 use crate::{CompiledModel, DragonNpuError, NpuStatus};
 
@@ -241,6 +245,11 @@ pub(crate) fn parse_xdna2_variant(modalias: &str, pci_device: &str) -> Option<St
 /// Exposed as `pub(crate)` so integration tests running on the owner's physical
 /// XDNA2 hardware (via `cargo test --features amd-xdna2 --test ...`) can
 /// directly validate the open behavior when the platform matches.
+///
+/// Without `amd-xdna2`, production callers are feature-gated away; unit tests in
+/// this module still exercise the helper. Allow dead_code for default-feature
+/// clippy on the non-test lib graph.
+#[cfg_attr(not(feature = "amd-xdna2"), allow(dead_code))]
 pub(crate) fn try_open_accel_device(
     detected: Option<&AccelDevice>,
 ) -> (Option<std::fs::File>, Option<std::path::PathBuf>) {

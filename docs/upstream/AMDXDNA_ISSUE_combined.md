@@ -4,9 +4,11 @@ Single paste-ready issue covering **both** the AIE2 cmdlist NULL-guard fix (L2)
 and open fail-fast / lab `exec_cmd_allow` (L3). Prefer one issue with two
 patches over two disconnected threads.
 
-**When filing:** attach real `dmesg`/journal oops if available. Soften
-reproducibility language for a single lab capture. Rewrite any in-tree
-`Signed-off-by` / `From` to a **real DCO identity** before a PR.
+**When filing:** attach
+`docs/upstream/evidence/ATTACH_fill_slot_oops_20260713_220051.txt`
+(and optionally the 03:28 capture). Soften “always repro” language (lab
+scaffold EXEC_CMD, not XRT). Rewrite any in-tree `Signed-off-by` / `From` to a
+**real DCO identity** before a PR.
 
 Source materials:
 
@@ -49,16 +51,22 @@ from a dead workqueue).
 
 | Item | Value |
 |------|--------|
-| Device | AMD XDNA2 NPU, **PCI ID 1022:17f0** |
-| Kernel | **7.1.3-zen** (local lab; amdxdna loaded) |
-| Firmware (GET_INFO) | **1.1.2.64** (lightweight direct query) |
-| Driver base for patches | [amd/xdna-driver](https://github.com/amd/xdna-driver) @ `905717f5cd470580054a1635b9eea24b84dfd67f` |
-| Userspace | Out-of-tree lightweight DRM client (not XRT), research EXEC_CMD scaffold |
+| Device | AMD XDNA2 NPU, **PCI ID 1022:17f0** (ThinkPad P14s Gen 6 / Ryzen AI 7 PRO 350 lab) |
+| Kernel | **7.1.3-zen1-2-zen** (Garuda / Arch; stock in-tree amdxdna + lab OOT rebuild) |
+| Firmware | **1.1.2.64** via `amdnpu/17f0_10/npu_7.sbin` (linux-firmware); OOT tree requests `npu.dev.sbin` (aliased in lab) |
+| Driver base for patches | [amd/xdna-driver](https://github.com/amd/xdna-driver) @ `905717f5cd470580054a1635b9eea24b84dfd67f` (**OOT** `src/driver/amdxdna/`) |
+| Userspace | Out-of-tree lightweight DRM client (not XRT), research EXEC_CMD scaffold that triggered the 2026-07-13 oops |
+| Post-patch lab | Same host runs OOT + L2+L3 with `exec_cmd_allow=0`; open/GET_INFO/CREATE_HWCTX smoke OK without EXEC_CMD |
 
 ### Symptoms
 
-1. Oops with RIP in **`aie2_cmdlist_fill_slot`** (amdxdna); RAX=0-class pattern
-   consistent with missing client/ops (hypothesis).
+1. **Oops** (captured **twice** on 2026-07-13, journal still retained):  
+   `BUG: kernel NULL pointer dereference, address: 0000000000000050`  
+   RIP: `aie2_cmdlist_fill_slot+0x26/0x130 [amdxdna]`  
+   Workqueue: `amdxdna_js` / `drm_sched_run_job_work`  
+   Call chain: `aie2_cmdlist_single_execbuf` → `aie2_sched_job_run` → …  
+   **RAX=0**, CR2=`0x50` — faulting insn loads `0x50(%rax)` after loading a
+   field from `cmd_abo` (matches NULL `cmd_abo->client` then `client->…` at +0x50).
 2. Afterward, **`amdxdna_drm_open`** waiters in **D-state**.
 3. High **module refcnt** → cannot `rmmod`.
 4. PCI remove/unbind of the NPU function may hang; parent GPP bridge may expose

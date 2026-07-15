@@ -16,9 +16,11 @@ recreate it by accident.
 |-------|-----------|---------|
 | **Compile** | Cargo feature `xdna2-dangerous-exec-cmd` | **OFF** |
 | **Runtime** | Env `XDNA2_ALLOW_EXEC_CMD=1` | **unset** |
-| **API** | `exec_cmd_is_enabled()` / `RealDirectSubmission::submit_command` | hard error if gated |
+| **API** | `exec_cmd_is_enabled()` / `submit_command` / `submit_and_wait_command` | hard error if gated |
+| **WAIT_CMD** | `wait_command` (not L1-gated; cleanup path) | finite timeout in lab helpers |
 | **Probe / timed_matmul** | Never call EXEC_CMD unless both layers allow | skip submit |
-| **Honesty** | `ran_on_npu` only for real compute; never scaffold Pass | enforced |
+| **Honesty** | `ran_on_npu` only for verified NPU compute; never envelope / inst-blob-without-verify Pass; `bo_roundtrip` uses `ran_on_device_path` only | enforced |
+| **Lab procedure** | [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) | operator single-shot only |
 
 Enabling EXEC_CMD requires **both** userspace gates (and, **if L3 is installed**, the kernel param):
 
@@ -35,7 +37,15 @@ XDNA2_ALLOW_EXEC_CMD=1 cargo run --features amd-xdna2,xdna2-dangerous-exec-cmd -
 
 Legacy `XDNA2_TRY_SUBMIT` is **fully ignored** (retired). Userspace only the double gate above can enable EXEC_CMD from dragon-npu; a lab L3 module adds a third gate.
 
-## Permanent controls (driver — **L2+L3 materials complete**, **L4 install packaging complete**, host install pending)
+### Secondary backends and `xrt-bridge` (Phase 9)
+
+- Features `intel-vpu`, `qualcomm-hexagon`, and `xrt-bridge` are **honest stubs /
+  research only**. They never claim silicon Pass or set `ran_on_npu`.
+- `xrt-bridge` is **not** default and is **not** enabled by `amd-xdna2`. It must
+  not open EXEC_CMD or recommend enabling L1 gates.
+- See [`SECONDARY_BACKENDS.md`](./SECONDARY_BACKENDS.md).
+
+## Permanent controls (driver — **L2+L3 materials complete**, **L4 install packaging complete**, **lab host installed**)
 
 Shippable in-repo artifacts (applyable patches + docs + issue bodies + install path):
 
@@ -63,16 +73,47 @@ Goals for amdxdna (GPL, forkable):
 3. Secondary killable `dev_lock` on open only — SVA bind residual documented. (**L3**)
 4. Module param `exec_cmd_allow=0` lab default so **entire** EXEC_CMD ioctl is refused in-kernel. (**L3** — always on after install)
 
-Until a fixed module is **installed on this host**, **userspace gates are the primary shield**.
-L2+L3 materials are complete in-tree; they do **not** mean the running kernel already has the fix.
+**Lab host (horizon, 2026-07-14/15):** OOT L2+L3 is **installed** under
+`updates/amdxdna-hardened/`, `exec_cmd_allow=0`, firmware `npu.dev.sbin`→`npu_7`.
+Userspace L1 remains the always-on shield on every machine; kernel L3 adds a third
+gate only when this module is loaded. Other hosts still need the install playbook.
+
+Verify anytime (read-only, no `/dev/accel`):
+
+```bash
+bash scripts/verify_amdxdna_hardened_host.sh
+bash scripts/diagnose_amdxdna.sh
+```
+
+## Phase 1 payload research (offline only)
+
+Cmd BO **envelope** layout (header, START_NPU, CHAIN, PREEMPT, DPU) is documented and
+unit-tested in-tree — see **`docs/XDNA2_CMD_PAYLOAD.md`**. That does **not** authorize
+EXEC_CMD. Instruction **txn** bytes remain opaque; never submit scaffolds or empty
+instruction buffers as “success.”
+
+Instruction/txn capture pathways, license notes, host inventory, and pure
+`decide_ran_on_npu` honesty criteria:
+[`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) ·
+[`scripts/capture_instruction_blob_checklist.md`](../scripts/capture_instruction_blob_checklist.md)
+(envelope packing remains CMD_PAYLOAD).
+
+## Phase 2 EXEC_CMD + WAIT (infrastructure ready; silicon operator-only)
+
+- APIs: `DirectSubmission::wait_command`, `submit_and_wait_command` (L1-gated submit;
+  finite timeout; no retry loop). Lab procedure: **[`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md)**.
+- Default `cargo test` / feature-on-without-ALLOW still **refuse** EXEC_CMD.
+- **Not** claimed proven on silicon unless an operator recorded a gated single-shot.
+- Still require: diagnose clean, L2 preferred, L1 + temporary L3 `exec_cmd_allow=1`,
+  Phase 1 / known-good payload, `timeout` wrappers, restore `exec_cmd_allow=0`.
 
 ## Ops rules (humans + agents)
 
 1. **Never** open `/dev/accel` in a loop while D-state waiters exist.
-2. **Diagnose first:** `bash scripts/diagnose_amdxdna.sh`.
-3. **No EXEC_CMD** until a **known-good** payload exists (not a research scaffold).
+2. **Diagnose / verify first:** `bash scripts/verify_amdxdna_hardened_host.sh` then `bash scripts/diagnose_amdxdna.sh`.
+3. **No EXEC_CMD** until a **known-good** payload exists (not a research scaffold). Envelope: [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md). Txn capture + Pass blockers: [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md).
 4. Hardware probes: always `timeout …`.
-5. File/track upstream: [amd/xdna-driver issues](https://github.com/amd/xdna-driver/issues) — paste body from `docs/upstream/…` when ready (human files).
+5. File/track upstream: [amd/xdna-driver issues](https://github.com/amd/xdna-driver/issues) — paste body from `docs/upstream/…` when ready (human files). **Agents do not open PRs/issues.**
 
 ## Recovery (if it ever happens again)
 
@@ -94,9 +135,10 @@ L2+L3 materials are complete in-tree; they do **not** mean the running kernel al
 - [x] **L2 materials:** applyable null-guard patch + build/apply docs + upstream issue body (in-tree).
 - [x] **L3 materials:** open fail-fast / killable `dev_lock` / `exec_cmd_allow` patch + docs + issue addendum (in-tree).
 - [x] **L4 materials:** install script + HARDENED_INSTALL playbook + DKMS scaffolding + combined issue body (in-tree). **Does not mean host is fixed.**
-- [ ] **L2/L3 installed on host:** patched `amdxdna` built/installed after clean boot or DKMS (unchecked until done — use L4 playbook).
-- [ ] Issue **filed** on amd/xdna-driver with oops + open-wedge notes (paste-ready combined body; human posts).
-- [ ] Optional: DKMS package with hardened driver **tracked long-term on this host** (scaffolding in `kernel/dkms/`; host not enrolled yet).
+- [x] **L2/L3 installed on host (lab):** OOT module in `updates/amdxdna-hardened/` on **7.1.3-zen1-2-zen**, srcversion `E36F27FC09FB5CA0C0C3E87`, `exec_cmd_allow=0` (runtime **N**), firmware alias `npu.dev.sbin.zst`→`npu_7.sbin.zst` (1.1.2.64); smoke open/get_info/**hwctx_ok** (2026-07-14/15). Host table: [`XDNA2_DIRECT_CAPABILITIES.md`](./XDNA2_DIRECT_CAPABILITIES.md). Evidence: [`docs/upstream/LAB_EVIDENCE.md`](./upstream/LAB_EVIDENCE.md).
+- [ ] **Reboot persistence proven:** after a real reboot, `bash scripts/verify_amdxdna_hardened_host.sh --post-reboot` exit 0 (still on `updates/…`, `exec_cmd_allow=0`, alias intact). **Not claimed until user reboots.** Checklist: [`XDNA2_HARDENED_INSTALL.md`](./XDNA2_HARDENED_INSTALL.md) § post-reboot.
+- [ ] Issue **filed** on amd/xdna-driver with oops + open-wedge notes (paste-ready: [`docs/upstream/AMDXDNA_ISSUE_combined.md`](./upstream/AMDXDNA_ISSUE_combined.md); human posts). Pack: [`docs/upstream/README.md`](./upstream/README.md). Fork WIP (no PR): `cryptoquick/xdna-driver` branch `amdxdna/cmdlist-null-guards` @ `a9ef3c4…` (L2 only).
+- [x] Optional: long-term host track via **`updates/` + modprobe.d** (not full DKMS yet; scaffolding remains in `kernel/dkms/`).
 
 ## L1 unit-test matrix (lib only; no `/dev/accel` required)
 

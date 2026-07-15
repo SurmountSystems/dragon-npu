@@ -1,0 +1,264 @@
+# Software-only CI — no /dev/accel, no modprobe, no EXEC_CMD enablement.
+name: ci
+
+on:
+  push:
+    branches: [main, master, rust]
+  pull_request:
+    branches: [main, master, rust]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        # Prefer system paths without wiping cargo/rustup from the runner PATH.
+        run: PATH="/usr/bin:$PATH" cargo fmt -- --check
+
+  # Enforce Cargo.toml rust-version (1.87) so MSRV does not silently drift.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87
+      - name: cargo test --lib (MSRV default features)
+        run: PATH="/usr/bin:$PATH" cargo test --lib
+      - name: cargo test --lib amd-xdna2 (MSRV)
+        run: PATH="/usr/bin:$PATH" cargo test --lib --features amd-xdna2
+
+  clippy-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "amd-xdna2"
+          - "intel-vpu"
+          - "qualcomm-hexagon"
+          - "intel-vpu,qualcomm-hexagon"
+          - "xrt-bridge"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: clippy (lib + bins + tests + examples)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy --all-targets -- -D warnings
+          else
+            cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
+          fi
+      - name: test --lib
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --lib
+          else
+            cargo test --features "${{ matrix.features }}" --lib
+          fi
+
+  # L1 dangerous feature must still refuse EXEC without XDNA2_ALLOW_EXEC_CMD=1.
+  # Never set ALLOW=1 in CI.
+  exec-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: clippy dangerous-exec feature (ALLOW unset)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          unset XDNA2_ALLOW_EXEC_CMD || true
+          unset XDNA2_LAB_OFM || true
+          unset XDNA2_LAB_WEIGHT || true
+          cargo clippy --features amd-xdna2,xdna2-dangerous-exec-cmd -- -D warnings
+      - name: test lib with dangerous-exec-cmd feature, ALLOW unset
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          unset XDNA2_ALLOW_EXEC_CMD || true
+          unset XDNA2_LAB_OFM || true
+          unset XDNA2_LAB_WEIGHT || true
+          # Fail loud if ALLOW leaked into the runner env.
+          if [ -n "${XDNA2_ALLOW_EXEC_CMD:-}" ]; then
+            echo "XDNA2_ALLOW_EXEC_CMD must be unset in CI" >&2
+            exit 1
+          fi
+          cargo test --features amd-xdna2,xdna2-dangerous-exec-cmd --lib
+
+  # Lab wrapper: syntax + dry-run only (never --apply; no EXEC/sudo).
+  lab-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n lab + extract scripts
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          bash -n scripts/lab_exec_once.sh
+          bash -n scripts/extract_instruction_offline.sh
+          bash -n scripts/inventory_txn_sources.sh
+      - name: inventory_txn_sources smoke (exit 0)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          bash scripts/inventory_txn_sources.sh >/tmp/inv.txt
+          echo "inventory exit 0 OK"
+      - name: extract_instruction_offline inventory (exit 0)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          bash scripts/extract_instruction_offline.sh
+      - name: extract claim-aie2 refuse (exit 4)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          set +e
+          bash scripts/extract_instruction_offline.sh --claim-aie2-known-good
+          rc=$?
+          set -e
+          if [ "$rc" -ne 4 ]; then
+            echo "expected exit 4 for --claim-aie2-known-good, got $rc" >&2
+            exit 1
+          fi
+          echo "claim refuse rc=4 OK"
+      - name: extract force-lab-instr without stage refuses (exit 2)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          set +e
+          bash scripts/extract_instruction_offline.sh --force-lab-instr
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "expected exit 2 for --force-lab-instr without stage, got $rc" >&2
+            exit 1
+          fi
+          echo "force-lab-instr no-stage refuse rc=2 OK"
+      - name: extract synthetic VE2-path stage smoke (no real staging tree)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          d=$(mktemp -d)
+          # Path name tags PLATFORM=VE2_EDGE for extract detect_platform
+          mkdir -p "$d/shim_ve2/Runner/latency"
+          printf 'synthetic-not-aie2-elf\n' >"$d/shim_ve2/Runner/latency/nop.elf"
+          out="$d/out"
+          bash scripts/extract_instruction_offline.sh \
+            --elf "$d/shim_ve2/Runner/latency/nop.elf" \
+            --apply-copy --out "$out"
+          test -f "$out/sources/ve2_runner_latency_nop.elf"
+          test -f "$out/PROVENANCE.md"
+          grep -q 'NOT_AIE2_KNOWN_GOOD=1' "$out/PROVENANCE.md"
+          grep -q 'sources/ve2_runner_latency_nop.elf' "$out/sources.sha256"
+          (cd "$out" && sha256sum -c sources.sha256)
+          # VE2 lab_instr still requires allow flag
+          set +e
+          bash scripts/extract_instruction_offline.sh \
+            --elf "$d/shim_ve2/Runner/latency/nop.elf" \
+            --apply-copy --out "$out" --force-lab-instr
+          rc=$?
+          set -e
+          rm -rf "$d"
+          if [ "$rc" -ne 4 ]; then
+            echo "expected exit 4 for VE2 force-lab-instr without allow, got $rc" >&2
+            exit 1
+          fi
+          echo "synthetic extract stage smoke OK"
+      - name: lab_exec_once dry-run (no EXEC)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          unset XDNA2_ALLOW_EXEC_CMD || true
+          unset XDNA2_LAB_OFM || true
+          unset XDNA2_LAB_WEIGHT || true
+          # Dry-run may exit 1 on WEDGED hosts; CI runners have no amdxdna —
+          # accept 0 (plan OK) or 1 (preflight refuse). Never 2/4/5 on dry-run.
+          set +e
+          bash scripts/lab_exec_once.sh
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+            echo "unexpected lab dry-run exit $rc" >&2
+            exit 1
+          fi
+          echo "lab dry-run rc=$rc (0 plan / 1 preflight OK for CI)"
+      - name: lab_exec_once --apply without flags refuses (exit 2)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          unset XDNA2_ALLOW_EXEC_CMD || true
+          unset XDNA2_LAB_OFM || true
+          set +e
+          bash scripts/lab_exec_once.sh --apply
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "expected exit 2 for --apply without risk/blob, got $rc" >&2
+            exit 1
+          fi
+          echo "lab apply refuse without flags rc=2 OK"
+      - name: lab_exec research NOT_AIE2 blob refuses without --allow-research-blob
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          unset XDNA2_ALLOW_EXEC_CMD || true
+          d=$(mktemp -d)
+          # Minimal non-empty blob + sibling PROVENANCE (not committed; CI /tmp only)
+          printf 'x' >"$d/lab_instr.bin"
+          printf 'NOT_AIE2_KNOWN_GOOD=1\nPLATFORM=VE2_EDGE\n' >"$d/PROVENANCE.md"
+          set +e
+          bash scripts/lab_exec_once.sh --apply --i-accept-wedge-risk --blob "$d/lab_instr.bin"
+          rc=$?
+          set -e
+          rm -rf "$d"
+          if [ "$rc" -ne 2 ]; then
+            echo "expected exit 2 for research blob without --allow-research-blob, got $rc" >&2
+            exit 1
+          fi
+          echo "research-blob refuse rc=2 OK"
+      - name: lab_exec --skip-verify without stock allow refuses (exit 2)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          set +e
+          bash scripts/lab_exec_once.sh --skip-verify
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "expected exit 2 for --skip-verify without --allow-stock-kernel, got $rc" >&2
+            exit 1
+          fi
+          echo "skip-verify refuse rc=2 OK"
+
+  bin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: build dragon-npu binary
+        run: PATH="/usr/bin:$PATH" cargo build --bin dragon-npu
+      - name: clippy bins with amd-xdna2
+        run: PATH="/usr/bin:$PATH" cargo clippy --bins --features amd-xdna2 -- -D warnings
+      - name: bench compile only (default + amd-xdna2)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          cargo bench --no-run
+          cargo bench --features amd-xdna2 --no-run

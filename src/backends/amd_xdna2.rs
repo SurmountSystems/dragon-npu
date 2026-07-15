@@ -25,16 +25,22 @@
 //! - `xdna2_real_hardware` integration test + `examples/xdna2_probe.rs` provide repeatable
 //!   cargo validation of the entire real open + diagnostics layer on target hardware.
 //! - `submit_and_run` is the stable production boundary (routes to Real arm when active).
-//! - Real .onnx weight tensors (multi-dtype + bf16 raw) are already loaded and available
-//!   via `CompiledModel` for future real execution use.
-//! - All of the above is strongly TDD'd (96+ lib tests + dedicated real-hardware integration tests).
+//! - **Phase 4:** Real `compile_model` uses [`ModelCompiler`] (same host passes as simulation);
+//!   Real `submit_and_run` is mode-dispatched (`XDNA2_REAL_SUBMIT_MODE`: default fail-closed,
+//!   `host_ref` host f32 for allowlisted ops, `npu_exec` gated EXEC attempt — never fake NPU Pass).
+//! - **Phase 5:** Host graph interpreter ([`host_graph`]) runs Identity/Relu/Add/Mul/MatMul/Gemm
+//!   with real f32 math + weights; weight BO plan scaffolding; **still not** NPU graph Pass.
+//! - **Phase 3.5 lab:** Pure numerical policy in [`numerical`] + OFM helpers in [`lab_io`]
+//!   (`pack_start_npu_kernel_args`, `lab_decide_from_ofm_bytes`). Timed path wires decide
+//!   **only** when `XDNA2_LAB_OFM=1` after OFM readback; default still hard-false `ran_on_npu`.
+//! - Real .onnx weight tensors (multi-dtype + bf16 raw) are loaded via `CompiledModel`.
+//! - All of the above is strongly TDD'd (lib tests + dedicated real-hardware integration tests).
 //!
 //! **Honest status on actual NPU execution**:
-//! The device open, handle management, rich observability, and typed driver queries
-//! (via the lightweight direct amdxdna path) are solid and hardware-validated.
-//! Actual command submission and model execution inside the Real arm are not yet
-//! implemented. This is the next major focus, kept strictly in the pure lightweight
-//! direct style (no heavy runtimes).
+//! Device open, hwctx/BO/diagnostics, and Phase 1–3 EXEC infrastructure are real.
+//! Host graph pipeline is real (Phase 5). Full silicon model inference (`ran_on_npu`) is
+//! **not** claimed without a known-good instruction txn + OFM numerical verify
+//! (see docs/XDNA2_TXN_RESEARCH.md + docs/XDNA2_REAL_EXECUTION.md Phase 4–5).
 //!
 //! See docs/XDNA2_REAL_EXECUTION.md for the production plan and current readiness.
 //! Real hardware validation data lives in docs/XDNA2_HARDWARE_TESTING.md.
@@ -42,17 +48,421 @@
 //! References: autonomous HW research + Python amd_xdna_backend.py + npu_driver_integration.py
 
 pub mod direct;
+pub mod host_graph;
+pub mod lab_io;
+pub mod numerical;
+
+/// Re-export feature-free colibrì schema version (defined on crate root).
+pub use crate::TIMED_OP_JSON_SCHEMA_VERSION;
 
 pub use direct::{
-    BufferHandle, Command, CommandType, DirectCapability, DirectError, DirectSubmission,
-    ExecCmdPayloadHeader, HardwareContext, StubDirectSubmission, TimedOpResult,
-    build_exec_cmd_payload_scaffold, exec_cmd_block_reason, exec_cmd_is_enabled,
-    timed_matmul_direct,
+    AMDXDNA_CMD_COUNT_MAX, AMDXDNA_SET_PARAM_POWER_MODE, AmdxdnaCmdHeaderFields, BufferHandle,
+    Command, CommandType, DEFAULT_BO_ROUNDTRIP_SIZE, DEFAULT_HWCTX_TILES,
+    DEFAULT_WAIT_CMD_TIMEOUT_MS, DirectCapability, DirectError, DirectSubmission, ErtCmdOpcode,
+    ErtCmdState, ExecCmdPayloadHeader, HOST_REF_MAX_ELEMENTS, HardwareContext, HostMatmulRef,
+    MAX_INSTRUCTION_BLOB_BYTES, MAX_SUGGESTED_HWCTX_TILES, SYNC_BO_FROM_DEVICE, SYNC_BO_TO_DEVICE,
+    SharedRealDirectSubmission, StubDirectSubmission, SubmitWaitResult, TimedOpResult,
+    amdxdna_cmd_num_cu_masks, amdxdna_drm_set_power_mode, amdxdna_drm_set_state,
+    amdxdna_drm_wait_cmd, build_amdxdna_cmd_bo, build_ert_cmd_chain_bo, build_ert_start_dpu_cmd_bo,
+    build_ert_start_npu_cmd_bo, build_ert_start_npu_cmd_bo_ex,
+    build_ert_start_npu_cmd_bo_with_kernel_args, build_ert_start_npu_preempt_cmd_bo,
+    build_ert_start_npu_preempt_elf_cmd_bo, build_exec_cmd_payload_scaffold,
+    check_finite_wait_timeout, check_wait_timeout_or_infinite_opt_in, decode_instruction_hex,
+    destroy_hwctx_and_owned_bos, exec_cmd_block_reason, exec_cmd_is_enabled,
+    fill_cmd_bo_with_payload, host_matmul_f32_ones, load_instruction_blob_from_env,
+    load_instruction_blob_from_path, pack_amdxdna_cmd_header, parse_amdxdna_cmd_header_from_bytes,
+    power_mode, submit_and_wait_command, suggest_hwctx_tiles, suggest_hwctx_tiles_from_tops,
+    timed_bo_roundtrip_direct, timed_matmul_direct, unpack_amdxdna_cmd_header,
+    wait_infinite_is_allowed,
 };
+
+pub use numerical::{
+    DEFAULT_VERIFY_ATOL, DEFAULT_VERIFY_RTOL, NumericalVerifyCriteria, NumericalVerifyInput,
+    RanOnNpuBlockReason, decide_ran_on_npu, decide_ran_on_npu_reason, host_matmul_f32_ones_vec,
+    max_abs_diff_f32, verify_f32_allclose,
+};
+
+pub use lab_io::{
+    IoBoSet, LabIoSizePlan, LabOfmVerifyPlan, WeightExecBind, WeightExecFillRequest,
+    build_lab_arg_bo_handles, classify_lab_matmul_status, create_and_fill_ones_io_bos,
+    create_and_fill_weight_io_bos, create_io_bos, destroy_io_bos, destroy_weight_exec_bind,
+    f32_slice_from_le_bytes, f32_slice_to_le_bytes, fill_ifm_wts,
+    host_matmul_f32_ones_ifm_with_wts, host_ones_f32_matrix_bytes, lab_decide_from_ofm_bytes,
+    lab_decide_from_ofm_bytes_bool, lab_decide_from_ofm_bytes_with_golden, lab_io_size_plan,
+    lab_matmul_ifm_nbytes, lab_matmul_ofm_nbytes, lab_matmul_wts_nbytes, lab_ofm_env_enabled,
+    lab_ofm_env_value_enabled, lab_weight_env_enabled, pack_start_npu_kernel_args,
+    pack_start_npu_kernel_args_no_io, readback_ofm, u64_to_prop_dwords, zero_ofm,
+};
+
+pub use host_graph::{
+    HOST_GRAPH_OP_ALLOWLIST, HostGraphOptions, LAB_WEIGHT_MVP_DOC, LabMatmulWeightSpec,
+    WEIGHT_BO_TYPE_SHMEM, Xdna2WeightPlan, build_weight_bo_plan, check_initializer_shape_payload,
+    check_lab_weight_mvp_model, create_lab_weight_io_from_env,
+    create_lab_weight_io_from_model_path, evaluate_host_graph, evaluate_host_graph_with_options,
+    evaluate_host_ir, evaluate_host_ir_with_options, fill_weight_bos_batch,
+    host_graph_ops_supported, host_ir_ops_supported, initializer_host_bytes, initializer_nbytes,
+    lab_weight_requires_ofm, onnx_data_type_name, select_lab_matmul_weight,
+    upload_weights_to_shmem_bos, weight_exec_fill_request_from_spec,
+};
+
+use std::sync::Arc;
 
 use crate::backends::simulation::{SimulationBackend, SimulationConfig};
 use crate::backends::{AccelDevice, Backend, probe_accel_devices, try_open_accel_device};
-use crate::{CompiledModel, DragonNpuError, NpuStatus};
+use crate::{CompiledModel, DragonNpuError, ModelCompiler, NpuStatus};
+
+/// Phase 4 Real-arm submit mode (`XDNA2_REAL_SUBMIT_MODE`).
+///
+/// Default is fail-closed: compile may succeed, but `submit_and_run` refuses to
+/// claim silicon inference without explicit host_ref or gated npu_exec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealSubmitMode {
+    /// Production default: actionable [`DragonNpuError::RealSubmitNotReady`].
+    FailClosed,
+    /// Host f32 path for allowlisted graphs; **not** NPU (`ran_on_npu` false).
+    HostRef,
+    /// Attempt gated EXEC_CMD + Phase 1–3 helpers; never returns fake NPU outputs.
+    NpuExec,
+}
+
+impl RealSubmitMode {
+    /// Parse `XDNA2_REAL_SUBMIT_MODE` (`host_ref` / `host_validate` / `npu_exec`).
+    /// Unset or unknown → [`RealSubmitMode::FailClosed`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        std::env::var("XDNA2_REAL_SUBMIT_MODE").map_or(Self::FailClosed, |v| {
+            let lower = v.trim().to_ascii_lowercase();
+            match lower.as_str() {
+                "host_ref" | "host_validate" => Self::HostRef,
+                "npu_exec" => Self::NpuExec,
+                _ => Self::FailClosed,
+            }
+        })
+    }
+}
+
+/// Ops with real host semantics under `host_ref` (Phase 5 host graph).
+///
+/// Add/Mul/MatMul/Gemm require weights / RHS initializers at execute time; missing
+/// weights → clear error (no fake golden). See [`host_graph::evaluate_host_graph`].
+const HOST_REF_OP_ALLOWLIST: &[&str] = HOST_GRAPH_OP_ALLOWLIST;
+
+/// Ops allowed to *attempt* gated `npu_exec` graph checks (still probe-only EXEC, not model run).
+/// Same allowlist as host graph; does not claim silicon graph execution.
+const NPU_EXEC_OP_ALLOWLIST: &[&str] = HOST_GRAPH_OP_ALLOWLIST;
+
+/// XDNA2-oriented compile/submit plan derived from a [`CompiledModel`].
+///
+/// Produced at submit time (and via [`AmdXdna2Backend::xdna2_compile_plan`]). Does **not**
+/// claim a known-good instruction txn or silicon GEMM Pass.
+#[derive(Debug, Clone)]
+pub struct Xdna2CompilePlan {
+    /// Operator types from the compiled graph.
+    pub ops: Vec<String>,
+    /// Ops not in the Phase 4 Real allowlist (normalized names).
+    pub unsupported_ops: Vec<String>,
+    /// True when every op is allowlisted for `host_ref` / `npu_exec` graph checks.
+    pub host_ref_supported: bool,
+    /// Preferred CREATE_HWCTX tile count hint (AIE2-friendly default).
+    pub preferred_tiles: u32,
+    /// Preferred UMQ BO size hint (bytes).
+    pub preferred_umq_bytes: u64,
+    /// Preferred log BO size hint (bytes).
+    pub preferred_log_bytes: u64,
+    /// Free-form honesty notes for tools/logs.
+    pub notes: String,
+}
+
+/// Build a Phase 4 plan from a compiled model (host-side only).
+///
+/// `preferred_tiles` defaults to [`DEFAULT_HWCTX_TILES`] (4) without a device.
+/// Pass `resource` from live GET_INFO to apply [`suggest_hwctx_tiles`] (Phase 6).
+/// Env `XDNA2_HWCTX_TILES_SINGLE` still overrides at timed_matmul time.
+#[must_use]
+pub fn build_xdna2_compile_plan(model: &CompiledModel) -> Xdna2CompilePlan {
+    build_xdna2_compile_plan_with_resource(model, None)
+}
+
+/// Like [`build_xdna2_compile_plan`] with optional resource info for tile heuristic.
+#[must_use]
+pub fn build_xdna2_compile_plan_with_resource(
+    model: &CompiledModel,
+    resource: Option<&direct::amdxdna_drm_get_resource_info>,
+) -> Xdna2CompilePlan {
+    let ops: Vec<String> = model.ops().to_vec();
+    let unsupported_host = unsupported_ops_vs(&ops, HOST_REF_OP_ALLOWLIST);
+    let unsupported_npu = unsupported_ops_vs(&ops, NPU_EXEC_OP_ALLOWLIST);
+    let host_ref_supported = unsupported_host.is_empty() && !ops.is_empty();
+    let preferred_tiles = resource.map_or(DEFAULT_HWCTX_TILES, suggest_hwctx_tiles);
+    let notes = if ops.is_empty() {
+        "empty op list — model graph has no ops to validate".to_string()
+    } else if host_ref_supported {
+        format!(
+            "all ops in host_ref allowlist (Identity/Relu/Add/Mul/MatMul/Gemm + Phase 6 fused linear); \
+             npu_exec is EXEC-only Phase 3 probe (not model graph on NPU); no ran_on_npu claim; \
+             preferred_tiles={preferred_tiles} (heuristic without device stays 4)"
+        )
+    } else {
+        format!(
+            "host_ref unsupported ops: [{}]; npu_exec graph-check unsupported: [{}]; \
+             compile still OK — use simulation arm or narrow the graph. \
+             host_ref is host f32 graph eval (not NPU); preferred_tiles={preferred_tiles}.",
+            unsupported_host.join(", "),
+            unsupported_npu.join(", ")
+        )
+    };
+    Xdna2CompilePlan {
+        ops,
+        // Surface host_ref gaps as the primary product "unsupported" list.
+        unsupported_ops: unsupported_host,
+        host_ref_supported,
+        preferred_tiles,
+        preferred_umq_bytes: 16 * 1024,
+        preferred_log_bytes: 128 * 1024,
+        notes,
+    }
+}
+
+fn normalize_op_name(op: &str) -> String {
+    op.trim().to_ascii_lowercase()
+}
+
+fn unsupported_ops_vs(ops: &[String], allowlist: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for op in ops {
+        let n = normalize_op_name(op);
+        if n.is_empty() {
+            continue;
+        }
+        if !allowlist.contains(&n.as_str()) && !out.iter().any(|e| e == &n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn require_ops_allowlist(model: &CompiledModel, allowlist: &[&str]) -> Result<(), DragonNpuError> {
+    let ops = model.ops();
+    if ops.is_empty() {
+        return Err(DragonNpuError::UnsupportedOps {
+            model: model.model_path().to_string(),
+            ops: "(none — empty graph)".to_string(),
+        });
+    }
+    let bad = unsupported_ops_vs(ops, allowlist);
+    if !bad.is_empty() {
+        return Err(DragonNpuError::UnsupportedOps {
+            model: model.model_path().to_string(),
+            ops: bad.join(", "),
+        });
+    }
+    Ok(())
+}
+
+/// Host-only f32 path via Phase 5 graph interpreter. **Never** claims NPU.
+///
+/// Identity/Relu/Add/Mul/MatMul/Gemm with real math when weights/shapes allow.
+/// Missing weights or bad shapes → error (no fake golden).
+/// CLI may set `XDNA2_HOST_MATMUL_K` via [`HostGraphOptions::from_env`]; unit tests
+/// that call [`evaluate_host_graph`] directly stay env-isolated.
+fn host_ref_execute(model: &CompiledModel, input: &[f32]) -> Result<Vec<f32>, DragonNpuError> {
+    host_graph::evaluate_host_graph_with_options(
+        model,
+        input,
+        &host_graph::HostGraphOptions::from_env(),
+    )
+}
+
+/// Shared Real-arm state (device open + probe metadata) for executor + compiled-model Backend.
+#[derive(Debug)]
+struct RealXdna2Shared {
+    detected: Option<AccelDevice>,
+    device: Option<RealXdna2Device>,
+}
+
+/// Backend stored on models compiled by the Real arm so `CompiledModel::submit_and_run`
+/// uses the same Phase 4 mode dispatch as [`AmdXdna2Backend::submit_and_run`].
+#[derive(Clone, Debug)]
+struct RealArmBackend {
+    shared: Arc<RealXdna2Shared>,
+}
+
+impl Backend for RealArmBackend {
+    fn status(&self) -> Result<NpuStatus, DragonNpuError> {
+        let open = self.shared.device.is_some();
+        let (device_name, driver_version) = self.shared.detected.as_ref().map_or_else(
+            || {
+                (
+                    format!("AMD XDNA2 Real arm (no probe hit) device_open={open}"),
+                    "amdxdna real-arm (no device)".to_string(),
+                )
+            },
+            |d| {
+                (
+                    format!(
+                        "AMD XDNA2 Real arm ({}:{}) device_open={open}",
+                        d.pci_vendor, d.pci_device
+                    ),
+                    "amdxdna real-arm".to_string(),
+                )
+            },
+        );
+        Ok(NpuStatus {
+            vendor: "AMD".to_string(),
+            // available ≠ inference-ready: default submit is fail-closed without modes/gates.
+            available: open,
+            compute_units: 8,
+            memory_mb: 8192,
+            peak_tops: 50.0,
+            driver_version,
+            supported_dtypes: vec![
+                "fp32".to_string(),
+                "fp16".to_string(),
+                "bf16".to_string(),
+                "int8".to_string(),
+            ],
+            device_name,
+            // Real arm path; simulated=true when accel fd is not open.
+            simulated: !open,
+        })
+    }
+
+    fn compile_model(
+        &self,
+        model_path: &str,
+        optimization_level: u8,
+        quantization: &str,
+    ) -> Result<CompiledModel, DragonNpuError> {
+        // Host-side ModelCompiler (same passes as simulation). Backend Arc is this Real arm
+        // so model.submit_and_run uses Phase 4 dispatch.
+        let compiler = ModelCompiler::new();
+        compiler.compile(
+            model_path,
+            optimization_level,
+            quantization,
+            Arc::new(self.clone()),
+        )
+    }
+
+    fn run(&self, input: &[f32]) -> Result<Vec<f32>, DragonNpuError> {
+        let _ = input;
+        // Direct run on Real arm is not the production path (needs model op list).
+        Err(DragonNpuError::RuntimeError(
+            "use submit_and_run for real XDNA2 hardware (direct run is not supported on the production path; \
+             host_ref / npu_exec are submit_and_run modes via XDNA2_REAL_SUBMIT_MODE)"
+                .to_string(),
+        ))
+    }
+
+    fn submit_and_run(
+        &self,
+        model: &CompiledModel,
+        input: &[f32],
+    ) -> Result<Vec<f32>, DragonNpuError> {
+        real_arm_submit_and_run(
+            self.shared.as_ref(),
+            model,
+            input,
+            RealSubmitMode::from_env(),
+        )
+    }
+}
+
+fn real_arm_submit_and_run(
+    shared: &RealXdna2Shared,
+    model: &CompiledModel,
+    input: &[f32],
+    mode: RealSubmitMode,
+) -> Result<Vec<f32>, DragonNpuError> {
+    // Prefer resource-backed tile heuristic when Real device is open (Issue 8).
+    let resource = shared
+        .device
+        .as_ref()
+        .and_then(|d| d.get_direct_resource_info().ok());
+    let plan = build_xdna2_compile_plan_with_resource(model, resource.as_ref());
+    let device_open = shared.device.is_some();
+    let device_path = shared
+        .device
+        .as_ref()
+        .map_or_else(|| "(none)".to_string(), |d| d.path().display().to_string());
+    let gate = exec_cmd_block_reason();
+
+    match mode {
+        RealSubmitMode::FailClosed => Err(DragonNpuError::RealSubmitNotReady {
+            reason: format!(
+                "model '{}' compiled OK (ops={}, host_ref_unsupported=[{}], host_ref_supported={}); \
+                 device_open={device_open} path={device_path}; EXEC_CMD: {gate}; \
+                 no verified instruction txn for silicon inference (ran_on_npu remains false). \
+                 Set XDNA2_REAL_SUBMIT_MODE=host_ref for Phase 5 host f32 graph \
+                 (Identity/Relu/Add/Mul/MatMul/Gemm when weights present; not NPU), or \
+                 XDNA2_REAL_SUBMIT_MODE=npu_exec (EXEC-only Phase 3 timed_matmul 1x1x1 probe — model graph \
+                 is NOT executed) with feature xdna2-dangerous-exec-cmd + XDNA2_ALLOW_EXEC_CMD=1 \
+                 (+ optional XDNA2_INSTRUCTION_BLOB). Still not a numerical NPU Pass. \
+                 For hwctx-only bring-up without EXEC, use timed_matmul / xdna2_probe (not npu_exec). \
+                 See docs/XDNA2_REAL_EXECUTION.md Phase 4–5.",
+                model.model_path(),
+                plan.ops.len(),
+                plan.unsupported_ops.join(", "),
+                plan.host_ref_supported,
+            ),
+        }),
+        RealSubmitMode::HostRef => {
+            // Phase 5 host graph; device open optional. Not NPU.
+            host_ref_execute(model, input)
+        }
+        RealSubmitMode::NpuExec => {
+            // Graph allowlist is a coarse pre-check only — npu_exec does not run the model.
+            require_ops_allowlist(model, NPU_EXEC_OP_ALLOWLIST)?;
+            if !device_open {
+                return Err(DragonNpuError::RealSubmitNotReady {
+                    reason: format!(
+                        "npu_exec mode but real XDNA2 device is not open (path={device_path}); \
+                         open /dev/accel via new_with_real_stub on a live amdxdna host. {gate}"
+                    ),
+                });
+            }
+            // npu_exec is EXEC-only by design (requires L1 double gate). For CREATE_HWCTX-only
+            // diagnostics without opening EXEC, use timed_matmul_direct / probe (returns hwctx_ok).
+            if !exec_cmd_is_enabled() {
+                return Err(DragonNpuError::RealSubmitNotReady {
+                    reason: format!(
+                        "npu_exec is EXEC-only and EXEC_CMD is gated: {gate}. \
+                         model '{}' passed coarse op allowlist; device_open=true. \
+                         Model graph is not executed in npu_exec. \
+                         For hwctx_ok without EXEC, call timed_matmul / xdna2_probe instead of enabling L1. \
+                         Do not claim silicon Pass without gates + known-good txn + numerical verify.",
+                        model.model_path()
+                    ),
+                });
+            }
+            let device =
+                shared
+                    .device
+                    .as_ref()
+                    .ok_or_else(|| DragonNpuError::RealSubmitNotReady {
+                        reason: "npu_exec: device vanished (internal)".to_string(),
+                    })?;
+            // Reuse fd-scoped RealDirectSubmission (DevHeap ownership) + Phase 3 probe.
+            // Model ops/weights/UMQ plan hints are intentionally not applied — 1x1x1 probe only.
+            let sub = device.shared_direct_submission();
+            let tr = timed_matmul_direct(&sub, 1, 1, 1, "f32");
+            Err(DragonNpuError::RealSubmitNotReady {
+                reason: format!(
+                    "npu_exec Phase 3 timed_matmul probe only (1x1x1 f32) — model graph NOT executed \
+                     (compiled model='{}' ops={}). probe status={} ran_on_npu={} ran_on_device_path={} \
+                     detail={}. Outputs are intentionally not returned as inference results. \
+                     Use host_ref for Phase 5 host f32 graph. See docs/XDNA2_REAL_EXECUTION.md Phase 4–5.",
+                    model.model_path(),
+                    plan.ops.len(),
+                    tr.status,
+                    tr.ran_on_npu,
+                    tr.ran_on_device_path,
+                    tr.detail
+                ),
+            })
+        }
+    }
+}
 
 /// AMD XDNA2 backend.
 ///
@@ -108,6 +518,17 @@ trait Xdna2Executor: std::fmt::Debug + Send + Sync {
         input: &[f32],
     ) -> Result<Vec<f32>, DragonNpuError>;
 
+    /// Phase 4: submit with explicit mode (no env). Default ignores mode and
+    /// delegates to [`Self::submit_and_run`] (simulation). Real overrides.
+    fn submit_and_run_with_mode(
+        &self,
+        model: &CompiledModel,
+        input: &[f32],
+        _mode: RealSubmitMode,
+    ) -> Result<Vec<f32>, DragonNpuError> {
+        self.submit_and_run(model, input)
+    }
+
     /// Production helper: whether the real device is open and ready.
     /// Default impl returns false; Real executor overrides it.
     fn real_device_open(&self) -> bool {
@@ -154,6 +575,12 @@ trait Xdna2Executor: std::fmt::Debug + Send + Sync {
     ) -> Result<direct::amdxdna_drm_get_power_mode, direct::DirectError> {
         Err(direct::DirectError::Unsupported(
             "get_direct_power_mode not available on this executor".to_string(),
+        ))
+    }
+
+    fn set_direct_power_mode(&self, _mode: u8) -> Result<(), direct::DirectError> {
+        Err(direct::DirectError::Unsupported(
+            "set_direct_power_mode not available on this executor".to_string(),
         ))
     }
 
@@ -290,26 +717,61 @@ struct HwCtxRecord {
 pub(crate) struct RealXdna2Device {
     /// Metadata from the sysfs probe at the time we decided to open this device.
     detected: AccelDevice,
-    /// The open file descriptor. We keep it so we can eventually issue ioctls
-    /// or pass it to XRT / other runtimes.
+    /// The open file descriptor. Kept open for the device lifetime; Drop cleans
+    /// tracked hwctxs then shared submission (DevHeap) before the fd closes.
     file: std::fs::File,
     /// The exact path we successfully opened (e.g. /dev/accel/accel0).
     path: std::path::PathBuf,
+    /// Fd-scoped real submission (single DevHeap owner for this open).
+    /// Reuse via [`Self::shared_direct_submission`] — do not construct a second
+    /// `RealDirectSubmission` on this fd while this lives.
+    submission: Arc<direct::RealDirectSubmission>,
     /// Records of hwctxs + their associated BOs created via the direct path.
     /// Interior mutability so create/destroy work through `&self` public APIs.
     created_hwctxs: std::sync::Mutex<Vec<HwCtxRecord>>,
+}
+
+impl Drop for RealXdna2Device {
+    fn drop(&mut self) {
+        // Best-effort: destroy tracked hwctxs + UMQ/log BOs while fd is still open.
+        let records = self
+            .created_hwctxs
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        let fd = self.as_fd();
+        for r in records {
+            let _ = self.submission.destroy_hwctx(fd, r.handle);
+            if r.umq_bo != 0 {
+                let _ = self.submission.destroy_buffer(fd, r.umq_bo);
+            }
+            if r.log_buf_bo != 0 {
+                let _ = self.submission.destroy_buffer(fd, r.log_buf_bo);
+            }
+        }
+        // Arc drop of submission → RealDirectSubmission::Drop releases DevHeap.
+    }
 }
 
 impl RealXdna2Device {
     /// Create a device handle from an already-successful open.
     /// The caller is responsible for having performed the open.
     fn from_opened(detected: AccelDevice, file: std::fs::File, path: std::path::PathBuf) -> Self {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
         Self {
             detected,
             file,
             path,
+            submission: Arc::new(direct::RealDirectSubmission::new(fd)),
             created_hwctxs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Shared fd-scoped submission (reuses DevHeap; safe for repeated npu_exec / probe).
+    #[must_use]
+    pub fn shared_direct_submission(&self) -> SharedRealDirectSubmission {
+        SharedRealDirectSubmission::new(Arc::clone(&self.submission))
     }
 
     /// Record a successfully created hwctx for ownership / destroy tracking.
@@ -427,18 +889,11 @@ impl RealXdna2Device {
 
     /// Returns a lightweight direct submission handle for this device.
     ///
-    /// This is the entry point for the focused, non-official direct driver
-    /// execution path we are building (direct amdxdna ioctls, no heavy official
-    /// runtimes). The handle is created with the real open fd so that future
-    /// real implementations have everything they need.
+    /// **Reuses** the fd-scoped [`RealDirectSubmission`] (single DevHeap owner).
+    /// Do not call `RealDirectSubmission::new` on this fd while the device lives.
     #[allow(dead_code)]
-    pub fn direct_submission(&self) -> impl DirectSubmission {
-        // Return the real implementation (which performs actual DRM_IOCTL_AMDXDNA_GET_INFO
-        // calls for the typed helpers). This is what makes get_direct_firmware_version(),
-        // get_direct_power_mode(), and get_direct_resource_info() talk to the live
-        // amdxdna driver on physical hardware when the Real arm or new_with_real_stub()
-        // is used.
-        direct::RealDirectSubmission::new(self.as_fd())
+    pub fn direct_submission(&self) -> SharedRealDirectSubmission {
+        self.shared_direct_submission()
     }
 
     /// Query firmware version using the lightweight direct path (real ioctl on hardware).
@@ -447,9 +902,7 @@ impl RealXdna2Device {
     pub fn get_direct_firmware_version(
         &self,
     ) -> Result<direct::amdxdna_drm_query_firmware_version, direct::DirectError> {
-        // Delegate through the direct submission. When the real arm is active,
-        // RealDirectSubmission will perform the actual GET_INFO ioctl.
-        self.direct_submission().get_firmware_version()
+        self.submission.get_firmware_version()
     }
 
     /// Query configured power mode using the lightweight direct path.
@@ -457,7 +910,13 @@ impl RealXdna2Device {
     pub fn get_direct_power_mode(
         &self,
     ) -> Result<direct::amdxdna_drm_get_power_mode, direct::DirectError> {
-        self.direct_submission().get_power_mode()
+        self.submission.get_power_mode()
+    }
+
+    /// Set power mode (SET_STATE / SET_POWER_MODE). See backend docs.
+    #[allow(dead_code)]
+    pub fn set_direct_power_mode(&self, mode: u8) -> Result<(), direct::DirectError> {
+        self.submission.set_power_mode(mode)
     }
 
     /// Query resource information (current/max TOPS, clocks, task limits) via the direct path.
@@ -465,7 +924,7 @@ impl RealXdna2Device {
     pub fn get_direct_resource_info(
         &self,
     ) -> Result<direct::amdxdna_drm_get_resource_info, direct::DirectError> {
-        self.direct_submission().get_resource_info()
+        self.submission.get_resource_info()
     }
 
     /// Query sensor data via the lightweight direct path.
@@ -473,7 +932,7 @@ impl RealXdna2Device {
     pub fn get_direct_sensors(
         &self,
     ) -> Result<direct::amdxdna_drm_query_sensor, direct::DirectError> {
-        self.direct_submission().get_sensors()
+        self.submission.get_sensors()
     }
 
     /// Get information about a specific buffer object via the lightweight direct path.
@@ -482,7 +941,7 @@ impl RealXdna2Device {
         &self,
         handle: u32,
     ) -> Result<direct::amdxdna_drm_get_bo_info, direct::DirectError> {
-        self.direct_submission().get_bo_info(self.as_fd(), handle)
+        self.submission.get_bo_info(self.as_fd(), handle)
     }
 
     /// Convenience: create a hardware context with internally-managed UMQ and log buffers.
@@ -511,7 +970,7 @@ impl RealXdna2Device {
         log_size: u64,
         qos: Option<&direct::QosInfo>,
     ) -> Result<direct::HardwareContext, direct::DirectError> {
-        let ctx = self.direct_submission().create_hwctx_with_sizes(
+        let ctx = self.submission.create_hwctx_with_sizes(
             self.as_fd(),
             num_tiles,
             mem_size,
@@ -531,17 +990,16 @@ impl RealXdna2Device {
     #[allow(dead_code)]
     pub fn destroy_direct_hwctx(&self, handle: u32) -> Result<(), direct::DirectError> {
         let record = self.untrack_hwctx(handle);
-        let sub = self.direct_submission();
         let fd = self.as_fd();
         if let Some(r) = record {
             if r.umq_bo != 0 {
-                let _ = sub.destroy_buffer(fd, r.umq_bo);
+                let _ = self.submission.destroy_buffer(fd, r.umq_bo);
             }
             if r.log_buf_bo != 0 {
-                let _ = sub.destroy_buffer(fd, r.log_buf_bo);
+                let _ = self.submission.destroy_buffer(fd, r.log_buf_bo);
             }
         }
-        sub.destroy_hwctx(fd, handle)
+        self.submission.destroy_hwctx(fd, handle)
     }
 
     /// Destroy a hwctx and its associated BOs (recommended for bring-up).
@@ -552,16 +1010,15 @@ impl RealXdna2Device {
         ctx: &direct::HardwareContext,
     ) -> Result<(), direct::DirectError> {
         let _ = self.untrack_hwctx(ctx.handle);
-        let sub = self.direct_submission();
         let fd = self.as_fd();
         // Destroy hwctx first while BOs are still valid references for the driver,
         // then GEM_CLOSE the UMQ/log BOs we own.
-        let hwctx_res = sub.destroy_hwctx(fd, ctx.handle);
+        let hwctx_res = self.submission.destroy_hwctx(fd, ctx.handle);
         if ctx.umq_bo != 0 {
-            let _ = sub.destroy_buffer(fd, ctx.umq_bo);
+            let _ = self.submission.destroy_buffer(fd, ctx.umq_bo);
         }
         if ctx.log_buf_bo != 0 {
-            let _ = sub.destroy_buffer(fd, ctx.log_buf_bo);
+            let _ = self.submission.destroy_buffer(fd, ctx.log_buf_bo);
         }
         hwctx_res
     }
@@ -571,7 +1028,7 @@ impl RealXdna2Device {
     pub fn get_direct_aie_version(
         &self,
     ) -> Result<direct::amdxdna_drm_query_aie_version, direct::DirectError> {
-        self.direct_submission().get_aie_version()
+        self.submission.get_aie_version()
     }
 
     /// Returns how many hwctxs are currently tracked on this device handle
@@ -606,25 +1063,15 @@ pub struct RealXdna2DeviceInfo {
 /// Real XDNA2 executor — the production path for actual hardware submission.
 ///
 /// When the `Real` arm is active, this type holds a `RealXdna2Device` (the opened
-/// /dev/accel handle) and is responsible for future real NPU command submission.
+/// /dev/accel handle) and implements Phase 4 `compile_model` / `submit_and_run`:
+/// - **compile_model**: always host-side [`ModelCompiler`] (same passes as simulation).
+/// - **submit_and_run**: mode dispatch via `XDNA2_REAL_SUBMIT_MODE` (default fail-closed;
+///   `host_ref` host f32; `npu_exec` gated EXEC attempt without fake NPU Pass).
 ///
-/// Current state:
-/// - Device open + rich diagnostics via the embedded `RealXdna2Device` — mature.
-/// - `submit_and_run` / `compile_model` — honest "not yet wired" errors until
-///   the actual execution implementation lands.
-///
-/// This is where real XDNA2 command submission work will continue in the pure
-/// lightweight direct style (no heavy/official runtimes).
-///
-/// See docs/XDNA2_REAL_EXECUTION.md.
+/// See docs/XDNA2_REAL_EXECUTION.md Phase 4 and docs/XDNA2_NEVER_AGAIN.md.
 #[derive(Debug)]
-#[allow(dead_code)] // Real submission implementation pending architectural decisions
 struct RealXdna2Executor {
-    /// Details of the detected XDNA2 device (from sysfs probe).
-    detected: Option<AccelDevice>,
-    /// The opened real device handle, if we successfully opened one.
-    /// This is the new home for all real-device concerns.
-    device: Option<RealXdna2Device>,
+    shared: Arc<RealXdna2Shared>,
 }
 
 impl RealXdna2Executor {
@@ -632,18 +1079,30 @@ impl RealXdna2Executor {
     ///
     /// If a device was detected, this will attempt to open the corresponding
     /// /dev/accel device using the shared helper. Failure to open is turned
-    /// into a clear runtime error only when submission is actually attempted.
+    /// into a clear error only when `npu_exec` submission is attempted.
+    /// Host-side `compile_model` and `host_ref` submit do not require an open device.
     fn new(detected: Option<AccelDevice>) -> Self {
         let (opened_file, opened_path) = try_open_accel_device(detected.as_ref());
 
-        let device = match (detected, opened_file, opened_path) {
+        let device = match (detected.clone(), opened_file, opened_path) {
             (Some(det), Some(f), Some(p)) => Some(RealXdna2Device::from_opened(det, f, p)),
             _ => None,
         };
 
+        // Prefer probe metadata from the open device; else the original detection.
+        let detected_meta = device.as_ref().map(|d| d.detected.clone()).or(detected);
+
         Self {
-            detected: device.as_ref().map(|d| d.detected.clone()),
-            device,
+            shared: Arc::new(RealXdna2Shared {
+                detected: detected_meta,
+                device,
+            }),
+        }
+    }
+
+    fn arm_backend(&self) -> RealArmBackend {
+        RealArmBackend {
+            shared: Arc::clone(&self.shared),
         }
     }
 }
@@ -652,27 +1111,16 @@ impl Xdna2Executor for RealXdna2Executor {
     fn compile_model(
         &self,
         model_path: &str,
-        _optimization_level: u8,
-        _quantization: &str,
+        optimization_level: u8,
+        quantization: &str,
     ) -> Result<CompiledModel, DragonNpuError> {
-        // In a full production implementation this would compile or load
-        // an XDNA2-native artifact using the opened device context.
-        Err(DragonNpuError::CompilationFailed {
-            model: model_path.to_string(),
-            reason: if self.device.is_some() {
-                "real XDNA2 compilation/submission not yet wired (device open succeeded; \
-                 real_device_read_sysfs() and real_device_detected() are available for diagnostics)"
-                    .to_string()
-            } else {
-                "real XDNA2 device not available for compilation".to_string()
-            },
-        })
+        // Phase 4.1: real compile via ModelCompiler (host-side; device optional).
+        self.arm_backend()
+            .compile_model(model_path, optimization_level, quantization)
     }
 
-    fn run(&self, _input: &[f32]) -> Result<Vec<f32>, DragonNpuError> {
-        Err(DragonNpuError::RuntimeError(
-            "use submit_and_run for real XDNA2 hardware (direct run is not supported on the production path)".to_string(),
-        ))
+    fn run(&self, input: &[f32]) -> Result<Vec<f32>, DragonNpuError> {
+        self.arm_backend().run(input)
     }
 
     fn is_real(&self) -> bool {
@@ -681,50 +1129,51 @@ impl Xdna2Executor for RealXdna2Executor {
 
     fn submit_and_run(
         &self,
-        _model: &CompiledModel,
-        _input: &[f32],
+        model: &CompiledModel,
+        input: &[f32],
     ) -> Result<Vec<f32>, DragonNpuError> {
-        // This is where the real production submission will happen:
-        // - Use the opened device to issue commands to the amdxdna driver.
-        // - Feed model weights from CompiledModel::initializers().
-        // - Handle tiling, bf16, power modes, etc. (see XDNA2_REAL_EXECUTION.md).
-        //
-        // NEVER AGAIN (docs/XDNA2_NEVER_AGAIN.md): when this is wired, EXEC_CMD
-        // must go only through `RealDirectSubmission::submit_command` (which
-        // hard-gates on `exec_cmd_is_enabled()`), or call `exec_cmd_is_enabled()`
-        // at the top and refuse. Do **not** open-code DRM_IOCTL_AMDXDNA_EXEC_CMD
-        // here and bypass the double gate (feature + XDNA2_ALLOW_EXEC_CMD).
-        if self.device.is_some() {
-            Err(DragonNpuError::RuntimeError(
-                "real XDNA2 submit_and_run not yet implemented (device successfully opened; \
-                 use real_device_detected(), real_device_info(), and real_device_read_sysfs() \
-                 for rich diagnostics while implementing submission — see docs/XDNA2_REAL_EXECUTION.md)".to_string(),
-            ))
-        } else {
-            Err(DragonNpuError::RuntimeError(
-                "real XDNA2 hardware device could not be opened for submission".to_string(),
-            ))
-        }
+        // Phase 4.2: NEVER AGAIN — EXEC only through gated helpers inside npu_exec mode
+        // (timed_matmul_direct → submit_and_wait_command / RealDirectSubmission).
+        real_arm_submit_and_run(
+            self.shared.as_ref(),
+            model,
+            input,
+            RealSubmitMode::from_env(),
+        )
+    }
+
+    fn submit_and_run_with_mode(
+        &self,
+        model: &CompiledModel,
+        input: &[f32],
+        mode: RealSubmitMode,
+    ) -> Result<Vec<f32>, DragonNpuError> {
+        real_arm_submit_and_run(self.shared.as_ref(), model, input, mode)
     }
 
     fn real_device_open(&self) -> bool {
-        self.device.is_some()
+        self.shared.device.is_some()
     }
 
     fn real_device_path(&self) -> Option<&std::path::Path> {
-        self.device.as_ref().map(RealXdna2Device::path)
+        self.shared.device.as_ref().map(RealXdna2Device::path)
     }
 
     fn real_device_info(&self) -> Option<RealXdna2DeviceInfo> {
-        self.device.as_ref().map(RealXdna2Device::info)
+        self.shared.device.as_ref().map(RealXdna2Device::info)
     }
 
     fn real_device_detected(&self) -> Option<&AccelDevice> {
-        self.device.as_ref().map(RealXdna2Device::detected)
+        self.shared
+            .device
+            .as_ref()
+            .map(RealXdna2Device::detected)
+            .or(self.shared.detected.as_ref())
     }
 
     fn real_device_read_sysfs(&self, relative_path: &str) -> Option<String> {
-        self.device
+        self.shared
+            .device
             .as_ref()
             .and_then(|d| d.read_sysfs(relative_path))
     }
@@ -733,7 +1182,7 @@ impl Xdna2Executor for RealXdna2Executor {
     fn get_direct_firmware_version(
         &self,
     ) -> Result<direct::amdxdna_drm_query_firmware_version, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -746,7 +1195,7 @@ impl Xdna2Executor for RealXdna2Executor {
     fn get_direct_power_mode(
         &self,
     ) -> Result<direct::amdxdna_drm_get_power_mode, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -756,10 +1205,21 @@ impl Xdna2Executor for RealXdna2Executor {
         )
     }
 
+    fn set_direct_power_mode(&self, mode: u8) -> Result<(), direct::DirectError> {
+        self.shared.device.as_ref().map_or_else(
+            || {
+                Err(direct::DirectError::Unsupported(
+                    "no real XDNA2 device open for set_power_mode".to_string(),
+                ))
+            },
+            |d| d.set_direct_power_mode(mode),
+        )
+    }
+
     fn get_direct_resource_info(
         &self,
     ) -> Result<direct::amdxdna_drm_get_resource_info, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -770,15 +1230,15 @@ impl Xdna2Executor for RealXdna2Executor {
     }
 
     fn direct_submission(&self) -> Box<dyn direct::DirectSubmission> {
-        if let Some(dev) = &self.device {
-            Box::new(direct::RealDirectSubmission::new(dev.as_fd()))
+        if let Some(dev) = &self.shared.device {
+            Box::new(dev.shared_direct_submission())
         } else {
             Box::new(direct::StubDirectSubmission::new(-1))
         }
     }
 
     fn get_sensors(&self) -> Result<direct::amdxdna_drm_query_sensor, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -792,7 +1252,7 @@ impl Xdna2Executor for RealXdna2Executor {
         &self,
         handle: u32,
     ) -> Result<direct::amdxdna_drm_get_bo_info, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -819,7 +1279,7 @@ impl Xdna2Executor for RealXdna2Executor {
         log_size: u64,
         qos: Option<&direct::QosInfo>,
     ) -> Result<direct::HardwareContext, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct hwctx".to_string(),
@@ -830,7 +1290,7 @@ impl Xdna2Executor for RealXdna2Executor {
     }
 
     fn destroy_direct_hwctx(&self, handle: u32) -> Result<(), direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -843,7 +1303,7 @@ impl Xdna2Executor for RealXdna2Executor {
     fn get_direct_aie_version(
         &self,
     ) -> Result<direct::amdxdna_drm_query_aie_version, direct::DirectError> {
-        self.device.as_ref().map_or_else(
+        self.shared.device.as_ref().map_or_else(
             || {
                 Err(direct::DirectError::Unsupported(
                     "no real XDNA2 device open for direct query".to_string(),
@@ -854,7 +1314,8 @@ impl Xdna2Executor for RealXdna2Executor {
     }
 
     fn created_direct_hwctx_count(&self) -> usize {
-        self.device
+        self.shared
+            .device
             .as_ref()
             .map_or(0, RealXdna2Device::created_direct_hwctx_count)
     }
@@ -1152,6 +1613,19 @@ impl AmdXdna2Backend {
         }
     }
 
+    /// Set power mode via `DRM_IOCTL_AMDXDNA_SET_STATE` + `SET_POWER_MODE` (Phase 6).
+    ///
+    /// Packed from public uAPI. **Operator-tested** — default tests never open
+    /// `/dev/accel` for SET. Does not claim measured TOPS change.
+    pub fn set_direct_power_mode(&self, mode: u8) -> Result<(), direct::DirectError> {
+        match &self.execution {
+            Execution::Real(exec) => exec.set_direct_power_mode(mode),
+            Execution::Simulation(_) => Err(direct::DirectError::Unsupported(
+                "set_direct_power_mode requires the Real XDNA2 execution arm".to_string(),
+            )),
+        }
+    }
+
     /// Query resource limits (TOPS, clocks, task caps) via the lightweight direct driver path.
     pub fn get_direct_resource_info(
         &self,
@@ -1163,6 +1637,15 @@ impl AmdXdna2Backend {
                     .to_string(),
             )),
         }
+    }
+
+    /// Suggested CREATE_HWCTX tile count from live resource info (Phase 6).
+    ///
+    /// Real arm only (needs GET_INFO). Heuristic multiples of 4 in 4..=8 — not a
+    /// silicon efficiency claim. See [`suggest_hwctx_tiles`].
+    pub fn suggested_hwctx_tiles(&self) -> Result<u32, direct::DirectError> {
+        let res = self.get_direct_resource_info()?;
+        Ok(suggest_hwctx_tiles(&res))
     }
 
     /// Query AIE version via the lightweight direct driver path.
@@ -1249,13 +1732,24 @@ impl AmdXdna2Backend {
         }
     }
 
-    /// Timed matmul attempt via the pure direct path (plan step 4).
+    /// Timed matmul attempt via the pure direct path (plan step 4 / Phase 3).
     ///
-    /// Returns structured timings + honest `status` (`hwctx_blocked`,
-    /// `payload_unsupported`, `ok_submit_scaffold`, …). Never fakes NPU Pass.
+    /// Returns structured stage timings + honest `status` (`hwctx_blocked`,
+    /// `hwctx_ok`, `ok_submit_wait_envelope`, `ok_submit_wait_with_inst_blob`, …).
+    /// Never fakes NPU Pass (`ran_on_npu` stays false without numerical verify).
+    /// Optional host golden: `host_ref_*` (CPU only).
     pub fn timed_matmul(&self, m: u32, n: u32, k: u32, dtype: &str) -> direct::TimedOpResult {
         let sub = self.direct_submission();
         direct::timed_matmul_direct(sub.as_ref(), m, n, k, dtype)
+    }
+
+    /// Timed Shmem BO fill + SYNC TO/FROM + verify (Phase 3 safe silicon path).
+    ///
+    /// No EXEC_CMD. `ran_on_device_path` on success; never `ran_on_npu`.
+    /// `size_bytes == 0` uses [`direct::DEFAULT_BO_ROUNDTRIP_SIZE`].
+    pub fn timed_bo_roundtrip(&self, size_bytes: u64) -> direct::TimedOpResult {
+        let sub = self.direct_submission();
+        direct::timed_bo_roundtrip_direct(sub.as_ref(), size_bytes)
     }
 
     /// Snapshot of the frozen Direct NPU capability checklist for tools/docs.
@@ -1292,8 +1786,8 @@ impl AmdXdna2Backend {
 
     /// Primary production API for running inference on XDNA2 hardware.
     ///
-    /// When `real_execution_active()` is true, this performs actual NPU submission
-    /// (once the real execution implementation is wired).
+    /// When `real_execution_active()` is true (Real arm), Phase 4 mode dispatch applies
+    /// (`XDNA2_REAL_SUBMIT_MODE`; default fail-closed). Simulation arm runs host fidelity path.
     pub fn submit_and_run(
         &self,
         model: &CompiledModel,
@@ -1304,6 +1798,32 @@ impl AmdXdna2Backend {
                 exec.submit_and_run(model, input)
             }
         }
+    }
+
+    /// Phase 4 lab/test API: Real-arm submit with an explicit mode (no env mutation).
+    ///
+    /// Simulation arm ignores `mode` and uses the normal simulation path.
+    /// Prefer this in unit tests so `XDNA2_REAL_SUBMIT_MODE` in the shell cannot flake CI.
+    pub fn submit_and_run_with_mode(
+        &self,
+        model: &CompiledModel,
+        input: &[f32],
+        mode: RealSubmitMode,
+    ) -> Result<Vec<f32>, DragonNpuError> {
+        match &self.execution {
+            Execution::Simulation(exec) | Execution::Real(exec) => {
+                exec.submit_and_run_with_mode(model, input, mode)
+            }
+        }
+    }
+
+    /// Phase 4: derive an XDNA2 compile/submit plan from a compiled model (host-side).
+    ///
+    /// Does not open devices or issue ioctls. Useful for tools that need op-allowlist
+    /// status and hwctx size hints without claiming silicon compute.
+    #[must_use]
+    pub fn xdna2_compile_plan(model: &CompiledModel) -> Xdna2CompilePlan {
+        build_xdna2_compile_plan(model)
     }
 }
 
@@ -1526,19 +2046,173 @@ mod tests {
     #[test]
     fn submit_and_run_on_real_stub_returns_clear_actionable_error() {
         let backend = AmdXdna2Backend::new_with_real_stub();
-        // We must be able to reach the compile call site on the Real arm.
-        // Compile fails honestly today (either device-open or not-wired).
-        let compile_res = backend.compile_model("any_model.onnx", 1, "fp32");
-        assert!(compile_res.is_err());
-        let err = compile_res.unwrap_err();
+        // Phase 4: compile succeeds on Real arm (host ModelCompiler).
+        let model = backend
+            .compile_model("any_model.onnx", 1, "fp32")
+            .expect("Real arm compile_model must use ModelCompiler");
+        assert!(!model.ops().is_empty());
+        // Pin FailClosed so shell XDNA2_REAL_SUBMIT_MODE=host_ref cannot flake this test.
+        let err = backend
+            .submit_and_run_with_mode(&model, &[0.0f32; 4], RealSubmitMode::FailClosed)
+            .expect_err("FailClosed Real submit must error");
         let msg = format!("{err:?}");
-        // Real arm always prefixes with "real XDNA2 …" (open or not).
-        // Do not require a live /dev/accel open (wedged driver / CI without NPU).
         assert!(
-            msg.contains("real XDNA2 compilation/submission not yet wired")
-                || msg.contains("real XDNA2 device not available for compilation"),
-            "expected Real-arm compile error, got: {msg}"
+            msg.contains("RealSubmitNotReady") || msg.contains("not ready"),
+            "expected actionable RealSubmitNotReady, got: {msg}"
         );
+        // Plan helper must be callable without claiming silicon.
+        let plan = AmdXdna2Backend::xdna2_compile_plan(&model);
+        assert!(!plan.ops.is_empty());
+        assert!(!plan.notes.is_empty());
+    }
+
+    #[test]
+    fn real_submit_mode_from_env_defaults_to_fail_closed_when_unset() {
+        // When the env var is absent, from_env must be FailClosed. Do not mutate env here.
+        if std::env::var_os("XDNA2_REAL_SUBMIT_MODE").is_none() {
+            assert_eq!(RealSubmitMode::from_env(), RealSubmitMode::FailClosed);
+        }
+    }
+
+    #[test]
+    fn real_compile_model_succeeds_without_device() {
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        let model = backend
+            .compile_model("model.onnx", 0, "fp32")
+            .expect("compile must succeed on Real arm without requiring silicon");
+        assert!(model.node_count() > 0);
+        assert!(!model.ops().is_empty());
+        assert_eq!(model.optimization_level(), 0);
+    }
+
+    #[test]
+    fn host_ref_mode_runs_allowlisted_json_model() {
+        // Tiny allowlisted graph (Relu only) + host_ref mode via pure mode arg (no env race).
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_phase4_host_ref_relu.json");
+        let json = r#"{"ops":["Relu"]}"#;
+        std::fs::write(&path, json).expect("write temp model");
+        let path_str = path.to_str().expect("utf8 path");
+
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        let model = backend
+            .compile_model(path_str, 0, "fp32")
+            .expect("compile allowlisted json");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            model
+                .ops()
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect::<Vec<_>>(),
+            vec!["relu".to_string()]
+        );
+        let plan = build_xdna2_compile_plan(&model);
+        assert!(plan.host_ref_supported, "plan notes: {}", plan.notes);
+        // Issue 8: offline plan stays DEFAULT_HWCTX_TILES without resource.
+        assert_eq!(plan.preferred_tiles, DEFAULT_HWCTX_TILES);
+        let res = direct::amdxdna_drm_get_resource_info {
+            npu_clk_max: 1800,
+            npu_tops_max: 58,
+            npu_task_max: 16,
+            npu_tops_curr: 0,
+            npu_task_curr: 0,
+        };
+        let plan_hw = build_xdna2_compile_plan_with_resource(&model, Some(&res));
+        assert_eq!(plan_hw.preferred_tiles, 8);
+
+        // Call Phase 4 dispatch with HostRef directly (avoids process-wide env mutation).
+        let shared = RealXdna2Shared {
+            detected: None,
+            device: None,
+        };
+        let input = vec![-1.0f32, 0.0, 2.0, 3.5];
+        let out = real_arm_submit_and_run(&shared, &model, &input, RealSubmitMode::HostRef)
+            .expect("host_ref must produce host-validated output");
+        assert_eq!(out.len(), input.len());
+        assert!((out[0] - 0.0).abs() < f32::EPSILON); // ReLU
+        assert!((out[2] - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn host_ref_rejects_unsupported_ops() {
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        // Heuristic .onnx path produces many "conv" ops — not in Phase 4 allowlist.
+        let model = backend
+            .compile_model("big_model.onnx", 0, "fp32")
+            .expect("compile");
+        let shared = RealXdna2Shared {
+            detected: None,
+            device: None,
+        };
+        let err = real_arm_submit_and_run(&shared, &model, &[1.0f32; 4], RealSubmitMode::HostRef)
+            .expect_err("conv graph must be UnsupportedOps");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("UnsupportedOps")
+                || msg.contains("Unsupported ops")
+                || msg.contains("conv"),
+            "expected UnsupportedOps, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn npu_exec_mode_refuses_without_device_or_when_gated() {
+        assert!(
+            !exec_cmd_is_enabled(),
+            "test requires default EXEC_CMD gates closed"
+        );
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_phase4_npu_exec_id.json");
+        std::fs::write(&path, r#"{"ops":["Identity"]}"#).expect("write");
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        let model = backend
+            .compile_model(path.to_str().unwrap(), 0, "fp32")
+            .expect("compile");
+        let _ = std::fs::remove_file(&path);
+
+        // Synthetic shared without open device: npu_exec must fail closed (no fake Pass).
+        let shared = RealXdna2Shared {
+            detected: backend.detected_device().cloned(),
+            device: None,
+        };
+        let err = real_arm_submit_and_run(&shared, &model, &[1.0f32], RealSubmitMode::NpuExec)
+            .expect_err("npu_exec without device must refuse");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("RealSubmitNotReady")
+                || msg.contains("not ready")
+                || msg.contains("device")
+                || msg.contains("EXEC_CMD")
+                || msg.contains("gated"),
+            "expected npu_exec refuse, got: {msg}"
+        );
+
+        // On hosts with a live open device: pin modes so shell XDNA2_REAL_SUBMIT_MODE
+        // (e.g. host_ref) cannot turn this branch into Ok (Identity is host_ref-allowlisted).
+        if backend.real_device_open() {
+            let err_fc = backend
+                .submit_and_run_with_mode(&model, &[1.0f32], RealSubmitMode::FailClosed)
+                .expect_err("FailClosed must error even when device open");
+            let m_fc = format!("{err_fc:?}");
+            assert!(
+                m_fc.contains("RealSubmitNotReady") || m_fc.contains("not ready"),
+                "got: {m_fc}"
+            );
+            // Gates closed in this test: NpuExec must also refuse (not Ok / not host_ref).
+            let err_ne = backend
+                .submit_and_run_with_mode(&model, &[1.0f32], RealSubmitMode::NpuExec)
+                .expect_err("NpuExec must refuse when EXEC_CMD gated");
+            let m_ne = format!("{err_ne:?}");
+            assert!(
+                m_ne.contains("RealSubmitNotReady")
+                    || m_ne.contains("not ready")
+                    || m_ne.contains("gated")
+                    || m_ne.contains("EXEC"),
+                "got: {m_ne}"
+            );
+        }
     }
 
     #[test]
@@ -1582,17 +2256,73 @@ mod tests {
     #[test]
     fn submit_and_run_on_real_stub_via_compiled_model_returns_clear_error() {
         let backend = AmdXdna2Backend::new_with_real_stub();
-        // Even if compile "succeeds" in future real wiring, today the Real arm
-        // errors early. Accept both open and not-open honest messages so CI
-        // and wedged-driver hosts stay green without requiring /dev/accel.
-        let compile_res = backend.compile_model("real_model.onnx", 2, "bf16");
-        assert!(compile_res.is_err());
-        let err_msg = format!("{:?}", compile_res.unwrap_err());
+        // Phase 4: compile succeeds; use pinned FailClosed (not env-dependent CompiledModel path).
+        let model = backend
+            .compile_model("real_model.onnx", 2, "bf16")
+            .expect("Real arm compile must succeed");
+        let err = backend
+            .submit_and_run_with_mode(&model, &[0.1f32; 8], RealSubmitMode::FailClosed)
+            .expect_err("FailClosed Real submit must error");
+        let err_msg = format!("{err:?}");
         assert!(
-            err_msg.contains("real XDNA2 compilation/submission not yet wired")
-                || err_msg.contains("real XDNA2 device not available for compilation"),
-            "expected Real-arm compile error, got: {err_msg}"
+            err_msg.contains("RealSubmitNotReady") || err_msg.contains("not ready"),
+            "expected actionable Real submit error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn host_ref_rejects_matmul_without_fake_golden() {
+        // Phase 5: MatMul is allowlisted but must refuse without weights (no fake golden).
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_phase4_host_ref_matmul.json");
+        std::fs::write(&path, r#"{"ops":["MatMul"]}"#).expect("write");
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        let model = backend
+            .compile_model(path.to_str().unwrap(), 0, "fp32")
+            .expect("compile");
+        let _ = std::fs::remove_file(&path);
+        let err = backend
+            .submit_and_run_with_mode(&model, &[1.0f32; 4], RealSubmitMode::HostRef)
+            .expect_err("MatMul must not Ok on host_ref without weights");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("initializer")
+                || msg.contains("weight")
+                || msg.contains("Runtime")
+                || msg.contains("UnsupportedOps")
+                || msg.contains("matmul")
+                || msg.contains("MatMul"),
+            "got {msg}"
+        );
+    }
+
+    #[test]
+    fn host_ref_matmul_with_weights_known_numbers() {
+        let mut path = std::env::temp_dir();
+        path.push("dragon_npu_phase5_host_ref_matmul_ok.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "ops": ["MatMul", "Relu"],
+              "initializers": [
+                {"name": "W", "shape": [2, 2], "data": [1.0, 0.0, 0.0, 1.0]}
+              ]
+            }"#,
+        )
+        .expect("write");
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        let model = backend
+            .compile_model(path.to_str().unwrap(), 0, "fp32")
+            .expect("compile");
+        let _ = std::fs::remove_file(&path);
+        // Identity weight: input [[-1, 2]] -> MatMul same -> Relu [0, 2]
+        let out = backend
+            .submit_and_run_with_mode(&model, &[-1.0, 2.0], RealSubmitMode::HostRef)
+            .expect("host_ref MatMul+Relu with weights");
+        assert_eq!(out, vec![0.0, 2.0]);
+        let plan = build_weight_bo_plan(&model);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].nbytes, 16);
     }
 
     #[test]

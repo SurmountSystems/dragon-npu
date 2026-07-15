@@ -2,16 +2,67 @@
 name = "dragon-npu"
 version = "0.1.0"
 edition = "2024"
+# Edition 2024 needs ≥1.85; this crate also uses 1.87 APIs (`is_multiple_of`, `cast_unsigned`).
+# Lab/CI toolchains are newer; pin MSRV to the real language floor, not edition-only.
+rust-version = "1.87"
 authors = ["Dragonfire Project <contact@dragonfire.ai>"]
-description = "Production-quality Rust library for vendor-agnostic NPU acceleration on Linux (AMD XDNA, Intel VPU, Qualcomm Hexagon, simulation). Library-first rewrite with strict error handling."
+description = "Production-quality Rust library for vendor-agnostic NPU acceleration on Linux (AMD XDNA2 primary, simulation default; Intel/Hexagon honest stubs). Library-first rewrite with strict error handling."
 license = "MIT"
 repository = "https://github.com/dragonfire/dragon-npu"
 keywords = ["npu", "ai", "acceleration", "linux", "inference"]
 categories = ["science", "hardware-support"]
 readme = "README.md"
+# Keep crates.io tarball focused on the Rust crate + docs/patches story.
+# Exclude Python reference trees, kmod build debris, host evidence, and large binaries.
+# Docs needed for crate docs (README, docs/*.md, LICENSE) stay via default include.
+exclude = [
+    # Kernel build / OOT stage / rescue kmod (sources optional; debris never for crates.io)
+    "kernel/out/",
+    "kernel/dkms/staging/",
+    "kernel/amdxdna_rescue/",
+    # Host-local evidence snapshots
+    "docs/upstream/evidence/",
+    # Python reference implementation + scripts (not the Rust product)
+    "dragon_npu/",
+    "optimizations/",
+    "benchmarks/",
+    "setup.py",
+    "requirements.txt",
+    "pyproject.toml",
+    "MANIFEST.in",
+    "scripts/setup_npu.py",
+    "examples/*.py",
+    "tests/*.py",
+    # Build artifacts / cargo target
+    "target/",
+    "**/*.ko",
+    "**/*.o",
+    "**/*.mod",
+    "**/*.cmd",
+    "**/Module.symvers",
+    "**/modules.order",
+    # Lab instruction / txn staging (never ship blobs)
+    "testdata/xdna2_cmd/",
+    "testdata/**/*.bin",
+    "testdata/**/*.elf",
+]
 
 [lib]
 name = "dragon_npu"
+
+[[bin]]
+name = "dragon-npu"
+path = "src/bin/dragon_npu.rs"
+doc = false
+
+[[bench]]
+name = "sim_compile_run"
+harness = false
+
+[[bench]]
+name = "xdna2_direct"
+harness = false
+required-features = ["amd-xdna2"]
 
 [dependencies]
 thiserror = "2.0.18"
@@ -45,8 +96,13 @@ amd-xdna2 = ["dep:libc"]   # AMD XDNA2 (Ryzen AI 300 / Strix Point & later) supp
 # Even with this feature, runtime still requires XDNA2_ALLOW_EXEC_CMD=1.
 # See docs/XDNA2_NEVER_AGAIN.md (L1 userspace permanent gate).
 xdna2-dangerous-exec-cmd = []
-intel-vpu = []           # Intel VPU (Meteor Lake+) support
-qualcomm-hexagon = []    # Qualcomm Hexagon (Snapdragon X) support
+# Secondary vendors: honest stubs only (available=false, run refuses). Not default.
+# Not selected by DragonNpu::new. See docs/SECONDARY_BACKENDS.md.
+intel-vpu = []           # Intel VPU (Meteor Lake+) — stub until XDNA2 MVP green
+qualcomm-hexagon = []    # Qualcomm Hexagon (Snapdragon X) — stub; weakest Linux story
+# Research-only XRT notes/capture comparison. NEVER default, NEVER enabled by amd-xdna2.
+# No libxrt link, no EXEC_CMD, no production hot path. See docs/SECONDARY_BACKENDS.md.
+xrt-bridge = []
 
 [lints.rust]
 unsafe_code = "deny"   # relaxed to "deny" only to allow a narrow, well-scoped unsafe ioctl module under the amd-xdna2 feature for the lightweight direct driver. All other code remains strictly safe.

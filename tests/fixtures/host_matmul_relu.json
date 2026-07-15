@@ -1,0 +1,10 @@
+{
+  "ops": ["MatMul", "Relu"],
+  "initializers": [
+    {
+      "name": "W",
+      "shape": [2, 2],
+      "data": [1.0, 0.0, 0.0, 1.0]
+    }
+  ]
+}

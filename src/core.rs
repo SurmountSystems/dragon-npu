@@ -28,7 +28,14 @@ impl DragonNpu {
     /// Create a new DragonNPU instance.
     ///
     /// Detects available NPUs and selects the best backend.
-    /// Prefers the XDNA2 backend (real detection or realistic simulation) when the amd-xdna2 feature is enabled; otherwise falls back to high-fidelity simulation.
+    /// Prefers the XDNA2 backend (real detection or realistic simulation) when the
+    /// `amd-xdna2` feature is enabled; otherwise falls back to high-fidelity simulation.
+    ///
+    /// **Not selected here (even when features are enabled):**
+    /// - `intel-vpu` / `qualcomm-hexagon` honest stubs — construct
+    ///   `IntelVpuBackend` / `QualcommHexagonBackend` explicitly if needed
+    ///   (`docs/SECONDARY_BACKENDS.md`).
+    /// - `xrt-bridge` research stub — never a production default.
     ///
     /// # Errors
     ///
@@ -46,6 +53,7 @@ impl DragonNpu {
         }
 
         // Default path (no amd-xdna2 feature): high-fidelity simulation.
+        // intel-vpu / qualcomm-hexagon / xrt-bridge are opt-in types only.
         // Reference: dragon_npu/dragon_npu_core.py
         Ok(Self {
             backend: Arc::new(SimulationBackend::new()),
@@ -159,6 +167,11 @@ pub struct CompiledModel {
     /// Actual extracted initializer tensors (float32 data + shape + name) from real ONNX.
     /// Populated only when loading real .onnx protobuf files that contain initializers.
     pub(crate) initializers: Vec<crate::compiler::Initializer>,
+    /// Operator type names from the parsed/optimized graph (ONNX op_type or heuristic ops).
+    /// Used by the Real XDNA2 arm for allowlist / unsupported-op checks (Phase 4).
+    pub(crate) ops: Vec<String>,
+    /// Per-node attributes (Gemm alpha/beta/trans*, …). Phase 7 — used by host_ref Gemm.
+    pub(crate) node_attrs: Vec<crate::ir::NodeAttrs>,
 }
 
 impl CompiledModel {
@@ -189,6 +202,8 @@ impl CompiledModel {
         layouts: Vec<Option<String>>,
         initializer_count: usize,
         initializers: Vec<crate::compiler::Initializer>,
+        ops: Vec<String>,
+        node_attrs: Vec<crate::ir::NodeAttrs>,
     ) -> Self {
         Self {
             model_path,
@@ -212,6 +227,8 @@ impl CompiledModel {
             layouts,
             initializer_count,
             initializers,
+            ops,
+            node_attrs,
         }
     }
 }
@@ -386,6 +403,23 @@ impl CompiledModel {
     /// Returns the optimization level used during compilation.
     pub fn optimization_level(&self) -> u8 {
         self.optimization_level
+    }
+
+    /// Returns the operator type names from the parsed/optimized graph.
+    ///
+    /// Values are ONNX `op_type` strings when loaded from real protobuf / richer JSON,
+    /// or heuristic names (`conv`, `fused_conv_relu`, …) for path-based fallbacks.
+    /// Used by the Real XDNA2 arm for Phase 4 op-allowlist checks.
+    pub fn ops(&self) -> &[String] {
+        &self.ops
+    }
+
+    /// Per-node attributes (Gemm `alpha`/`beta`/`transA`/`transB`, Conv pads, …).
+    ///
+    /// Populated from ONNX/JSON load + IR roundtrip. Host Gemm uses these for
+    /// ONNX semantics (Issue 4). Empty when the loader did not supply attrs.
+    pub fn node_attrs(&self) -> &[crate::ir::NodeAttrs] {
+        &self.node_attrs
     }
 }
 
