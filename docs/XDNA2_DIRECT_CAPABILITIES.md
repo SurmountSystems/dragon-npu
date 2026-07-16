@@ -88,6 +88,19 @@ With **hwctx create/destroy working**, the remaining blocker for real compute is
 | `XDNA2_HOST_REF=1` | Force host f32 golden matmul baseline in `TimedOpResult.host_ref_*` (also auto for small f32 shapes) |
 | `XDNA2_REAL_SUBMIT_MODE` | Phase 4–5 Real `submit_and_run`: unset = fail-closed `RealSubmitNotReady`; `host_ref` / `host_validate` = Phase 5 host f32 graph (Identity/Relu/Add/Mul/MatMul/Gemm when weights allow; not NPU); `npu_exec` = gated EXEC attempt via `timed_matmul_direct` (still not numerical Pass) |
 | `XDNA2_HOST_MATMUL_K` | Optional: pin MatMul `K` when weight shape missing (Phase 5 host graph only) |
+| `XDNA2_LAB_PACK` | Lab I/O pack when **`XDNA2_LAB_OFM=1`**: unset/`f32_ones` or `mladf_a16w4`. Unknown values fail-closed. See `AMD_MLADF_MATMUL_PACK.md` |
+| `XDNA2_LAB_WTS_PACKED` | Path to pre-packed WTS for mladf (exact meta length, e.g. 174080; read capped 64 MiB). Prefer `tools/export_mladf_wts.sh` → `wts.bin` (vendor `export_const_params`); also pack `--wts-from` / capture |
+| `XDNA2_LAB_CTRL_PACKED` | Path to control packet bin (e.g. 29664 B staged `lab_ctrl.bin`); fourth START_NPU kernel-arg BO. Prefer stage dump + `tools/validate_mladf_ctrl.sh` |
+| `XDNA2_LAB_REQUIRE_CTRL` | `1`/`true`: refuse mladf fill when plan has `ctrl_bytes` but ctrl missing/empty/all-zero (fill API + pack mode); pack mode also refuses unset path. Default off for unit tests |
+| `XDNA2_LAB_CTRL_AUTO_PATCH` | `1`/`true`: opt-in lab — apply meta IFM/WTS/OFM paddrs into ctrl (u64 LE overwrite residual) before attach; needs `XDNA2_LAB_MLADF_META`. Default off until size=6 `read_add_write` proven |
+| `XDNA2_LAB_REQUIRE_NONZERO_WTS` | `1`/`true`: refuse all-zero WTS at BO fill; pack mode also refuses unset `XDNA2_LAB_WTS_PACKED` (Pass readiness). **Wins over** `ALLOW_ZERO_WTS` when both set |
+| `XDNA2_LAB_ALLOW_ZERO_WTS` | `1`/`true`: allow zero WTS for plumbing only when **REQUIRE is unset** (not Pass). Does **not** override REQUIRE |
+| `XDNA2_LAB_OFM_GOLDEN` | OFM golden for pack-mode decide: f32 LE `m*n*4` or bf16 LE `m*n*2`. **Required** for mladf; **all-zero refused** by default. Offline: `tools/validate_mladf_ofm_golden.sh` |
+| `XDNA2_LAB_ALLOW_ZERO_GOLDEN` | `1`/`true` bypasses **offline resolve/load** only (shell validator exits 3, not 0). Product `decide_ran_on_npu` **always** refuses all-zero golden (`AllZeroGolden`). Never greened by `--require-pass-assets` |
+| `XDNA2_LAB_MLADF_KEY` / `XDNA2_LAB_MLADF_META` | mladf instr key / ctrl_meta JSON for BO sizes (meta sizes capped 64 MiB) |
+| `XDNA2_PACK_WTS_FROM` | **pack_mladf_ref / stage tools only** (same as `--wts-from`); not read by Rust lab path |
+| `DD_ROOT` / `AIEBU_LIB` | **export_mladf_wts.sh only** — Ryzen AI DynamicDispatch root + libaiebu path |
+| `SILICON_LAB_DIR` | **scripts only** — default `testdata/xdna2_cmd/silicon_lab` for `silicon_lab_preflight` / `lab_exec_once --silicon-mladf` |
 
 ### Phase 6 APIs (efficiency / observability — not GEMM tops)
 
@@ -124,20 +137,22 @@ All of:
 | `max_abs_diff_f32` / `verify_f32_allclose` | **Implemented** (pure; unit-tested) |
 | `host_matmul_f32_ones_vec` | **Implemented** (full golden vector) |
 | `NumericalVerifyCriteria` / `NumericalVerifyInput` | **Implemented** |
-| `decide_ran_on_npu` | **Implemented** — true **only** if non-empty buffers ∧ `submit_wait_ok` ∧ `had_instruction_blob` ∧ `real_ioctl_path` ∧ allclose |
+| `decide_ran_on_npu` / `silicon_ran_on_npu_flags_ok` | **Implemented** — true **only** if non-empty buffers ∧ `submit_wait_ok` ∧ `had_instruction_blob` ∧ `real_ioctl_path` ∧ allclose (+ OFM readback for outer flags) |
 | Default tolerances | `DEFAULT_VERIFY_ATOL=1e-4`, `DEFAULT_VERIFY_RTOL=1e-3` (`NumericalVerifyCriteria::default`) |
 | Lab packing (`lab_io`, kernel args `prop_count=0`) | **Implemented** + unit tests |
 | Wire into `timed_matmul_direct` → set `ran_on_npu` | **Lab-only:** `XDNA2_LAB_OFM=1` + OFM readback + decide; **default still hard-false** |
 | Status when decide true | `ok_npu_verified` (never from envelope alone) |
-| `scripts/lab_exec_once.sh` | **Implemented** — default dry-run; apply needs risk+blob |
-| Known-good txn blob on host/CI | **Blocked** — capture HITL; see [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) |
+| Zero OFM golden (mladf) | **Refused** unless `XDNA2_LAB_ALLOW_ZERO_GOLDEN=1` (not product Pass) |
+| `tools/silicon_lab_preflight.sh` | **Implemented** — offline asset gate; `--require-pass-assets` fail-closed; no L3/EXEC |
+| `scripts/lab_exec_once.sh` | **Implemented** — default dry-run; `--silicon-mladf` recipe; apply needs risk+blob |
+| Known-good txn blob + non-zero golden on host | **Blocked** — capture HITL; see [`SILICON_PATH_LAB.md`](./SILICON_PATH_LAB.md) Phase C |
 
 **Still no product Pass without a known-good blob + real non-empty device OFM compare.**
 Empty golden/candidate → `decide_ran_on_npu` **false**. Envelope or
 `ok_submit_wait_with_inst_blob` alone keeps **`ran_on_npu=false`**.
-Host has no passwordless sudo / no known-good blob → live L3 apply may exit 3.
+Dry-run green ≠ `ran_on_npu`. Host has no passwordless sudo / no golden → live L3 apply may exit 3/4.
 
-Cross-links: [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) · [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) · [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md) · [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md).
+Cross-links: [`SILICON_PATH_LAB.md`](./SILICON_PATH_LAB.md) · [`XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) · [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) · [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md) · [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md).
 
 ## Host install status (lab)
 

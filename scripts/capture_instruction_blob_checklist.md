@@ -77,6 +77,30 @@ cp /tmp/known_good_instr.bin testdata/xdna2_cmd/lab_instr.bin
 
 ---
 
+## Pathway A2 — OFM golden capture (for `ran_on_npu` Pass)
+
+After a **known-good** vendor ORT / Vitis EP / XRT run of the **same** staged
+mladf key + AMD-packed WTS:
+
+1. Dump the OFM buffer (staged: **512** bytes bf16 for M=1,N=256).  
+2. Stage gitignored: `testdata/xdna2_cmd/silicon_lab/ofm_golden.bin` (or any path).  
+3. Offline validate (refuses zeros / wrong size):
+
+```bash
+bash tools/validate_mladf_ofm_golden.sh testdata/xdna2_cmd/silicon_lab/ofm_golden.bin
+export XDNA2_LAB_OFM_GOLDEN=$PWD/testdata/xdna2_cmd/silicon_lab/ofm_golden.bin
+bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
+```
+
+4. **Do not** use `pack_mladf_ref` `ofm_expected.bin` (zeros) as Pass golden.  
+5. Host f32 ones×ones is **invalid** for a16w4 — pack mode refuses it.  
+6. Record provenance (WTS hash, key, tool version). Capture alone ≠ Pass until
+   gated EXEC+allclose.
+
+See `docs/SILICON_PATH_LAB.md` Phase C.
+
+---
+
 ## Pathway B — feed dragon-npu **without** claiming Pass
 
 ```bash

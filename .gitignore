@@ -136,3 +136,24 @@ kernel/amdxdna_rescue/.*.o
 .env.*
 
 target/
+
+# Lab: AMD DD txn dumps + fat dump tool binary (not for public commit)
+tools/dump_dd_txn
+target/dump_dd_txn
+testdata/xdna2_cmd/dd_matmul_txn/
+
+# Lab: pack_mladf_ref host buffers (ifm/wts/ofm binaries; keep PROVENANCE trackable)
+tools/pack_mladf_ref
+target/pack_mladf_ref
+testdata/xdna2_cmd/mladf_ref/**
+!testdata/xdna2_cmd/mladf_ref/
+!testdata/xdna2_cmd/mladf_ref/PROVENANCE.md
+!testdata/xdna2_cmd/mladf_ref/**/PROVENANCE.md
+testdata/xdna2_cmd/silicon_lab/**
+# Lab: AMD export_mladf_wts output (EULA-derived packed blobs; never commit)
+tools/export_mladf_wts
+target/export_mladf_wts
+testdata/xdna2_cmd/mladf_wts_export/**
+!testdata/xdna2_cmd/mladf_wts_export/
+!testdata/xdna2_cmd/mladf_wts_export/PROVENANCE.md
+!testdata/xdna2_cmd/mladf_wts_export/**/PROVENANCE.md

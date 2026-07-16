@@ -3290,7 +3290,37 @@ pub fn load_instruction_blob_from_path(path: &str) -> Result<Vec<u8>, DirectErro
             bytes.len()
         )));
     }
-    Ok(bytes)
+    // Prefer `.ctrltext` from aiebu ELF32; otherwise keep raw bytes (txn or unknown).
+    let payload = crate::backends::amd_xdna2::txn::instruction_payload_bytes(&bytes)?;
+    // Optional strict txn gate (lab): XDNA2_INSTRUCTION_REQUIRE_TXN=1
+    if instruction_require_txn_env() {
+        let kind = crate::backends::amd_xdna2::txn::validate_txn_blob(&payload).map_err(|e| {
+            DirectError::InvalidArgument(format!(
+                "XDNA2_INSTRUCTION_REQUIRE_TXN=1 but blob is not a valid XAie txn ({path}): {e}"
+            ))
+        })?;
+        let _ = kind; // classification available for future logging
+    }
+    if (payload.len() as u64) > MAX_INSTRUCTION_BLOB_BYTES {
+        return Err(DirectError::InvalidArgument(format!(
+            "instruction payload size {} > max {MAX_INSTRUCTION_BLOB_BYTES}: {path}",
+            payload.len()
+        )));
+    }
+    Ok(payload)
+}
+
+/// When `XDNA2_INSTRUCTION_REQUIRE_TXN` is `1`/`true`/`yes`/`on`, refuse loads that
+/// are not a size-consistent XAie txn (or ELF `.ctrltext` that is).
+#[must_use]
+pub fn instruction_require_txn_env() -> bool {
+    std::env::var("XDNA2_INSTRUCTION_REQUIRE_TXN").is_ok_and(|v| {
+        let t = v.trim();
+        t == "1"
+            || t.eq_ignore_ascii_case("true")
+            || t.eq_ignore_ascii_case("yes")
+            || t.eq_ignore_ascii_case("on")
+    })
 }
 
 /// Load optional instruction blob from env (no proprietary data hardcoded).
@@ -3497,7 +3527,8 @@ pub fn destroy_hwctx_and_owned_bos(submission: &dyn DirectSubmission, ctx: &Hard
 ///    - `ok_submit_wait_envelope` — accept+wait, no instruction blob
 ///    - `ok_submit_wait_with_inst_blob` — accept+wait with non-zero inst addr
 ///    - **`ran_on_npu=false`** unless `XDNA2_LAB_OFM=1` + OFM readback +
-///      [`super::lab_io::lab_decide_from_ofm_bytes`] (all decide criteria)
+///      [`super::lab_io::lab_decide_from_ofm_bytes_pack_mode`] (f32 ones or
+///      mladf bf16 + golden; never all-zero mladf golden by default)
 ///    - `ok_npu_verified` only when lab OFM decide returns true
 /// 3. If L1 closed: `hwctx_ok`, no EXEC_CMD.
 /// 4. Optional host golden matmul (`host_ref_*`) when blocked / for baseline.
@@ -3554,6 +3585,10 @@ pub fn timed_matmul_direct(
 
     // CRITICAL SAFETY: see exec_cmd_is_enabled() / docs/XDNA2_NEVER_AGAIN.md.
     let try_submit = exec_cmd_is_enabled();
+
+    // Populated when LAB_OFM uses mladf plan (report plan M/N/K on TimedOpResult).
+    let mut report_dims: Option<(u32, u32, u32)> = None;
+    let mut used_mladf_pack = false;
 
     let (status, detail, ran_on_npu) = if try_submit {
         let fill0 = Instant::now();
@@ -3677,10 +3712,15 @@ pub fn timed_matmul_direct(
         // PARTIAL_ELF kernel args with prop_count=0. Default off → empty args,
         // hard-false ran_on_npu (historical path).
         //
+        // Pack mode (`XDNA2_LAB_PACK`, default f32_ones): when LAB_WEIGHT is off,
+        // uses [`super::lab_io::create_and_fill_lab_io_bos_for_pack_mode`] so
+        // `mladf_a16w4` gets bf16 IFM + sized WTS (not f32 ones). Default f32_ones
+        // path is unchanged.
+        //
         // Optional model WTS (`XDNA2_LAB_WEIGHT=1` + `XDNA2_LAB_WEIGHT_MODEL`):
         // requires LAB_OFM; fail-closed if model/select/dims fail. Golden uses
-        // ones IFM × model WTS (not ones×ones). Caller must still have known-good
-        // txn for product ran_on_npu.
+        // ones IFM × model WTS (not ones×ones). LAB_WEIGHT overrides LAB_PACK.
+        // Caller must still have known-good txn for product ran_on_npu.
         //
         // Always pin instruction BO in EXEC arg list when present (XRT also
         // binds ctrl BO), whether or not LAB_OFM I/O BOs exist.
@@ -3688,15 +3728,20 @@ pub fn timed_matmul_direct(
         // on every exit path below.
         let lab_ofm = super::lab_io::lab_ofm_env_enabled();
         let lab_weight = super::lab_io::lab_weight_env_enabled();
+        // Fail-closed on unknown XDNA2_LAB_PACK (typos must not silently become ones).
+        let pack_mode_res = super::mladf_pack::LabPackMode::try_from_env();
         let mut io_set: Option<super::lab_io::IoBoSet> = None;
         // When set, OFM decide uses model WTS golden (ones IFM × model WTS).
         // WeightExecBind is not RAII — BO ownership lives in `io_set` only.
         let mut ofm_host_golden: Option<Vec<f32>> = None;
+        // Effective pack mode for OFM decode/decide (LAB_WEIGHT forces f32 path).
+        let mut decide_pack_mode = super::mladf_pack::LabPackMode::F32Ones;
         let mut kernel_args: Vec<u32> = Vec::new();
         let mut arg_bo_handles = super::lab_io::build_lab_arg_bo_handles(None, inst_handle);
         let mut ofm_note = String::new();
         if lab_ofm {
             let setup: Result<super::lab_io::IoBoSet, String> = if lab_weight {
+                decide_pack_mode = super::mladf_pack::LabPackMode::F32Ones;
                 match super::host_graph::create_lab_weight_io_from_env(submission, m, n, k, dtype) {
                     Ok((bind, golden)) => {
                         ofm_note = format!(
@@ -3710,30 +3755,66 @@ pub fn timed_matmul_direct(
                     Err(e) => Err(format!("XDNA2_LAB_WEIGHT setup failed: {e}")),
                 }
             } else {
-                super::lab_io::create_and_fill_ones_io_bos(submission, m, n, k, dtype)
-                    .map_err(|e| format!("ones IFM/WTS/OFM: {e}"))
+                match pack_mode_res {
+                    Err(e) => Err(format!("XDNA2_LAB_PACK: {e}")),
+                    Ok(pack_mode) => {
+                        decide_pack_mode = pack_mode;
+                        match super::lab_io::create_and_fill_lab_io_bos_for_pack_mode(
+                            submission, pack_mode, m, n, k, dtype,
+                            /*require_dims_match=*/ false,
+                        ) {
+                            Ok((ios, mladf_plan)) => {
+                                if let Some(ref p) = mladf_plan {
+                                    report_dims = Some((p.shape.m, p.shape.n, p.shape.k));
+                                    used_mladf_pack = true;
+                                    ofm_note = format!(
+                                        "lab_ofm pack=mladf_a16w4 key={:?} ifm={} wts={} ofm={} \
+                                         (report dims M,N,K={},{},{}; caller timed m,n,k={m},{n},{k})",
+                                        p.key,
+                                        p.ifm_bytes,
+                                        p.wts_bytes,
+                                        p.ofm_bytes,
+                                        p.shape.m,
+                                        p.shape.n,
+                                        p.shape.k
+                                    );
+                                } else {
+                                    ofm_note = format!(
+                                        "lab_ofm pack=f32_ones m={m} n={n} k={k} ofm_bytes={}",
+                                        ios.ofm_bytes
+                                    );
+                                }
+                                Ok(ios)
+                            }
+                            Err(e) => Err(format!("lab pack_mode={pack_mode:?} IFM/WTS/OFM: {e}")),
+                        }
+                    }
+                }
             };
             match setup {
                 Ok(ios) => {
-                    kernel_args = super::lab_io::pack_start_npu_kernel_args(
-                        ios.ifm_addr,
-                        ios.wts_addr,
-                        ios.ofm_addr,
-                    );
-                    // IFM/WTS/OFM first, then instruction (if any) for pin list.
-                    arg_bo_handles = super::lab_io::build_lab_arg_bo_handles(
+                    // IFM/WTS/OFM + optional CTRL paddr (count 3 or 4).
+                    kernel_args = ios.pack_kernel_args();
+                    // Pin list: IFM/WTS/OFM, optional CTRL, then instruction.
+                    arg_bo_handles = super::lab_io::build_lab_arg_bo_handles_ex(
                         Some((ios.ifm.0, ios.wts.0, ios.ofm.0)),
+                        ios.ctrl.map(|c| c.0),
                         inst_handle,
                     );
+                    let ctrl_note = if ios.ctrl.is_some() {
+                        format!(" ctrl_bytes={}", ios.ctrl_bytes)
+                    } else {
+                        String::new()
+                    };
                     if ofm_note.is_empty() {
                         ofm_note = format!(
-                            "lab_ofm IFM/WTS/OFM bound (prop_count=0 kernel_args={} ofm_bytes={})",
+                            "lab_ofm IFM/WTS/OFM bound (prop_count=0 kernel_args={} ofm_bytes={}{ctrl_note})",
                             kernel_args.len(),
                             ios.ofm_bytes
                         );
                     } else {
                         ofm_note = format!(
-                            "{ofm_note}; kernel_args={} ofm_bytes={}",
+                            "{ofm_note}; kernel_args={} ofm_bytes={}{ctrl_note}",
                             kernel_args.len(),
                             ios.ofm_bytes
                         );
@@ -3872,10 +3953,11 @@ pub fn timed_matmul_direct(
                                     match super::lab_io::readback_ofm(submission, ios) {
                                         Ok(ofm_bytes) => {
                                             ofm_readback_ok = true;
+                                            let (dm, dn, dk) = report_dims.unwrap_or((m, n, k));
                                             let plan = super::lab_io::LabOfmVerifyPlan {
-                                                m,
-                                                n,
-                                                k,
+                                                m: dm,
+                                                n: dn,
+                                                k: dk,
                                                 used_inst_blob,
                                                 submit_wait_ok: true,
                                                 real_ioctl,
@@ -3884,27 +3966,51 @@ pub fn timed_matmul_direct(
                                                     super::numerical::NumericalVerifyCriteria::default(
                                                     ),
                                             };
-                                            let decide = ofm_host_golden.as_ref().map_or_else(
-                                                || super::lab_io::lab_decide_from_ofm_bytes(&plan),
-                                                |g| {
-                                                    super::lab_io::lab_decide_from_ofm_bytes_with_golden(
-                                                        &plan, g,
-                                                    )
-                                                },
-                                            );
+                                            // Pack-mode decide: f32 ones path, or bf16 +
+                                            // XDNA2_LAB_OFM_GOLDEN / model golden for mladf.
+                                            // Never use f32 ones×ones as a16w4 golden.
+                                            let decide =
+                                                super::lab_io::lab_decide_from_ofm_bytes_pack_mode(
+                                                    decide_pack_mode,
+                                                    &plan,
+                                                    ofm_host_golden.as_deref(),
+                                                );
                                             match decide {
                                                 Ok((true, _)) => {
-                                                    ran = true;
-                                                    detail = format!(
-                                                        "EXEC_CMD+WAIT seq={} + OFM numerical verify \
-                                                         PASS (lab_ofm{}); {blob_note}; {ofm_note}",
-                                                        r.seq,
-                                                        if ofm_host_golden.is_some() {
-                                                            "+model_wts"
-                                                        } else {
-                                                            ""
-                                                        }
+                                                    // Outer product AND (docs/tests mirror); refuse
+                                                    // if any honesty flag is missing.
+                                                    ran = super::numerical::silicon_ran_on_npu_flags_ok(
+                                                        real_ioctl,
+                                                        true, // submit_wait_ok
+                                                        used_inst_blob,
+                                                        true, // ofm_readback_ok
+                                                        true, // decide pass
                                                     );
+                                                    if ran {
+                                                        detail = format!(
+                                                            "EXEC_CMD+WAIT seq={} + OFM numerical verify \
+                                                             PASS (lab_ofm{}); {blob_note}; {ofm_note}",
+                                                            r.seq,
+                                                            if ofm_host_golden.is_some() {
+                                                                "+model_wts"
+                                                            } else if matches!(
+                                                                decide_pack_mode,
+                                                                super::mladf_pack::LabPackMode::MladfA16W4
+                                                            ) {
+                                                                "+mladf_a16w4"
+                                                            } else {
+                                                                ""
+                                                            }
+                                                        );
+                                                    } else {
+                                                        detail = format!(
+                                                            "EXEC_CMD+WAIT seq={} decide true but \
+                                                             silicon_ran_on_npu_flags_ok refused \
+                                                             (real_ioctl={real_ioctl} blob={used_inst_blob}); \
+                                                             {blob_note}; {ofm_note}; ran_on_npu=false",
+                                                            r.seq
+                                                        );
+                                                    }
                                                 }
                                                 Ok((false, reason)) => {
                                                     detail = format!(
@@ -3913,11 +4019,9 @@ pub fn timed_matmul_direct(
                                                          ran_on_npu=false",
                                                         r.seq
                                                     );
-                                                    if reason
-                                                        == Some(
-                                                            super::numerical::RanOnNpuBlockReason::AllcloseFailed,
-                                                        )
-                                                    {
+                                                    if super::lab_io::ran_on_npu_reason_is_ofm_verify_fail(
+                                                        reason,
+                                                    ) {
                                                         ofm_allclose_failed = true;
                                                     }
                                                 }
@@ -3942,6 +4046,14 @@ pub fn timed_matmul_direct(
                                     detail = format!("{detail} {ofm_note}");
                                 }
                             }
+                            // Final product AND (never Pass without readback + flags).
+                            ran = super::numerical::silicon_ran_on_npu_flags_ok(
+                                real_ioctl,
+                                true,
+                                used_inst_blob,
+                                ofm_readback_ok,
+                                ran,
+                            );
                             let st = super::lab_io::classify_lab_matmul_status(
                                 lab_ofm,
                                 io_set.is_some() || !lab_ofm,
@@ -4013,20 +4125,38 @@ pub fn timed_matmul_direct(
 
     destroy_hwctx_and_owned_bos(submission, &ctx);
 
-    let mut result = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+    // Prefer mladf plan dims when LAB_PACK filled staged kernel (not probe 1×1×1).
+    let (rm, rn, rk) = report_dims.unwrap_or((m, n, k));
+    // Report a16 pack label when mladf BO path ran (probe dtype is often "f32").
+    let report_dtype = if used_mladf_pack {
+        "mladf_a16w4"
+    } else {
+        dtype
+    };
+    let mut result = timed_op_base("matmul", rm, rn, rk, report_dtype, real_ioctl, None);
     result.total_s = t0.elapsed().as_secs_f64();
     result.host_prep_s = host_prep_s;
     result.hwctx_s = hwctx_s;
     result.fill_s = fill_s;
     result.submit_wait_s = submit_wait_s;
     result.device_s = submit_wait_s;
-    // Phase 3.5: ran_on_npu true **only** via lab OFM readback + decide_ran_on_npu.
+    // Phase 3.5: ran_on_npu true **only** via lab OFM readback + pack-mode decide.
     // Envelope / inst-blob submit alone never sets true (default path hard-false).
     result.ran_on_npu = ran_on_npu;
     result.ran_on_device_path = false;
     result.status = status;
     result.detail = detail;
-    attach_host_ref(&mut result, m, n, k, dtype);
+    if used_mladf_pack {
+        // f32 ones×ones host_ref is invalid for a16w4; do not auto-run large ones GEMM.
+        result.host_ref_ok = false;
+        result.host_ref_s = None;
+        result.host_ref_detail = format!(
+            "host_ref skipped (mladf_a16w4 plan M,N,K={rm},{rn},{rk}: f32 ones golden invalid; \
+             use XDNA2_LAB_OFM_GOLDEN for numerical verify)"
+        );
+    } else {
+        attach_host_ref(&mut result, rm, rn, rk, dtype);
+    }
     result
 }
 
@@ -5801,6 +5931,68 @@ mod tests {
                     "expected host_ref attempt: {}",
                     r.host_ref_detail
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn timed_matmul_lab_ofm_mladf_never_pass_on_stub() {
+        // LAB_OFM + mladf must never claim ran_on_npu without non-zero golden + real path.
+        let prev_ofm = std::env::var_os("XDNA2_LAB_OFM");
+        let prev_pack = std::env::var_os("XDNA2_LAB_PACK");
+        let prev_gold = std::env::var_os("XDNA2_LAB_OFM_GOLDEN");
+        let prev_zero = std::env::var_os("XDNA2_LAB_ALLOW_ZERO_GOLDEN");
+        // SAFETY: test-only env for lab pack path; restore below.
+        unsafe {
+            std::env::set_var("XDNA2_LAB_OFM", "1");
+            std::env::set_var("XDNA2_LAB_PACK", "mladf_a16w4");
+            std::env::remove_var("XDNA2_LAB_OFM_GOLDEN");
+            std::env::remove_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN");
+        }
+        let stub = StubDirectSubmission::new(-1);
+        let r = timed_matmul_direct(&stub, 1, 1, 1, "f32");
+        assert!(!r.ran_on_npu, "status={} detail={}", r.status, r.detail);
+        if exec_cmd_is_enabled() {
+            // Setup should have applied staged plan dims even if submit fails.
+            assert_eq!(r.m, 1, "plan M");
+            assert_eq!(r.n, 256, "plan N");
+            assert_eq!(r.k, 1152, "plan K");
+            assert_eq!(r.dtype, "mladf_a16w4");
+            assert!(
+                r.detail.contains("mladf")
+                    || r.detail.contains("caller timed")
+                    || r.status.contains("lab")
+                    || r.status == "payload_unsupported"
+                    || r.status == "submit_wait_failed"
+                    || r.status.starts_with("ok_submit")
+                    || r.status.contains("ofm")
+                    || r.status == "cmd_bo_failed"
+                    || r.status == "cmd_bo_fill_failed",
+                "unexpected status/detail: {} / {}",
+                r.status,
+                r.detail
+            );
+        } else {
+            // Without L1, LAB_OFM pack path is not entered (still honest).
+            assert_eq!(r.status, "hwctx_ok");
+        }
+        unsafe {
+            match prev_ofm {
+                Some(v) => std::env::set_var("XDNA2_LAB_OFM", v),
+                None => std::env::remove_var("XDNA2_LAB_OFM"),
+            }
+            match prev_pack {
+                Some(v) => std::env::set_var("XDNA2_LAB_PACK", v),
+                None => std::env::remove_var("XDNA2_LAB_PACK"),
+            }
+            match prev_gold {
+                Some(v) => std::env::set_var("XDNA2_LAB_OFM_GOLDEN", v),
+                None => std::env::remove_var("XDNA2_LAB_OFM_GOLDEN"),
+            }
+            match prev_zero {
+                Some(v) => std::env::set_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN", v),
+                None => std::env::remove_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN"),
             }
         }
     }

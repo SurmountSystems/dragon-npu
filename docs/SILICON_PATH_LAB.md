@@ -1,0 +1,281 @@
+# Silicon path lab (WTS → ctrl → gated EXEC)
+
+## Plain English
+
+1. **Weights** — The NPU program needs real packed weights (174080 bytes), not zeros.  
+2. **Control packet** — Same program expects a ~29 KB control blob (`lab_ctrl.bin`).  
+3. **One gated run** — Temporary driver unlock + EXEC + compare outputs to a **non-zero** golden.
+
+Packing/layout alone never sets `ran_on_npu`.
+
+## Stage offline assets
+
+```bash
+# needs Ryzen AI DD install for dump_dd_txn
+bash tools/stage_silicon_lab_assets.sh
+# real AMD-packed WTS (pick one):
+#   bash tools/stage_silicon_lab_assets.sh --export-wts
+#   bash tools/stage_silicon_lab_assets.sh --wts-from /path/to/amd_packed_wts.bin
+```
+
+Produces under `testdata/xdna2_cmd/silicon_lab/` (gitignored bins):
+
+| File | Size | Role |
+|------|------|------|
+| `lab_instr.bin` | 1688 | Instruction txn |
+| `lab_ctrl.bin` | 29664 | Control packet |
+| `lab_ctrl_meta.json` | — | Sizes + patch locations |
+| `ifm.bin` | 2304 | bf16 ones (also rebuilt in Rust) |
+| `wts.bin` | 174080 | zeros unless `--wts-from` / `--export-wts` |
+| `ofm_expected.bin` | 512 | zeros — **not** Pass golden |
+
+## Real AMD-packed WTS (Phase A / Milestone A)
+
+`pack_mladf_ref` alone **does not** invent an AMD weight shuffle. Zero WTS is
+length-only plumbing.
+
+### Working path on this project (preferred)
+
+Vendor `mladfmatmulbias::export_const_params` is linked offline when Ryzen AI DD
++ system XRT + `libaiebu` are present:
+
+```bash
+# 1) Export real AMD-shuffled lab WTS (174080 B, non-zero)
+bash tools/export_mladf_wts.sh
+# → testdata/xdna2_cmd/mladf_wts_export/wts.bin + PROVENANCE.md
+
+# 2) Offline validate (same gate as Rust validate_mladf_wts_packed_for_pass)
+bash tools/validate_mladf_wts.sh testdata/xdna2_cmd/mladf_wts_export/wts.bin
+
+# 3) Stage silicon lab assets with that WTS
+bash tools/stage_silicon_lab_assets.sh --wts-from testdata/xdna2_cmd/mladf_wts_export/wts.bin
+# equivalent one-shot (export then stage):
+# bash tools/stage_silicon_lab_assets.sh --export-wts
+
+# 4) Wire lab env
+export XDNA2_LAB_WTS_PACKED=$PWD/testdata/xdna2_cmd/mladf_wts_export/wts.bin
+export XDNA2_LAB_REQUIRE_NONZERO_WTS=1
+```
+
+**Deps (fail-closed):**
+
+| Need | Default |
+|------|---------|
+| `DD_ROOT` | `~/Projects/ai/ryzen-ai-install/venv/lib/python3.12/site-packages/ryzenai_dynamic_dispatch` |
+| XRT | `-lxrt_coreutil -lxrt++ -lxrt_core` on system |
+| `AIEBU_LIB` | `/usr/lib/libaiebu.a` |
+
+**Honesty notes for the export tool:**
+
+- Host tensors are **lab synthetic** (int4 pattern + float scales=1 + int8 zeros + float bias=0).  
+- Attr `op_version=v2` (this DD build refuses `flat` with “flat version is not supported for matmulbias”; open headers map both flat and v2 to `MatmulWtsShuffle::BFP_UNIFIED`).  
+- Output **must** be exactly **174080** bytes and non-zero — tool refuses otherwise.  
+- **Do not commit** `wts.bin` (EULA / gitignored).  
+- Export ≠ Pass: still need non-zero OFM golden + L1/L3 EXEC + allclose for `ran_on_npu`.
+
+### Other honest options
+
+1. **Capture** — run vendor ORT / Vitis EP once, dump the WTS BO (174080 B, non-zero), then `--wts-from`.  
+2. **`--wts-from`** — any operator-supplied 174080 non-zero file after validate:  
+   `bash tools/validate_mladf_wts.sh /path/to/amd_packed_wts.bin`  
+   `bash tools/stage_silicon_lab_assets.sh --wts-from /path/to/amd_packed_wts.bin`
+
+Rust pure gate (no device):
+
+```text
+validate_mladf_wts_packed_for_pass(wts, 174080)  // len + not all zero
+// also: validate_wts_packed_len_nonzero (mladf_pack)
+```
+
+Then:
+
+```bash
+export XDNA2_LAB_WTS_PACKED=…/wts.bin   # must be non-zero for Pass
+export XDNA2_LAB_REQUIRE_NONZERO_WTS=1  # refuse zero / missing pack at BO create
+```
+
+**Not claimed:** pure-Rust port of the AMD shuffle (not needed if export/capture works).
+
+## Control packet (Phase B / Milestone B)
+
+The staged mladf program expects a **fourth** kernel-arg BO: the runtime control
+packet (**29664** bytes for the staged key), not just IFM/WTS/OFM.
+
+### Working path (preferred)
+
+```bash
+# 1) Stage vendor dump (instr + ctrl + meta + size fixtures)
+bash tools/stage_silicon_lab_assets.sh
+# → testdata/xdna2_cmd/silicon_lab/lab_ctrl.bin (29664) + lab_ctrl_meta.json
+#    stage runs tools/validate_mladf_ctrl.sh automatically
+
+# 2) Offline validate (same gate as Rust validate_mladf_ctrl_packed_for_pass)
+bash tools/validate_mladf_ctrl.sh testdata/xdna2_cmd/silicon_lab/lab_ctrl.bin
+
+# 3) Wire lab env (count-4 kernel args + pin CTRL before instruction)
+export XDNA2_LAB_CTRL_PACKED=$PWD/testdata/xdna2_cmd/silicon_lab/lab_ctrl.bin
+export XDNA2_LAB_MLADF_META=$PWD/testdata/xdna2_cmd/silicon_lab/lab_ctrl_meta.json
+# default XDNA2_LAB_REQUIRE_CTRL=0 for unit tests; set 1 for Pass-readiness dry-run
+export XDNA2_LAB_REQUIRE_CTRL=1
+```
+
+### Rust (pure + BO)
+
+| Helper | Role |
+|--------|------|
+| `validate_mladf_ctrl_packed_for_pass` | len + not empty/all-zero (offline Pass gate) |
+| `load_ctrl_packed_from_env` | `XDNA2_LAB_CTRL_PACKED` capped read; size match to plan |
+| `attach_ctrl_bo` / `IoBoSet.ctrl` | fourth Shmem BO fill |
+| `pack_start_npu_kernel_args_with_ctrl` | kernel-arg count **4** + ctrl paddr |
+| `build_lab_arg_bo_handles_ex` | pin list IFM/WTS/OFM/**CTRL**/inst |
+| `parse_mladf_ctrl_patch_locations` | meta `control_packet_patch_locations` offsets (non-array → Err) |
+| `ctrl_u64_patches_for_io_paddrs` / `patch_ctrl_from_meta_io_paddrs` | pure paddr writes |
+| `patch_ctrl_packet_u64_le` | LE u64 overwrite at offsets (OOB refuse) |
+| `XDNA2_LAB_CTRL_AUTO_PATCH=1` | opt-in: after IFM/WTS/OFM BO create, write device paddrs into ctrl before attach (needs `XDNA2_LAB_MLADF_META`) |
+
+**REQUIRE_CTRL:** `XDNA2_LAB_REQUIRE_CTRL=1` refuses missing/**empty/all-zero**/wrong-size ctrl when
+the plan has `ctrl_bytes` (pack mode **and** `create_and_fill_mladf_io_bos_ex`). Default
+**unset** so unit tests and 3-BO plumbing stay green.
+
+**Auto-patch (lab, optional):** default **off**. Set
+`export XDNA2_LAB_CTRL_AUTO_PATCH=1` for Phase C dry-runs so vendor dump paddrs are
+replaced with this process's IFM/WTS/OFM `xdna_addr` values (u64 LE overwrite residual).
+
+**Honesty / residual:**
+
+- `lab_ctrl.bin` is a **vendor DD dump**, not hand-written microcode.  
+- Meta lists `size: 6` and `operation: read_add_write`; lab pure path overwrites
+  **u64 LE** at each listed offset — **not** proven full XRT 6-byte add semantics.  
+- Ctrl attach / count-4 ≠ `ran_on_npu` / silicon Pass.
+
+## Live EXEC (Phase C / Milestone C — operator HITL)
+
+**Goal:** `ran_on_npu=true` **only** after gated EXEC+WAIT and OFM allclose vs a
+**non-zero** golden. This agent session does **not** claim silicon Pass without a
+verified live run.
+
+### Pass criteria (airtight)
+
+Product `ran_on_npu` requires **all** of:
+
+| Criterion | Notes |
+|-----------|--------|
+| Real ioctl path | `RealDirectSubmission` (never stub) |
+| EXEC+WAIT OK | L1 feature + `XDNA2_ALLOW_EXEC_CMD=1` + L3 `exec_cmd_allow=1` |
+| Instruction blob used | non-empty START_NPU txn |
+| OFM readback | `XDNA2_LAB_OFM=1` + successful BO read |
+| Decide true | allclose vs **non-zero** golden for mladf |
+
+Pure helpers (no device):
+
+```text
+decide_ran_on_npu / silicon_ran_on_npu_flags_ok
+classify_lab_matmul_status → ok_npu_verified only when decide_ran
+validate_mladf_{wts,ctrl,ofm_golden}_packed_for_pass
+silicon_pass_asset_readiness  // offline checklist object
+```
+
+**Never** true from envelope-only submit, zero WTS, zero golden, or stub path.
+
+`XDNA2_LAB_ALLOW_ZERO_GOLDEN=1` only bypasses **offline resolve** of a zero file
+(shell validator exits **3**, not 0). Product decide still returns
+`AllZeroGolden` → `ran_on_npu=false`. `--require-pass-assets` ignores ALLOW.
+
+### OFM golden (operator-supplied)
+
+| Source | Pass? |
+|--------|--------|
+| `pack_mladf_ref` `ofm_expected.bin` (512 zeros) | **No** — refused |
+| Host f32 ones×ones golden | **Invalid** for a16w4 (pack mode refuses) |
+| Non-zero bf16 **512** B (`m=1,n=256`) or f32 **1024** B | Yes candidate |
+| Capture from known-good vendor/XRT run of **same** key+WTS | Preferred |
+
+```bash
+# Offline validate (same gate as Rust validate_mladf_ofm_golden_packed_for_pass)
+bash tools/validate_mladf_ofm_golden.sh /path/to/ofm_golden.bin
+export XDNA2_LAB_OFM_GOLDEN=/path/to/ofm_golden.bin
+```
+
+**Capture checklist (optional):** after a known-good vendor ORT/Vitis EP run of the
+staged key, dump the OFM BO (512 B bf16), write `ofm_golden.bin` under
+`testdata/xdna2_cmd/silicon_lab/` (gitignored), record provenance, then validate.
+Do **not** invent zeros. Host reference for a16w4 needs real AMD-packed WTS math
+(not shipped as pure-Rust golden generator).
+
+### Offline Pass-readiness preflight (no L3 / no EXEC)
+
+```bash
+# After stage + real WTS + non-zero golden:
+bash tools/stage_silicon_lab_assets.sh --export-wts   # or --wts-from …
+# place non-zero golden:
+# cp /path/to/captured_ofm.bin testdata/xdna2_cmd/silicon_lab/ofm_golden.bin
+#   or: export XDNA2_LAB_OFM_GOLDEN=…
+
+# Soft report (warn on missing golden/zero WTS; still exit 0):
+bash tools/silicon_lab_preflight.sh --print-env
+
+# Fail closed if any Pass asset missing (instr + WTS nz + CTRL nz + golden nz):
+bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
+```
+
+### Exact dry-run then apply (copy-paste)
+
+```bash
+export PATH=/usr/bin:$PATH
+# Prefer real AMD WTS already staged; golden path required for Pass attempt:
+export XDNA2_LAB_OFM_GOLDEN=$PWD/testdata/xdna2_cmd/silicon_lab/ofm_golden.bin  # non-zero bf16 512
+
+# 1) Offline asset gate
+bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
+
+# 2) Lab dry-run: diagnose + silicon recipe + env print — NEVER opens L3 / EXEC
+bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets
+# (sets PACK/KEY/META/WTS/CTRL/REQUIRE_*/OFM/AUTO_PATCH + default blob=lab_instr.bin)
+
+# 3) Apply only if dry-run OK + operator accepts wedge risk (HITL sudo for L3):
+# bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets \
+#   --apply --i-accept-wedge-risk --blob "$XDNA2_INSTRUCTION_BLOB"
+#
+# Exit codes (unchanged honesty):
+#   0 = dry-run plan OK, OR apply cargo exit 0 + restore OK
+#       (npu_direct_bench exits 0 only when ran_on_npu=true — rare)
+#   4 = process non-zero / !ran_on_npu but gates restored (common without golden match)
+#   5 = restore failed — fix exec_cmd_allow=0 manually
+#
+# Always verify after apply:
+# cat /sys/module/amdxdna/parameters/exec_cmd_allow   # expect N or 0
+# bash scripts/diagnose_amdxdna.sh
+```
+
+Manual env (equivalent to `--silicon-mladf` wiring):
+
+```bash
+export XDNA2_INSTRUCTION_BLOB=$PWD/testdata/xdna2_cmd/silicon_lab/lab_instr.bin
+export XDNA2_LAB_OFM=1
+export XDNA2_LAB_PACK=mladf_a16w4
+export XDNA2_LAB_MLADF_KEY='mladfmatmulbias_prmptflat_mladf_2x4x4_flat_a16fw4acc16f_1_1152_256_128'
+export XDNA2_LAB_MLADF_META=$PWD/testdata/xdna2_cmd/silicon_lab/lab_ctrl_meta.json
+export XDNA2_LAB_WTS_PACKED=$PWD/testdata/xdna2_cmd/mladf_wts_export/wts.bin
+export XDNA2_LAB_CTRL_PACKED=$PWD/testdata/xdna2_cmd/silicon_lab/lab_ctrl.bin
+export XDNA2_LAB_OFM_GOLDEN=$PWD/testdata/xdna2_cmd/silicon_lab/ofm_golden.bin
+export XDNA2_LAB_REQUIRE_NONZERO_WTS=1
+export XDNA2_LAB_REQUIRE_CTRL=1
+export XDNA2_LAB_CTRL_AUTO_PATCH=1
+```
+
+### Honesty (Milestone C)
+
+- Dry-run green ≠ `ran_on_npu`.  
+- Apply exit **4** when `!ran_on_npu` is expected without golden match; restore still
+  clears L3.  
+- Never leave `exec_cmd_allow=1` permanent; never set `XDNA2_ALLOW_EXEC_CMD=1` in
+  default tests.  
+- This document alone does not claim silicon Pass.
+
+## Related
+
+- [AMD_MLADF_MATMUL_PACK.md](./AMD_MLADF_MATMUL_PACK.md)  
+- [XDNA2_EXEC_CMD_LAB.md](./XDNA2_EXEC_CMD_LAB.md)  
+- [XDNA2_NEVER_AGAIN.md](./XDNA2_NEVER_AGAIN.md)  
+- [XDNA2_DIRECT_CAPABILITIES.md](./XDNA2_DIRECT_CAPABILITIES.md) env table  
+- Tools: `tools/silicon_lab_preflight.sh`, `tools/validate_mladf_ofm_golden.sh`  

@@ -8,11 +8,12 @@
 //! `cargo test --lib` does not run this suite; CI runs both feature sets.
 //!
 //! **Timed-path wire:** [`super::direct::timed_matmul_direct`] calls
-//! [`super::lab_io::lab_decide_from_ofm_bytes`] **only** when `XDNA2_LAB_OFM=1`
-//! and OFM readback succeeds. Default (env unset) still hard-false `ran_on_npu`.
-//! Call [`decide_ran_on_npu`] only after a real **non-empty** device output buffer
-//! is available. `submit_wait_ok` must reflect a real L1-gated EXEC+WAIT success
-//! (never host_ref / stub envelope alone).
+//! [`super::lab_io::lab_decide_from_ofm_bytes_pack_mode`] **only** when
+//! `XDNA2_LAB_OFM=1` and OFM readback succeeds (f32 ones path or
+//! `XDNA2_LAB_PACK=mladf_a16w4` with non-zero golden). Default (env unset) still
+//! hard-false `ran_on_npu`. Call [`decide_ran_on_npu`] only after a real
+//! **non-empty** device output buffer is available. `submit_wait_ok` must reflect
+//! a real L1-gated EXEC+WAIT success (never host_ref / stub envelope alone).
 //!
 //! See `docs/XDNA2_TXN_RESEARCH.md` and `docs/XDNA2_DIRECT_CAPABILITIES.md`.
 
@@ -71,6 +72,19 @@ pub enum RanOnNpuBlockReason {
     NotRealIoctlPath,
     /// Length mismatch, non-finite, or tolerance failure.
     AllcloseFailed,
+    /// All-zero host golden (vacuous allclose vs host-zeroed OFM).
+    ///
+    /// Product Pass **never** allows this. `XDNA2_LAB_ALLOW_ZERO_GOLDEN` only
+    /// bypasses offline resolve/load gates for plumbing — not this criterion.
+    AllZeroGolden,
+}
+
+/// True when every element is exactly ±0.0 (empty → true).
+///
+/// Pure twin of lab-path `ofm_golden_is_all_zero` (no device).
+#[must_use]
+pub fn f32_slice_is_all_zero(v: &[f32]) -> bool {
+    v.iter().all(|&x| x == 0.0)
 }
 
 /// Maximum absolute elementwise difference `|a[i]-b[i]|`.
@@ -203,6 +217,11 @@ pub fn decide_ran_on_npu_reason(
     if input.host_golden.is_empty() || input.device_or_candidate.is_empty() {
         return Err(RanOnNpuBlockReason::EmptyBuffers);
     }
+    // Vacuous zeros-vs-zeros must never product Pass (ALLOW_ZERO_GOLDEN is
+    // offline plumbing only — does not override this).
+    if f32_slice_is_all_zero(input.host_golden) {
+        return Err(RanOnNpuBlockReason::AllZeroGolden);
+    }
     if !input.submit_wait_ok {
         return Err(RanOnNpuBlockReason::SubmitWaitNotOk);
     }
@@ -225,6 +244,7 @@ pub fn decide_ran_on_npu_reason(
 ///
 /// Returns **false** if any of:
 /// - empty `host_golden` or `device_or_candidate` (empty OFM must never Pass)
+/// - **all-zero** `host_golden` ([`RanOnNpuBlockReason::AllZeroGolden`])
 /// - `!submit_wait_ok`
 /// - `!had_instruction_blob`
 /// - `!real_ioctl_path`
@@ -232,9 +252,32 @@ pub fn decide_ran_on_npu_reason(
 ///
 /// Does **not** open devices or submit work. See [`decide_ran_on_npu_reason`] for
 /// which criterion blocked.
+///
+/// **`XDNA2_LAB_ALLOW_ZERO_GOLDEN`:** may bypass *offline resolve/load* only;
+/// product decide **always** refuses all-zero golden.
 #[must_use]
 pub fn decide_ran_on_npu(input: &NumericalVerifyInput<'_>) -> bool {
     decide_ran_on_npu_reason(input).is_ok()
+}
+
+/// Pure product flag AND for silicon `ran_on_npu` (timed path honesty mirror).
+///
+/// Returns true **only** when every flag is true. Envelope-only submit
+/// (`submit_wait_ok` alone), stub path (`!real_ioctl_path`), missing instruction
+/// blob, missing OFM readback, or failed decide never Pass.
+///
+/// Does **not** open devices. Does **not** replace [`decide_ran_on_npu`] (allclose);
+/// use both: decide for numerical, this for the outer lab flag aggregation.
+#[must_use]
+#[allow(clippy::fn_params_excessive_bools)] // honesty flags, not a domain state machine
+pub fn silicon_ran_on_npu_flags_ok(
+    real_ioctl_path: bool,
+    submit_wait_ok: bool,
+    had_instruction_blob: bool,
+    ofm_readback_ok: bool,
+    ofm_decide_pass: bool,
+) -> bool {
+    real_ioctl_path && submit_wait_ok && had_instruction_blob && ofm_readback_ok && ofm_decide_pass
 }
 
 #[cfg(test)]
@@ -529,6 +572,57 @@ mod tests {
             decide_ran_on_npu_reason(&input),
             Err(RanOnNpuBlockReason::AllcloseFailed)
         );
+    }
+
+    #[test]
+    fn decide_ran_on_npu_refuses_all_zero_golden() {
+        // Pure allclose would Pass zeros-vs-zeros — product decide must refuse.
+        // ALLOW_ZERO_GOLDEN only bypasses offline resolve, never this gate.
+        let z = [0.0_f32, 0.0];
+        let input = NumericalVerifyInput {
+            host_golden: &z,
+            device_or_candidate: &z,
+            had_instruction_blob: true,
+            submit_wait_ok: true,
+            real_ioctl_path: true,
+            criteria: NumericalVerifyCriteria::default(),
+        };
+        assert!(!decide_ran_on_npu(&input));
+        assert_eq!(
+            decide_ran_on_npu_reason(&input),
+            Err(RanOnNpuBlockReason::AllZeroGolden)
+        );
+        // −0.0 also counts as zero
+        let zn = [-0.0_f32, 0.0];
+        let input_n = NumericalVerifyInput {
+            host_golden: &zn,
+            device_or_candidate: &z,
+            ..input
+        };
+        assert_eq!(
+            decide_ran_on_npu_reason(&input_n),
+            Err(RanOnNpuBlockReason::AllZeroGolden)
+        );
+    }
+
+    #[test]
+    fn f32_slice_is_all_zero_helper() {
+        assert!(f32_slice_is_all_zero(&[]));
+        assert!(f32_slice_is_all_zero(&[0.0, -0.0]));
+        assert!(!f32_slice_is_all_zero(&[0.0, 1.0]));
+    }
+
+    #[test]
+    fn silicon_ran_on_npu_flags_ok_requires_all() {
+        assert!(silicon_ran_on_npu_flags_ok(true, true, true, true, true));
+        // Envelope-only / no blob / stub / no OFM / decide fail
+        assert!(!silicon_ran_on_npu_flags_ok(true, true, true, true, false));
+        assert!(!silicon_ran_on_npu_flags_ok(true, true, true, false, true));
+        assert!(!silicon_ran_on_npu_flags_ok(true, true, false, true, true));
+        assert!(!silicon_ran_on_npu_flags_ok(true, false, true, true, true));
+        assert!(!silicon_ran_on_npu_flags_ok(false, true, true, true, true));
+        // Forged decide_pass without readback must not Pass (timed-path AND).
+        assert!(!silicon_ran_on_npu_flags_ok(true, true, true, false, true));
     }
 
     #[test]

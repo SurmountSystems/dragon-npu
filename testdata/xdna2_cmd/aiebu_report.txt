@@ -1,0 +1,57 @@
+Header version 0.1
+Device Generation: 4
+Cols, Rows, NumMemRows : (4, 6, 1)
+TransactionSize: 416
+NumOps: 13
+UID:0c7fe63d0342b63aa017ce2f02ebe7dc
+elf size:1072
+ELF Header
+
+  Class:      ELF32
+  Encoding:   Little endian
+  ELFVersion: Current
+  OS/ABI:     ? (0xE)
+  ABI Version:2
+  Type:       Executable file
+  Machine:    AT&T WE 32100
+  Version:    Current
+  Entry:      0x0
+  Flags:      0x0
+
+Section Headers:
+[  Nr ] Type              Addr       Size       ES   Flg Lk   Inf   Al   Name
+[    0] NULL              0x00000000 0x00000000 0x00     0x00 0x000 0x00                   
+[    1] STRTAB            0x00000000 0x00000046 0x00     0x00 0x000 0x01 .shstrtab         
+[    2] PROGBITS          0x00000000 0x000001a0 0x00 AX  0x00 0x000 0x10 .ctrltext         
+[    3] STRTAB            0x00000000 0x00000003 0x00     0x00 0x000 0x00 .dynstr           
+[    4] DYNSYM            0x00000000 0x00000020 0x10 A   0x03 0x001 0x08 .dynsym           
+[    5] RELA              0x00000000 0x0000000c 0x0c A   0x04 0x000 0x08 .rela.dyn         
+[    6] DYNAMIC           0x00000000 0x00000010 0x08 A   0x03 0x000 0x08 .dynamic          
+[    7] NOTE              0x00000000 0x00000020 0x00     0x00 0x000 0x01 .note.xrt.UID     
+Key to Flags: W (write), A (alloc), X (execute), 
+              M (merge), S (strings), I (info),
+              L (link order), O (extra OS processing required),
+              G (group), T (TLS), C (compressed), E (exclude)
+Program Headers:
+[  Nr ] Type           VirtAddr   PhysAddr   FileSize   Mem.Size   Flags    Align
+[    0] PHDR           0x00000000 0x00000000 0x00000060 0x00000060 R        0x00000000 
+[    1] LOAD           0x00000000 0x00000000 0x000001a0 0x000001a0 R E      0x00000010 
+[    2] DYNAMIC        0x00000000 0x00000000 0x00000010 0x00000010 RW       0x00000008 
+
+  [2] .ctrltext	1a0
+v0.1, gen4
+6x4 M1
+416B, 13ops
+XAIE_IO_WRITE                                  8
+XAIE_IO_BLOCKWRITE                             2
+XAIE_IO_MASKWRITE                              1
+XAIE_IO_MASKPOLL                               1
+XAIE_IO_MASKPOLL_BUSY                          0
+XAIE_IO_NOOP                                   0
+XAIE_IO_PREEMPT                                0
+XAIE_IO_LOAD_PM_START                          0
+XAIE_IO_CUSTOM_OP_TCT                          0
+XAIE_IO_CUSTOM_OP_DDR_PATCH                    1
+XAIE_IO_CUSTOM_OP_MERGE_SYNC                   0
+XAIE_IO_CUSTOM_OP_RECORD_TIMER                 0
+

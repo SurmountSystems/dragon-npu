@@ -1,3 +1,130 @@
+Latest Turn (Milestone C review closeout Issues 1–7):
+- **Issue 1 (bug):** `decide_ran_on_npu` → `AllZeroGolden` always refuse product Pass; ALLOW_ZERO only offline resolve.
+- **Issue 2 (bug):** shell golden ALLOW exits **3** (not 0); `XDNA2_LAB_ALLOW_ZERO_GOLDEN` (+ legacy); require-pass unsets ALLOW.
+- **Issue 3:** timed path final `silicon_ran_on_npu_flags_ok` AND.
+- **4–7:** DRY_RUN_READY honesty; WTS Pass-candidate pick; mktemp preflight; bf16 ±0 decode.
+- Gates: fmt; clippy -D amd-xdna2; **404+1** lib; bash -n.
+- **Still open:** non-zero OFM golden HITL; sudo L3 → `ran_on_npu` after allclose.
+
+Latest Turn (Milestone C — Live L3 EXEC + OFM match → ran_on_npu plumbing):
+- **Pass criteria:** `silicon_ran_on_npu_flags_ok` + existing `decide_ran_on_npu` / classify `ok_npu_verified` only on decide; zero-golden refuse for mladf; envelope-only never Pass.
+- **OFM golden:** `validate_mladf_ofm_golden_packed_for_pass` + `tools/validate_mladf_ofm_golden.sh` (bf16 512 / f32 1024, non-zero); `silicon_pass_asset_readiness`.
+- **Preflight:** `tools/silicon_lab_preflight.sh` offline asset gate (`--require-pass-assets`, `--print-env`); no L3/EXEC.
+- **Lab:** `scripts/lab_exec_once.sh --silicon-mladf` wires full recipe; apply still risk+blob+restore traps; silicon env forwarded on apply.
+- **Docs:** `SILICON_PATH_LAB` Phase C exact dry-run→apply; RESIDUAL/PLAN honesty (dry-run ≠ `ran_on_npu`).
+- **Live EXEC:** not attempted / not claimed (operator HITL).
+- Gates: fmt; clippy -D amd-xdna2; lib tests; bash -n preflight/validate_ofm/lab_exec.
+- **Still open:** operator non-zero OFM golden; sudo L3 apply → allclose → `ran_on_npu`.
+
+Latest Turn (Milestone B — control packet BO ~29 KB for EXEC):
+- **Validate:** `tools/validate_mladf_ctrl.sh` + Rust `validate_mladf_ctrl_packed_for_pass` (len 29664 + non-zero).
+- **Stage:** `stage_silicon_lab_assets.sh` size-gates `lab_ctrl.bin` 29664 + runs validate; PROVENANCE honesty (vendor dump ≠ microcode).
+- **Rust:** `REQUIRE_CTRL=1` refuse missing/empty/all-zero ctrl + unset `XDNA2_LAB_CTRL_PACKED` in pack mode; `parse_mladf_ctrl_patch_locations` / `ctrl_u64_patches_for_io_paddrs` / `patch_ctrl_from_meta_io_paddrs`; count-4 kernel args + pin CTRL already wired.
+- **Residual:** meta `size=6` `read_add_write` not full XRT fidelity (lab u64-LE overwrite); attach ≠ `ran_on_npu`.
+- **Docs:** `SILICON_PATH_LAB` Phase B exact commands; DIRECT_CAPABILITIES; AMD_MLADF ctrl row; RESIDUAL/PLAN.
+- Gates: fmt; clippy -D amd-xdna2; lib tests; bash -n validate_mladf_ctrl + stage.
+- **Still open:** non-zero OFM golden; sudo L3 EXEC → `ran_on_npu` only after allclose.
+
+Latest Turn (Milestone A — real AMD-packed WTS):
+- **Export:** `tools/export_mladf_wts.{cpp,sh}` links DD `export_const_params` + XRT + aiebu → **174080 non-zero** `wts.bin` (lab synthetic tensors; `op_version=v2`; flat refused by DD).
+- **Validate:** `tools/validate_mladf_wts.sh` + Rust `validate_wts_packed_len_nonzero` / `validate_mladf_wts_packed_for_pass`.
+- **Stage:** `--export-wts` one-shot; `--wts-from` still refuses all-zero.
+- **Rust:** `REQUIRE_NONZERO_WTS=1` refuses zero fill + unset `XDNA2_LAB_WTS_PACKED` in pack mode; unit tests.
+- **Docs:** `SILICON_PATH_LAB` Phase A exact commands; RESIDUAL / DIRECT_CAPABILITIES / AMD_MLADF pack.
+- **Honesty:** gitignore export bins; packing ≠ Pass / ≠ `ran_on_npu`.
+- Gates: fmt; clippy -D amd-xdna2; **392+1** lib; bash -n export/validate/stage; live export 174080/149120 nonzero.
+- **Still open:** non-zero OFM golden; sudo L3 EXEC → `ran_on_npu` only after allclose.
+
+Latest Turn (silicon residual A/B/C offline plumbing):
+- **A WTS:** `validate_mladf_wts_packed_for_pass` (len+non-zero); stage refuses all-zero `--wts-from`; docs for `export_const_params` / capture (no fake shuffle).
+- **B ctrl:** `load_ctrl_packed_from_env` / `attach_ctrl_bo` / count-4 kernel args; timed path `ios.pack_kernel_args()` + `build_lab_arg_bo_handles_ex` pins CTRL.
+- **C lab:** `docs/SILICON_PATH_LAB.md` + stage script env recipe; REQUIRE_CTRL / REQUIRE_NONZERO_WTS; zero golden/WTS fail-closed. Live EXEC = operator HITL only.
+- Gates: fmt; clippy -D amd-xdna2; **389+1** lib; bash -n stage script.
+- **Still open:** real non-zero AMD WTS blob; non-zero OFM golden; sudo L3 EXEC → `ran_on_npu` only after allclose.
+
+Latest Turn (review closeout WP1–4 Issues 1–16):
+- **Issue 1 (bug):** refuse all-zero OFM golden for mladf unless `XDNA2_LAB_ALLOW_ZERO_GOLDEN=1`.
+- **2:** `LabPackMode::try_from_env` fail-closed on unknown `XDNA2_LAB_PACK`.
+- **3:** TimedOpResult reports plan M/N/K; host_ref skipped for mladf.
+- **4–5/14:** stub pack-mode tests, fixture ifm/wts/ofm sizes, golden unit tests.
+- **6–7:** `MAX_MLADF_LAB_FILE_BYTES` + `read_lab_file_capped`; meta size_in_bytes cap.
+- **8/10/11:** pack tool meta-before-read, `#include <stdexcept>`, PROVENANCE table fix.
+- **9/12/13/15/16:** constant drift test; docs pack-mode decide; WTS len at env load; dtype accept-list; LAB_OFM=1 note.
+- Gates: fmt; clippy -D amd-xdna2; **374+1** lib; pack 2304/174080/512.
+- **Still open:** real AMD WTS shuffle; ctrl EXEC; silicon Pass.
+
+Latest Turn (WP1 + residual WP2/WP3/WP4 — pack_mladf_ref + timed pack wire):
+- **WP1:** `tools/pack_mladf_ref.{cpp,sh}` → gitignored `testdata/xdna2_cmd/mladf_ref/`:
+  ifm.bin=2304 (bf16 ones), wts.bin=174080 (zeros or `--wts-from`), ofm_expected.bin=512 zeros, PROVENANCE.md.
+  No fake AMD shuffle; full DD `export_const_params` needs XRT (not linked). Exit non-zero on size fail.
+- **WP2:** docs `XDNA2_LAB_WTS_PACKED` → pack output; optional ambient `wts.bin` len==174080 test.
+- **WP3:** `timed_matmul_direct` + `LAB_OFM` uses `create_and_fill_lab_io_bos_for_pack_mode`; default f32_ones; LAB_WEIGHT overrides pack.
+- **WP4:** f32 ones golden **invalid** for a16w4; `XDNA2_LAB_OFM_GOLDEN` (bf16/f32) via `parse_ofm_golden_bytes` / `lab_decide_from_ofm_bytes_pack_mode`; RESIDUAL + pack docs.
+- Gates: fmt; clippy -D amd-xdna2; **366+1** lib; bash -n pack script; pack sizes 2304/174080/512.
+- **Still open:** real AMD WTS shuffle; ctrl EXEC bind; silicon Pass.
+
+Latest Turn (WP0 review fixes Issues 1–9):
+- **Issue 1:** `normalize_mladf_instr_key` peels `_ctrl*`/`_param`/`_*_*_gm`; exact 3/4 trailing digit groups; GM → M=1,K=1152,N=256,Gs=128.
+- **Issue 2:** negative tests (empty/bad/zero dims, meta fail, WTS len, GM meta OFM pad).
+- **Issue 3:** `is_exact_staged_mladf_key` (no `contains`); GM needs meta/override.
+- **Issue 4:** meta authoritative; a16 IFM-only formula check.
+- **Issues 5–7:** dump tool `filesystem::create_directories`, write/close checks, drop redundant `_gm_ctrl*`.
+- **Issues 8–9:** `.json`/`.bin` strip; docs exact staged meta path.
+- Gates: fmt; clippy -D amd-xdna2; **16** mladf filter tests.
+- **Still open (WP1+):** WTS shuffle; ctrl EXEC; silicon Pass.
+
+Latest Turn (WP0 — kernel contract doc + fixtures):
+- **DONE WHEN:** staged key → IFM=2304, OFM=512, WTS=174080 from meta (+ parse M/K/N/Gs).
+- Docs: `docs/AMD_MLADF_MATMUL_PACK.md` size tables + key anatomy; cross-link from BUILD_NPU_MATMUL_PROGRAM.
+- Dump: `tools/dump_dd_txn.cpp` dumps primary txn + siblings `*_ctrl_meta` (`.json` when JSON) and `*_ctrl`; exact-key first; siblings free vs max.
+- Rust: `parse_mladf_instr_key` M=1,K=1152,N=256,Gs=128; `parse_mladf_key_tags` a16/w4/acc16f; staged constants + `parse_mladf_ctrl_meta_json`.
+- Verified live dump `/tmp/wp0_dump/*_ctrl_meta.json` → 2304/174080/512/29664.
+- Gates: fmt; clippy -D amd-xdna2; `cargo test --features amd-xdna2 --lib mladf` (11 ok).
+- **Still open (WP1+):** real WTS shuffle; ctrl packet EXEC bind; silicon Pass.
+
+Latest Turn (WP0–3: fill memory AMD a16w4 sizes — IFM/OFM bf16 pack):
+- Goal: IFM/WTS/OFM layouts for staged mladf matmul program (not f32 ones).
+- New `mladf_pack.rs`: parse key M/K/N/Gs; staged sizes 2304/174080/512/29664; ctrl_meta JSON; bf16 pack/unpack; zero or file WTS.
+- `lab_io`: `create_and_fill_mladf_io_bos`, `create_and_fill_lab_io_bos_for_pack_mode`, `lab_decode_ofm_bytes`.
+- Env: `XDNA2_LAB_PACK=mladf_a16w4`, `XDNA2_LAB_MLADF_KEY`, `XDNA2_LAB_MLADF_META`, `XDNA2_LAB_WTS_PACKED`.
+- Docs: `docs/AMD_MLADF_MATMUL_PACK.md`. Default f32_ones unchanged.
+- Gates: clippy -D amd-xdna2; **357+1** lib tests.
+- **Still open:** real WTS shuffle (not zeros); ctrl packet; live EXEC/Pass.
+
+Latest Turn (extract real AMD matmul NPU programs — plain English):
+- **Goal:** get the actual matrix-multiply *program bytes* for the NPU, not jargon.
+- Found them prebuilt inside Ryzen AI DynamicDispatch `libtransaction.a` (zlib-compressed; 6500+ matmul keys).
+- Built `tools/dump_dd_txn.cpp` + `tools/dump_dd_txn.sh` → dumps real STX classic v0.1 txn bins.
+- Example: `mladfmatmulbias_prmptflat_…_1152_256_128` = **1688 B**, gen4, 8×6, 40 ops, walk OK.
+- Staged gitignored `testdata/xdna2_cmd/lab_instr.bin` + PROVENANCE (vendor extract, not hand-written).
+- Doc: `docs/BUILD_NPU_MATMUL_PROGRAM.md` (plain English).
+- **Still not Pass:** these kernels need AMD packed a16/w4 layouts, not lab f32-ones; still need sudo EXEC + OFM check.
+- **Work remains:** match I/O layout to kernel, L3 lab apply, OFM golden for that kernel.
+
+Latest Turn (pure Rust XAie txn — valid EXEC instruction format):
+- User clarified: finish **Rust pure-direct**, not eepy 11 GiB packaging. Need was **valid instruction/txn** (START_NPU buffer), not Vitis EP.
+- New `src/backends/amd_xdna2/txn.rs` (MIT `XAie_TxnHeader` + classic **v0.1** op walk):
+  WRITE/MASK*/BLOCK*/NOOP/PREEMPT/CUSTOM sizes validated against host `copy_DDR_to_Mem_Tile.bin`.
+  `classify_instruction_blob`, `validate_txn_blob`, `build_strix_research_noop_txn`, ELF `.ctrltext` peel.
+- `load_instruction_blob_from_path` peels aiebu ELF; optional `XDNA2_INSTRUCTION_REQUIRE_TXN=1`.
+- `scripts/materialize_txn_offline.sh` + `examples/materialize_research_txn.rs` stage gitignored research NOOP.
+- Docs: `XDNA2_TXN_RESEARCH.md` §4b. **Still NOT GEMM Pass** — NOOP/DMA helper ≠ OFM MatMul.
+- Gates: clippy -D (default+amd-xdna2); 344+1 lib tests; 7 new txn unit tests.
+- **Work remains:** known-good **npu4 GEMM** txn HITL; sudo L3 single-shot; silicon OFM Pass.
+
+Latest Turn (eepy-min: others never need 11 GiB AMD dump):
+- Goal: one person packs once; teammates install ~440 MiB share, not full `ryzen_ai-1.7.1` (~11 GiB).
+- Outside repo (AMD EULA wheels, not git): `~/Projects/ai/ryzen-ai-install/`
+  - Fixed `activate-eepy.sh` → prefer `venv-eepy-min` (was still full `venv`).
+  - Fixed `install_eepy_min.sh` (auto-extract tarball, wheel checks, eepy.so, XRT shim).
+  - `pack_eepy_min.sh` + `EXCLUDED.md` + `MANIFEST.sha256` (460 MiB wheels).
+  - **`share_eepy_min.sh`** → `eepy-min-share-YYYYMMDD.tar.xz` (~438 MiB) scripts+wheels for friends.
+  - `smoke_eepy_min.sh` providers + CPU session (no NPU EXEC).
+- dragon-npu doc only: `docs/RYZEN_AI_EEPY_MIN.md` (no binaries in git).
+- Verified: activate → `VitisAIExecutionProvider`+CPU; smoke SMOKE_OK.
+- **Not** pure-direct; L3 `exec_cmd_allow=0` still blocks live EP inference until lab allow.
+- **Work remains:** known-good npu4/txn HITL; sudo L3; silicon Pass; optional app wire (Sovcit) to eepy-min.
+
 Latest Turn (clippy --all-targets + extract sha256/force):
 - Fixed lib-test clippy: match_same_arms, too_many_lines, cast_signed, redundant_clone, float_cmp, field_reassign.
 - extract: sha256 paths `sources/name`; VE2 force refuse before stage (no partial OUT).

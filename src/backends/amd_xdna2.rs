@@ -31,8 +31,10 @@
 //! - **Phase 5:** Host graph interpreter ([`host_graph`]) runs Identity/Relu/Add/Mul/MatMul/Gemm
 //!   with real f32 math + weights; weight BO plan scaffolding; **still not** NPU graph Pass.
 //! - **Phase 3.5 lab:** Pure numerical policy in [`numerical`] + OFM helpers in [`lab_io`]
-//!   (`pack_start_npu_kernel_args`, `lab_decide_from_ofm_bytes`). Timed path wires decide
-//!   **only** when `XDNA2_LAB_OFM=1` after OFM readback; default still hard-false `ran_on_npu`.
+//!   (`pack_start_npu_kernel_args`, `lab_decide_from_ofm_bytes_pack_mode` for f32 ones or
+//!   `XDNA2_LAB_PACK=mladf_a16w4` with non-zero golden — all-zero golden refused by default).
+//!   Timed path wires decide **only** when `XDNA2_LAB_OFM=1` after OFM readback; default
+//!   still hard-false `ran_on_npu`.
 //! - Real .onnx weight tensors (multi-dtype + bf16 raw) are loaded via `CompiledModel`.
 //! - All of the above is strongly TDD'd (lib tests + dedicated real-hardware integration tests).
 //!
@@ -50,7 +52,9 @@
 pub mod direct;
 pub mod host_graph;
 pub mod lab_io;
+pub mod mladf_pack;
 pub mod numerical;
+pub mod txn;
 
 /// Re-export feature-free colibrì schema version (defined on crate root).
 pub use crate::TIMED_OP_JSON_SCHEMA_VERSION;
@@ -78,20 +82,52 @@ pub use direct::{
 
 pub use numerical::{
     DEFAULT_VERIFY_ATOL, DEFAULT_VERIFY_RTOL, NumericalVerifyCriteria, NumericalVerifyInput,
-    RanOnNpuBlockReason, decide_ran_on_npu, decide_ran_on_npu_reason, host_matmul_f32_ones_vec,
-    max_abs_diff_f32, verify_f32_allclose,
+    RanOnNpuBlockReason, decide_ran_on_npu, decide_ran_on_npu_reason, f32_slice_is_all_zero,
+    host_matmul_f32_ones_vec, max_abs_diff_f32, silicon_ran_on_npu_flags_ok, verify_f32_allclose,
 };
 
 pub use lab_io::{
-    IoBoSet, LabIoSizePlan, LabOfmVerifyPlan, WeightExecBind, WeightExecFillRequest,
-    build_lab_arg_bo_handles, classify_lab_matmul_status, create_and_fill_ones_io_bos,
-    create_and_fill_weight_io_bos, create_io_bos, destroy_io_bos, destroy_weight_exec_bind,
-    f32_slice_from_le_bytes, f32_slice_to_le_bytes, fill_ifm_wts,
-    host_matmul_f32_ones_ifm_with_wts, host_ones_f32_matrix_bytes, lab_decide_from_ofm_bytes,
-    lab_decide_from_ofm_bytes_bool, lab_decide_from_ofm_bytes_with_golden, lab_io_size_plan,
+    IoBoSet, LabIoSizePlan, LabOfmVerifyPlan, SiliconPassAssetReadiness, WeightExecBind,
+    WeightExecFillRequest, attach_ctrl_bo, build_lab_arg_bo_handles, build_lab_arg_bo_handles_ex,
+    bytes_are_all_zero, check_mladf_ofm_golden_not_all_zero, check_mladf_pack_dtype,
+    check_mladf_wts_not_all_zero_for_exec, classify_lab_matmul_status,
+    create_and_fill_lab_io_bos_for_pack_mode, create_and_fill_mladf_io_bos,
+    create_and_fill_mladf_io_bos_ex, create_and_fill_ones_io_bos, create_and_fill_weight_io_bos,
+    create_io_bos, destroy_io_bos, destroy_weight_exec_bind, f32_slice_from_le_bytes,
+    f32_slice_to_le_bytes, fill_ifm_wts, host_matmul_f32_ones_ifm_with_wts,
+    host_ones_f32_matrix_bytes, lab_allow_zero_ofm_golden_env, lab_ctrl_auto_patch_env,
+    lab_decide_candidate_f32_with_golden, lab_decide_from_ofm_bytes,
+    lab_decide_from_ofm_bytes_bool, lab_decide_from_ofm_bytes_pack_mode,
+    lab_decide_from_ofm_bytes_with_golden, lab_decode_ofm_bytes, lab_io_size_plan,
     lab_matmul_ifm_nbytes, lab_matmul_ofm_nbytes, lab_matmul_wts_nbytes, lab_ofm_env_enabled,
-    lab_ofm_env_value_enabled, lab_weight_env_enabled, pack_start_npu_kernel_args,
-    pack_start_npu_kernel_args_no_io, readback_ofm, u64_to_prop_dwords, zero_ofm,
+    lab_ofm_env_value_enabled, lab_require_ctrl_env, lab_require_non_zero_wts_env,
+    lab_weight_env_enabled, load_ctrl_packed_from_env, load_mladf_meta_json_text_from_env,
+    load_ofm_golden_from_env, ofm_golden_is_all_zero, pack_start_npu_kernel_args,
+    pack_start_npu_kernel_args_no_io, pack_start_npu_kernel_args_with_ctrl, parse_ofm_golden_bytes,
+    patch_ctrl_from_meta_io_paddrs, patch_ctrl_packet_u64_le, ran_on_npu_reason_is_ofm_verify_fail,
+    readback_ofm, resolve_pack_mode_ofm_golden, silicon_pass_asset_readiness, u64_to_prop_dwords,
+    validate_mladf_ctrl_packed_for_pass, validate_mladf_ofm_golden_packed_for_pass,
+    validate_mladf_wts_packed_for_pass, zero_ofm,
+};
+
+pub use txn::{
+    InstructionBlobKind, XAIE_TXN_HEADER_SIZE, XaieTxnHeader, XaieTxnOp, XaieTxnOpcode,
+    build_minimal_noop_txn, build_strix_research_noop_txn, classify_instruction_blob,
+    instruction_payload_bytes, validate_txn_blob, walk_txn_ops_v01,
+};
+
+pub use mladf_pack::{
+    CtrlMetaPatchEntry, CtrlPatchBufferRole, CtrlPatchLocation, LabPackMode,
+    MAX_MLADF_LAB_FILE_BYTES, MLADF_A16_ELEM_BYTES, MladfBufferPlan, MladfKeyTags,
+    MladfMatmulShape, STAGED_MLADF_CTRL_BYTES, STAGED_MLADF_IFM_BYTES, STAGED_MLADF_KEY,
+    STAGED_MLADF_OFM_BYTES, STAGED_MLADF_WTS_BYTES, bf16_bits_to_f32, build_mladf_lab_payloads,
+    ctrl_u64_patches_for_io_paddrs, f32_to_bf16_bits, host_ones_bf16_matrix_bytes,
+    is_exact_staged_mladf_key, load_wts_packed_from_env, mladf_buffer_plan_from_env,
+    mladf_buffer_plan_from_key, normalize_mladf_instr_key, pack_ifm_bf16_from_f32_rowmajor,
+    parse_mladf_ctrl_meta_json, parse_mladf_ctrl_patch_locations, parse_mladf_instr_key,
+    parse_mladf_key_tags, read_lab_file_capped, staged_mladf_buffer_plan,
+    strip_mladf_map_sibling_suffixes, unpack_ofm_bf16_to_f32, validate_wts_packed_len_nonzero,
+    wts_bytes_are_all_zero,
 };
 
 pub use host_graph::{

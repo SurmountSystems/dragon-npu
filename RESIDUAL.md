@@ -1,53 +1,61 @@
-# Residual — clippy --all-targets + extract sha256/force refuse
+# Residual — silicon path (WTS → ctrl → EXEC + OFM)
 
-**Date:** 2026-07-15  
-**Honesty:** Silicon GEMM Pass still HITL (known-good AIE2/npu4 txn + sudo L3).
+**Date:** 2026-07-16
 
----
+## Done (offline / pure-direct)
 
-## Completed this round (clippy all-targets + extract)
+### Buffer fill (prior plan)
+- IFM size + bf16 pack; OFM size + bf16 unpack
+- WTS **correct length** (zeros or `XDNA2_LAB_WTS_PACKED`)
+- Lab BO create/fill for `XDNA2_LAB_PACK=mladf_a16w4`
+- pack_mladf_ref + timed pack wire + zero-golden refuse
 
-| Issue | Fix |
-|-------|-----|
-| **clippy --all-targets** | match_same_arms, too_many_lines allow, cast_signed, redundant_clone, float_cmp, field_reassign_with_default |
-| **extract sha256** | `sources.sha256` uses `sources/name` so `sha256sum -c` works from OUT |
-| **extract force VE2** | Refuse **before** mkdir/copy (no partial stage on exit 4) |
+### Milestone A — real AMD-packed WTS
 
-## Prior (still true)
+| Item | Status |
+|------|--------|
+| **Offline AMD export** | `tools/export_mladf_wts.{cpp,sh}` → **174080 non-zero** |
+| **Validate / stage / REQUIRE_NONZERO_WTS** | done |
+| **Honesty** | packing ≠ `ran_on_npu` |
 
-Full-alloc zero; ofm_decide_error; LAB_WEIGHT MVP; synthetic extract CI.
+### Milestone B — control packet BO ~29 KB
 
-## LAB_WEIGHT MVP limits (intentional)
+| Item | Status |
+|------|--------|
+| **Validate / stage / REQUIRE_CTRL / count-4 pin** | done |
+| **Meta u64-LE patch residual** | not full XRT size=6 read_add_write |
 
-- f32 LE WTS (promoted host view)
-- ones IFM golden only (`ones @ W`)
-- plain MatMul/Gemm only — no `fused_*`, no Gemm alpha/beta ≠ 1, no bias BO
-- Full alloc zeroing for page tails
+### Milestone C — Live L3 EXEC + OFM → `ran_on_npu` (this turn)
 
-## Still HITL
+| Item | Status |
+|------|--------|
+| **Pass criteria pure** | `decide_ran_on_npu` + `silicon_ran_on_npu_flags_ok`; classify `ok_npu_verified` only on decide; zero golden refuse for mladf |
+| **OFM golden offline gate** | `validate_mladf_ofm_golden_packed_for_pass` + `tools/validate_mladf_ofm_golden.sh` (512 bf16 / 1024 f32, non-zero) |
+| **Asset readiness** | `silicon_pass_asset_readiness` + `tools/silicon_lab_preflight.sh` (`--require-pass-assets`) |
+| **Lab recipe** | `lab_exec_once.sh --silicon-mladf` wires PACK/KEY/META/WTS/CTRL/REQUIRE_*/OFM/GOLDEN/AUTO_PATCH; dry-run default; apply still risk+blob |
+| **Docs** | `docs/SILICON_PATH_LAB.md` Phase C exact dry-run → apply |
+| **Live EXEC this session** | **Not claimed** — operator HITL only (sudo L3 + non-zero golden) |
 
-1. Known-good npu4/17f0 txn blob  
-2. Sudo L3 single-shot lab apply  
-3. True silicon Pass (OFM allclose on Real)
+Pure helpers: `validate_mladf_{wts,ctrl,ofm_golden}_packed_for_pass`,
+`silicon_pass_asset_readiness`, `silicon_ran_on_npu_flags_ok`,
+`check_mladf_ofm_golden_not_all_zero`, `patch_ctrl_from_meta_io_paddrs`,
+`bytes_are_all_zero`.
 
----
+## Still open (HITL)
 
-## Gates
+1. **Non-zero bf16 OFM golden** for staged key (capture from vendor run or host-ref after real WTS) — agent cannot invent Pass golden
+2. **Sudo L3** single-shot: `lab_exec_once.sh --silicon-mladf --apply --i-accept-wedge-risk …`
+3. **`ran_on_npu=true`** only after L1+L3 + EXEC+WAIT + non-zero golden allclose on silicon
+
+## Env recipe (dry-run first)
 
 ```bash
-export PATH=/usr/bin:$PATH
-unset XDNA2_ALLOW_EXEC_CMD XDNA2_LAB_OFM XDNA2_LAB_WEIGHT
-cargo fmt -- --check
-cargo clippy -- -D warnings
-cargo clippy --features amd-xdna2 -- -D warnings
-cargo clippy --features amd-xdna2,xdna2-dangerous-exec-cmd -- -D warnings
-cargo test --lib
-cargo test --features amd-xdna2 --lib
-cargo test --features amd-xdna2,xdna2-dangerous-exec-cmd --lib
-cargo check --examples --features amd-xdna2
-bash scripts/lab_exec_once.sh
-bash scripts/extract_instruction_offline.sh
-bash -n scripts/*.sh
+bash tools/export_mladf_wts.sh
+bash tools/stage_silicon_lab_assets.sh --wts-from testdata/xdna2_cmd/mladf_wts_export/wts.bin
+# export XDNA2_LAB_OFM_GOLDEN=…/nonzero_bf16_512.bin
+bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
+bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets
+# apply only with operator risk accept — exit 4 if !ran_on_npu still possible
 ```
 
-Latest local: **112** default; **337+1 ignored** amd-xdna2; synth extract OK; lab dry-run 0.
+See `docs/SILICON_PATH_LAB.md`.

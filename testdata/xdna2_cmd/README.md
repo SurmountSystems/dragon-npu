@@ -1,5 +1,15 @@
 # XDNA2 command / instruction blob staging (lab only)
 
+## Quick stage (research NOOP only)
+
+```bash
+bash scripts/materialize_txn_offline.sh
+# → lab_instr.bin classic v0.1 NOOP (valid XAie header; NOT GEMM)
+# optional: --from-aiebu for lab copy_DDR txn if Ryzen AI aiebu present
+```
+
+Pure Rust: `dragon_npu::backends::amd_xdna2::{classify_instruction_blob, build_strix_research_noop_txn}`.
+
 ## Purpose
 
 Local staging directory for **operator-captured** or **license-cleared** instruction
@@ -37,6 +47,14 @@ Typical local files (not in git):
 - `lab_instr.bin` — raw instruction BO contents  
 - `*.elf`, `*.xclbin`, `ml_txn.bin` — sources / intermediates  
 - optional `PROVENANCE.md` / `*.sha256` (may be committed if non-secret)  
+- `mladf_ref/{ifm,wts,ofm_expected}.bin` — from `bash tools/pack_mladf_ref.sh`
+  (staged a16w4 sizes; WTS may be zeros — not Pass weights)  
+
+```bash
+bash tools/pack_mladf_ref.sh
+export XDNA2_LAB_PACK=mladf_a16w4
+export XDNA2_LAB_WTS_PACKED=$PWD/testdata/xdna2_cmd/mladf_ref/wts.bin
+```
 
 ## How to set the env hook
 

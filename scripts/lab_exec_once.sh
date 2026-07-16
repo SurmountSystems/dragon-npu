@@ -33,6 +33,8 @@
 #   bash scripts/lab_exec_once.sh
 #   bash scripts/lab_exec_once.sh --help
 #   bash scripts/lab_exec_once.sh --blob /path/to.bin   # dry-run with blob preview
+#   bash scripts/lab_exec_once.sh --silicon-mladf       # dry-run + mladf env recipe preflight
+#   bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets
 #   bash scripts/lab_exec_once.sh --apply --i-accept-wedge-risk --blob /path/to.bin
 #
 # Prefer: PATH=/usr/bin:$PATH (Garuda / wild PATH hygiene).
@@ -56,6 +58,8 @@ SKIP_VERIFY=0
 ALLOW_SUSPICIOUS=0
 ALLOW_STOCK_KERNEL=0
 ALLOW_RESEARCH_BLOB=0
+SILICON_MLADF=0
+REQUIRE_PASS_ASSETS=0
 REFCNT_MAX=5
 TIMEOUT_S="${LAB_EXEC_TIMEOUT_S:-30}"
 WAIT_MS="${XDNA2_WAIT_TIMEOUT_MS:-5000}"
@@ -67,6 +71,8 @@ PRINT_SUDO_ONLY=0
 NO_BUILD=0
 ASSUME_L3_OPEN=0
 MAX_BLOB_BYTES=$((64 * 1024 * 1024)) # mirror MAX_INSTRUCTION_BLOB_BYTES
+SILICON_LAB_DIR="${SILICON_LAB_DIR:-$ROOT/testdata/xdna2_cmd/silicon_lab}"
+MLADF_KEY='mladfmatmulbias_prmptflat_mladf_2x4x4_flat_a16fw4acc16f_1_1152_256_128'
 
 # L3_WE_ENABLED=1 only when this script intentionally opened L3 (or assumed ownership).
 L3_WE_ENABLED=0
@@ -98,6 +104,12 @@ Default (no --apply): DRY-RUN / plan only
 
 Other options:
   --blob PATH              Dry-run preview or apply required path
+  --silicon-mladf          Wire staged mladf a16w4 env recipe + offline asset preflight
+                           (tools/silicon_lab_preflight.sh). Sets default --blob to
+                           SILICON_LAB_DIR/lab_instr.bin when --blob omitted.
+                           Does NOT open L3 / EXEC on dry-run.
+  --require-pass-assets    With --silicon-mladf: fail closed if WTS/CTRL/OFM golden
+                           not Pass-candidate (nonzero + sizes). Default soft-warn.
   --skip-verify            Skip verify_amdxdna_hardened_host.sh (requires --allow-stock-kernel)
   --allow-suspicious-refcnt  Apply may continue if refcnt > max (still refuse WEDGED_*)
   --allow-stock-kernel     DANGEROUS: allow apply when hardened verify fails (stock amdxdna).
@@ -120,12 +132,14 @@ Exit codes:
     (npu_direct_bench exits 0 only if ran_on_npu — usually need known-good blob)
   1 preflight refuse
   2 bad args / invalid numbers (timeout-s/wait-timeout-ms must be >=1)
+      or --require-pass-assets asset fail
   3 sudo needed
   4 process non-zero/timeout (incl. bench exit 2 = !ran_on_npu) + restore OK
   5 restore failed
 
-Honesty: apply exit 0 is rare without known-good txn; exit 4 with restore OK is
-common and does NOT mean gates left open. Need blob + OFM verify for Pass.
+Honesty: apply exit 0 is rare without known-good txn + non-zero OFM golden match;
+exit 4 with restore OK is common and does NOT mean gates left open.
+Dry-run green ≠ ran_on_npu. Need blob + OFM verify for Pass.
 EOF
 }
 
@@ -154,6 +168,8 @@ while [[ $# -gt 0 ]]; do
       BLOB="$2"
       shift 2
       ;;
+    --silicon-mladf) SILICON_MLADF=1; shift ;;
+    --require-pass-assets) REQUIRE_PASS_ASSETS=1; shift ;;
     --skip-verify) SKIP_VERIFY=1; shift ;;
     --allow-suspicious-refcnt) ALLOW_SUSPICIOUS=1; shift ;;
     --allow-stock-kernel) ALLOW_STOCK_KERNEL=1; shift ;;
@@ -215,6 +231,98 @@ fi
 if [[ "$SKIP_VERIFY" -eq 1 && "$ALLOW_STOCK_KERNEL" -ne 1 ]]; then
   die 2 "--skip-verify requires --allow-stock-kernel (skipping hardened verify is stock/NULL risk)"
 fi
+if [[ "$REQUIRE_PASS_ASSETS" -eq 1 && "$SILICON_MLADF" -ne 1 ]]; then
+  die 2 "--require-pass-assets requires --silicon-mladf"
+fi
+
+# Prefer first WTS that validates as 174080 non-zero (export may be better than staged zeros).
+pick_silicon_wts() {
+  local c
+  for c in "$@"; do
+    [[ -n "$c" && -f "$c" ]] || continue
+    if bash "$ROOT/tools/validate_mladf_wts.sh" "$c" >/dev/null 2>&1; then
+      echo "$c"
+      return 0
+    fi
+  done
+  # Fall back to first existing path (may be zero — REQUIRE_NONZERO_WTS fails closed at fill).
+  for c in "$@"; do
+    if [[ -n "$c" && -f "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  echo ""
+  return 1
+}
+
+# Wire staged silicon-path env (mladf a16w4). Does not open L3 / EXEC.
+# Only sets vars that are currently unset so operator exports win.
+apply_silicon_mladf_env() {
+  local dir="$SILICON_LAB_DIR"
+  local wts_pick
+  export SILICON_LAB_DIR="$dir"
+  if [[ -z "${XDNA2_LAB_PACK:-}" ]]; then
+    export XDNA2_LAB_PACK=mladf_a16w4
+  fi
+  if [[ -z "${XDNA2_LAB_MLADF_KEY:-}" ]]; then
+    export XDNA2_LAB_MLADF_KEY="$MLADF_KEY"
+  fi
+  if [[ -z "${XDNA2_LAB_OFM:-}" ]]; then
+    export XDNA2_LAB_OFM=1
+  fi
+  if [[ -z "${XDNA2_LAB_REQUIRE_NONZERO_WTS:-}" ]]; then
+    export XDNA2_LAB_REQUIRE_NONZERO_WTS=1
+  fi
+  if [[ -z "${XDNA2_LAB_REQUIRE_CTRL:-}" ]]; then
+    export XDNA2_LAB_REQUIRE_CTRL=1
+  fi
+  if [[ -z "${XDNA2_LAB_CTRL_AUTO_PATCH:-}" ]]; then
+    export XDNA2_LAB_CTRL_AUTO_PATCH=1
+  fi
+  if [[ -z "${XDNA2_LAB_MLADF_META:-}" && -f "$dir/lab_ctrl_meta.json" ]]; then
+    export XDNA2_LAB_MLADF_META="$dir/lab_ctrl_meta.json"
+  fi
+  if [[ -z "${XDNA2_LAB_CTRL_PACKED:-}" && -f "$dir/lab_ctrl.bin" ]]; then
+    export XDNA2_LAB_CTRL_PACKED="$dir/lab_ctrl.bin"
+  fi
+  if [[ -z "${XDNA2_LAB_WTS_PACKED:-}" ]]; then
+    # Prefer staged if non-zero, else export non-zero (not export-first when staged is good).
+    wts_pick="$(pick_silicon_wts \
+      "$dir/wts.bin" \
+      "$ROOT/testdata/xdna2_cmd/mladf_wts_export/wts.bin" || true)"
+    if [[ -n "$wts_pick" ]]; then
+      export XDNA2_LAB_WTS_PACKED="$wts_pick"
+    fi
+  fi
+  if [[ -z "${XDNA2_LAB_OFM_GOLDEN:-}" && -f "$dir/ofm_golden.bin" ]]; then
+    export XDNA2_LAB_OFM_GOLDEN="$dir/ofm_golden.bin"
+  fi
+  # Default blob to staged instr when operator omitted --blob.
+  if [[ -z "$BLOB" && -f "$dir/lab_instr.bin" ]]; then
+    BLOB="$dir/lab_instr.bin"
+  fi
+  if [[ -z "${XDNA2_INSTRUCTION_BLOB:-}" && -n "$BLOB" ]]; then
+    export XDNA2_INSTRUCTION_BLOB="$BLOB"
+  fi
+  echo "SILICON_MLADF: PACK=${XDNA2_LAB_PACK:-} KEY=${XDNA2_LAB_MLADF_KEY:-(unset)} \
+OFM=${XDNA2_LAB_OFM:-} WTS=${XDNA2_LAB_WTS_PACKED:-(unset)} \
+CTRL=${XDNA2_LAB_CTRL_PACKED:-(unset)} GOLDEN=${XDNA2_LAB_OFM_GOLDEN:-(unset)} \
+META=${XDNA2_LAB_MLADF_META:-(unset)} BLOB=${BLOB:-(unset)}"
+  if [[ -z "$BLOB" ]]; then
+    echo "SILICON_MLADF_WARN: no instruction blob — soft dry-run may still exit 0; \
+use --require-pass-assets or stage lab_instr.bin (DRY_RUN_READY=0 ≠ recipe ready)" >&2
+  fi
+}
+
+run_silicon_preflight() {
+  local args=(--dir "$SILICON_LAB_DIR" --print-env)
+  if [[ "$REQUIRE_PASS_ASSETS" -eq 1 ]]; then
+    args+=(--require-pass-assets)
+  fi
+  echo "SILICON_PREFLIGHT: tools/silicon_lab_preflight.sh ${args[*]}"
+  bash "$ROOT/tools/silicon_lab_preflight.sh" "${args[@]}"
+}
 
 # Refuse blobs staged as research-only (VE2 / NOT_AIE2_KNOWN_GOOD) unless opt-in.
 # Checks: same dir PROVENANCE.md, parent PROVENANCE.md, blob.PROVENANCE.md.
@@ -530,30 +638,40 @@ print_plan() {
 MODE: dry-run
 PREFLIGHT: verdict=$DIAG_VERDICT refcnt=$REFCNT
 BLOB_PATH: $abs_blob
+SILICON_MLADF: $SILICON_MLADF require_pass_assets=$REQUIRE_PASS_ASSETS
 WOULD enable (apply only; not executed now):
   1. cargo build --features amd-xdna2,xdna2-dangerous-exec-cmd --example $EXAMPLE
   2. [sudo] temporarily exec_cmd_allow=1 (sysfs preferred; never leave permanent)
   3. export XDNA2_ALLOW_EXEC_CMD=1
   4. export XDNA2_INSTRUCTION_BLOB=$abs_blob
   5. export XDNA2_WAIT_TIMEOUT_MS=$WAIT_MS
-  6. export XDNA2_LAB_OFM=1   # OFM decide wire (still needs known-good txn)
+  6. export XDNA2_LAB_OFM=1   # OFM decide wire (still needs known-good txn + golden)
   7. timeout ${TIMEOUT_S}s cargo run --features amd-xdna2,xdna2-dangerous-exec-cmd --example $EXAMPLE ${CARGO_EXTRA[*]}
   8. restore exec_cmd_allow=0 only if this script enabled L3; unset ALLOW / LAB_OFM
 THEN: re-run diagnose; expect exec_cmd_allow N/0 after apply we owned
 
 Honesty:
+  - Soft dry-run exit 0 means plan printed only — check silicon preflight DRY_RUN_READY
+    and --require-pass-assets for Pass asset gate (instr+WTS+CTRL+non-zero golden).
+  - Dry-run green ≠ ran_on_npu. Missing blob can still soft-exit 0 without --require-pass-assets.
   - npu_direct_bench exits 0 only if ran_on_npu; else exit 2 → this script exit 4 (if restore OK).
   - cargo build/run non-zero (incl. 101) → exit 4 after restore attempt.
   - exit 4 with restore OK is NOT product Pass and does NOT leave gates open.
-  - Need known-good blob + OFM numerical match for true Pass.
+  - Need known-good blob + non-zero OFM golden match for true Pass.
   - SIGKILL cannot run traps — verify exec_cmd_allow manually after hard kill.
 
-No state changed.
+No state changed (no L3 open, no EXEC).
 EOF
 }
 
 main() {
+  if [[ "$SILICON_MLADF" -eq 1 ]]; then
+    apply_silicon_mladf_env
+  fi
   require_apply_flags
+  if [[ "$SILICON_MLADF" -eq 1 ]]; then
+    run_silicon_preflight
+  fi
   run_diagnose
   preflight_refuse
   run_verify
@@ -592,13 +710,29 @@ main() {
   export XDNA2_LAB_OFM=1
   unset XDNA2_WAIT_ALLOW_INFINITE || true
 
-  echo "EXEC: single-shot under timeout ${TIMEOUT_S}s (example=$EXAMPLE LAB_OFM=1)"
+  # Build env array so silicon-mladf exports (PACK/WTS/CTRL/GOLDEN/…) reach cargo child.
+  local -a RUN_ENV=(
+    XDNA2_ALLOW_EXEC_CMD=1
+    "XDNA2_INSTRUCTION_BLOB=$abs_blob"
+    "XDNA2_WAIT_TIMEOUT_MS=$WAIT_MS"
+    XDNA2_LAB_OFM=1
+  )
+  if [[ "$SILICON_MLADF" -eq 1 ]]; then
+    [[ -n "${XDNA2_LAB_PACK:-}" ]] && RUN_ENV+=("XDNA2_LAB_PACK=$XDNA2_LAB_PACK")
+    [[ -n "${XDNA2_LAB_MLADF_KEY:-}" ]] && RUN_ENV+=("XDNA2_LAB_MLADF_KEY=$XDNA2_LAB_MLADF_KEY")
+    [[ -n "${XDNA2_LAB_MLADF_META:-}" ]] && RUN_ENV+=("XDNA2_LAB_MLADF_META=$XDNA2_LAB_MLADF_META")
+    [[ -n "${XDNA2_LAB_WTS_PACKED:-}" ]] && RUN_ENV+=("XDNA2_LAB_WTS_PACKED=$XDNA2_LAB_WTS_PACKED")
+    [[ -n "${XDNA2_LAB_CTRL_PACKED:-}" ]] && RUN_ENV+=("XDNA2_LAB_CTRL_PACKED=$XDNA2_LAB_CTRL_PACKED")
+    [[ -n "${XDNA2_LAB_OFM_GOLDEN:-}" ]] && RUN_ENV+=("XDNA2_LAB_OFM_GOLDEN=$XDNA2_LAB_OFM_GOLDEN")
+    [[ -n "${XDNA2_LAB_REQUIRE_NONZERO_WTS:-}" ]] && RUN_ENV+=("XDNA2_LAB_REQUIRE_NONZERO_WTS=$XDNA2_LAB_REQUIRE_NONZERO_WTS")
+    [[ -n "${XDNA2_LAB_REQUIRE_CTRL:-}" ]] && RUN_ENV+=("XDNA2_LAB_REQUIRE_CTRL=$XDNA2_LAB_REQUIRE_CTRL")
+    [[ -n "${XDNA2_LAB_CTRL_AUTO_PATCH:-}" ]] && RUN_ENV+=("XDNA2_LAB_CTRL_AUTO_PATCH=$XDNA2_LAB_CTRL_AUTO_PATCH")
+  fi
+
+  echo "EXEC: single-shot under timeout ${TIMEOUT_S}s (example=$EXAMPLE LAB_OFM=1 silicon_mladf=$SILICON_MLADF)"
   set +e
   (cd "$ROOT" && timeout "${TIMEOUT_S}s" env \
-    XDNA2_ALLOW_EXEC_CMD=1 \
-    XDNA2_INSTRUCTION_BLOB="$abs_blob" \
-    XDNA2_WAIT_TIMEOUT_MS="$WAIT_MS" \
-    XDNA2_LAB_OFM=1 \
+    "${RUN_ENV[@]}" \
     cargo run --features amd-xdna2,xdna2-dangerous-exec-cmd --example "$EXAMPLE" \
     "${CARGO_EXTRA[@]}")
   EXEC_RC=$?
@@ -616,7 +750,7 @@ main() {
     echo "EXEC: process rc=$EXEC_RC (timeout/cargo/bench non-zero) — gates restored; script exit 4"
     if [[ "$EXEC_RC" -eq 2 ]]; then
       echo "NOTE: npu_direct_bench exits 2 when ran_on_npu=false (blocked_npu_compute)."
-      echo "      That is expected without known-good txn+OFM match — not product Pass."
+      echo "      That is expected without known-good txn+non-zero OFM match — not product Pass."
     fi
     if [[ "$EXEC_RC" -eq 101 ]]; then
       echo "NOTE: cargo often exits 101 on compile/run errors — mapped to lab exit 4."

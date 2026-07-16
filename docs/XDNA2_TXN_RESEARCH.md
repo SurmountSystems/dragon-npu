@@ -1,7 +1,7 @@
 # XDNA2 instruction / txn BO research (Phase 3.5 prep)
 
-**Status:** Offline research consolidated — envelope known; **txn control-code bytes still opaque**.  
-**Date:** 2026-07-15  
+**Status:** Offline research consolidated — envelope known; **classic v0.1 XAie txn layout implemented in pure Rust**; GEMM-correct silicon txn still HITL.  
+**Date:** 2026-07-16  
 **Safety:** No EXEC_CMD by default. No silicon GEMM Pass. No proprietary bytes committed.  
 **Cross-links:** [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md) · [`XDNA2_DIRECT_CAPABILITIES.md`](./XDNA2_DIRECT_CAPABILITIES.md) · [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) · [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md)
 
@@ -60,7 +60,9 @@ There is **no** separate uAPI `AMDXDNA_BO_INSTRUCTION` CREATE_BO type; instructi
 | Timed path model WTS (`XDNA2_LAB_OFM=1` + `XDNA2_LAB_WEIGHT=1` + `XDNA2_LAB_WEIGHT_MODEL`) fail-closed MVP | Product Pass still needs known-good npu4 blob |
 | IR-native host_ref (`evaluate_host_ir` = lower + host_graph) | Still host-only (never `ran_on_npu`) |
 | Offline extract script + VE2 stage with `NOT_AIE2_KNOWN_GOOD` | VE2 nop.elf is **not** AIE2/17f0 known-good |
-| Health field `txn_op_idx` proves FW walks “txn ops” | Documented txn opcode ISA |
+| Health field `txn_op_idx` proves FW walks “txn ops” | Full CERT custom-op semantics |
+| Pure Rust `txn` module: `XAie_TxnHeader`, classic v0.1 walk, NOOP builder, ELF `.ctrltext` peel | v1.0 optimized op packing (preempt bins) full walk |
+| `build_strix_research_noop_txn` + `materialize_txn_offline.sh` | Partner npu4 GEMM `ml_txn` / shim ELF (license-cleared) |
 
 ### VE2 Runner `nop.elf` (research only — not Pass)
 
@@ -87,7 +89,7 @@ Dragon-npu:
 | `lab_decide_from_ofm_bytes` | OFM bytes → ones golden → `decide_ran_on_npu` |
 | `lab_decide_from_ofm_bytes_with_golden` | OFM vs **model** host golden (requires golden len = m·n) |
 | `select_lab_matmul_weight` / `WeightExecBind` | Pure plan + live IFM/WTS/OFM (stub-tested; WeightExecBind not RAII) |
-| `timed_matmul_direct` + `XDNA2_LAB_OFM=1` | Optional create/fill/read OFM; ones IFM/WTS default; `ran_on_npu` only if decide true |
+| `timed_matmul_direct` + `XDNA2_LAB_OFM=1` | Optional create/fill/read OFM; `XDNA2_LAB_PACK` f32_ones (default) or mladf_a16w4; `ran_on_npu` only if decide true (mladf needs `XDNA2_LAB_OFM_GOLDEN`) |
 | `+ XDNA2_LAB_WEIGHT=1` + `XDNA2_LAB_WEIGHT_MODEL` | Model WTS + ones IFM golden; **requires LAB_OFM**; MVP refuses fused/alpha≠1/bias; full alloc zero |
 
 Default (LAB_OFM unset): empty kernel args, hard-false `ran_on_npu`.
@@ -147,11 +149,46 @@ Treat captured dumps as **lab-only** until license/provenance review; default CI
 
 ---
 
+## 4b. Pure Rust XAie txn (2026-07-16)
+
+MIT `XAie_TxnHeader` (16 B LE) + classic **v0.1** op sizes validated against
+host `aiebu-asm-lib/aie2/copy_DDR_to_Mem_Tile.bin` (lab file; not in git):
+
+| Op | Size rule (v0.1) |
+|----|------------------|
+| WRITE | 24 (size field = 24) |
+| MASKWRITE / MASKPOLL / MASKPOLL_BUSY | 32 (size field = 32) |
+| BLOCKWRITE / BLOCKSET | `size` u32 at +12 (total incl. 16 B hdr) |
+| NOOP / PREEMPT | 4 |
+| CUSTOM (≥128) | `size` u32 at +4 (total) |
+
+Module: `src/backends/amd_xdna2/txn.rs`
+
+| API | Role |
+|-----|------|
+| `classify_instruction_blob` | classic / header-only / ELF `.ctrltext` / unknown |
+| `validate_txn_blob` | refuse non-txn when strict |
+| `build_strix_research_noop_txn` | CI-safe synthetic v0.1 NOOP stream |
+| `instruction_payload_bytes` | peel aiebu ELF → `.ctrltext` |
+| `load_instruction_blob_from_path` | auto-peel ELF; optional `XDNA2_INSTRUCTION_REQUIRE_TXN=1` |
+
+Offline stage (gitignored binary + provenance):
+
+```bash
+bash scripts/materialize_txn_offline.sh           # synthetic NOOP
+bash scripts/materialize_txn_offline.sh --from-aiebu  # lab copy_* txn if present
+export XDNA2_INSTRUCTION_BLOB=$PWD/testdata/xdna2_cmd/lab_instr.bin
+export XDNA2_INSTRUCTION_REQUIRE_TXN=1   # optional strict
+```
+
+**Honesty:** synthetic NOOP / DMA copy helper txn ≠ GEMM OFM Pass.
+
 ## 5. Mapping to dragon-npu hooks
 
 | Hook | Location | Role |
 |------|----------|------|
-| `decode_instruction_hex` / `load_instruction_blob_from_{path,env}` | `direct.rs` | Pure/FS load; env `XDNA2_INSTRUCTION_BLOB` / `_HEX` |
+| `classify_instruction_blob` / `validate_txn_blob` / `build_*_noop_txn` | `txn.rs` | Pure XAie format |
+| `decode_instruction_hex` / `load_instruction_blob_from_{path,env}` | `direct.rs` | Pure/FS load; env `XDNA2_INSTRUCTION_BLOB` / `_HEX`; ELF peel |
 | `write_bo_bytes` / `fill_cmd_bo_with_payload` | `direct.rs` | Host fill before EXEC (required) |
 | `build_ert_start_npu_cmd_bo` | `direct.rs` | Offline envelope; points at inst `xdna_addr` |
 | `submit_and_wait_command` | `direct.rs` | L1-gated EXEC + finite WAIT |

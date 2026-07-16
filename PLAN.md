@@ -1,6 +1,27 @@
 # DragonNPU Rust Rewrite Plan
 
-## Latest (final re-review polish)
+## Latest (Milestone C — Live L3 EXEC + OFM → ran_on_npu plumbing)
+- **Done:** airtight Pass criteria (`silicon_ran_on_npu_flags_ok` + decide + classify); OFM golden offline validate (Rust + `tools/validate_mladf_ofm_golden.sh`); `tools/silicon_lab_preflight.sh` + `lab_exec_once --silicon-mladf` / `--require-pass-assets`; SILICON_PATH_LAB Phase C exact dry-run→apply.
+- **Honesty:** dry-run green ≠ `ran_on_npu`; no default-test EXEC/ALLOW; live sudo EXEC **not** claimed this turn.
+- **Next (HITL):** operator non-zero OFM golden + sudo L3 apply → allclose → `ran_on_npu`.
+
+## Previous (Milestone B — control packet BO ~29 KB)
+- **Done:** `validate_mladf_ctrl_packed_for_pass` + `tools/validate_mladf_ctrl.sh`; stage size+validate lab_ctrl 29664; REQUIRE_CTRL pack-mode refuse unset; meta patch location parse + pure u64 LE apply; Phase B docs.
+- **Residual:** size=6 `read_add_write` not full XRT; ctrl attach ≠ Pass.
+
+## Previous (Milestone A — real AMD-packed WTS)
+- **Done:** `tools/export_mladf_wts.{cpp,sh}` (DD `export_const_params` → 174080 non-zero); `validate_mladf_wts.sh`; stage `--export-wts`; Rust REQUIRE_NONZERO gates + tests; SILICON_PATH_LAB Phase A commands.
+
+## Previous (silicon residual A/B/C — offline plumbing)
+- **A:** WTS load + `validate_mladf_wts_packed_for_pass`; stage refuses zero `--wts-from`; AMD shuffle still vendor.
+- **B:** ctrl BO attach + kernel-arg count 4; timed path pins CTRL.
+- **C:** lab recipe + fail-closed zero WTS/golden; live EXEC = operator HITL.
+- **Next (HITL):** real AMD-packed WTS; non-zero OFM golden; sudo L3; `ran_on_npu` only after allclose.
+
+## Previous (WP0 — mladf kernel contract + fixtures)
+- Doc + dump sibling `*_ctrl_meta.json` + pure parse M/K/N/Gs → staged IFM/WTS/OFM 2304/174080/512.
+
+## Previous (final re-review polish)
 - Full BO alloc zero; ofm_decide_error; weight path stub tests; CI synth extract + dangerous clippy; LAB_WEIGHT MVP limits enforced.
 - **Next:** npu4 known-good txn HITL; sudo L3 apply; silicon Pass.
 
