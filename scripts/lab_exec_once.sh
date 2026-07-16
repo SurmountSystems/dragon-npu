@@ -105,8 +105,9 @@ Default (no --apply): DRY-RUN / plan only
 Other options:
   --blob PATH              Dry-run preview or apply required path
   --silicon-mladf          Wire staged mladf a16w4 env recipe + offline asset preflight
-                           (tools/silicon_lab_preflight.sh). Sets default --blob to
-                           SILICON_LAB_DIR/lab_instr.bin when --blob omitted.
+                           (tools/silicon_lab_preflight.sh). Default --blob prefers
+                           SILICON_LAB_DIR/lab_instr.elf (aiebu) over lab_instr.bin;
+                           raw .bin auto-upgrades to sibling .elf when present.
                            Does NOT open L3 / EXEC on dry-run.
   --require-pass-assets    With --silicon-mladf: fail closed if WTS/CTRL/OFM golden
                            not Pass-candidate (nonzero + sizes). Default soft-warn.
@@ -299,19 +300,54 @@ apply_silicon_mladf_env() {
     export XDNA2_LAB_OFM_GOLDEN="$dir/ofm_golden.bin"
   fi
   # Default blob to staged instr when operator omitted --blob.
-  if [[ -z "$BLOB" && -f "$dir/lab_instr.bin" ]]; then
+  # Prefer aiebu ELF (rela-patchable) over raw DD txn — raw causes APP_LOAD_PDI_FAIL.
+  if [[ -z "$BLOB" && -f "$dir/lab_instr.elf" ]]; then
+    BLOB="$dir/lab_instr.elf"
+  elif [[ -z "$BLOB" && -f "$dir/lab_instr.bin" ]]; then
     BLOB="$dir/lab_instr.bin"
+  fi
+  # Force .bin → sibling .elf when present (absolute or relative --blob).
+  # Live 2026-07-16: raw 1688 B txn → ert_state=5 Error / APP_LOAD_PDI_FAIL;
+  # aiebu ELF + rela patch is required for PDI load.
+  if [[ -n "$BLOB" ]]; then
+    local blob_base elf_sib
+    blob_base="${BLOB%.bin}"
+    if [[ "$BLOB" == *.bin || "$BLOB" == *.BIN ]]; then
+      elf_sib="${blob_base}.elf"
+      if [[ -f "$elf_sib" ]]; then
+        echo "NOTE: upgrading raw txn → aiebu ELF for rela patch: $elf_sib" >&2
+        BLOB="$elf_sib"
+      else
+        echo "SILICON_MLADF_WARN: blob is raw .bin and no sibling .elf at $elf_sib" >&2
+        echo "  stage with: bash tools/stage_aiebu_lab_instr.sh" >&2
+        echo "  raw DD txn typically → FW APP_LOAD_PDI_FAIL (0x3000003); ≠ ran_on_npu" >&2
+      fi
+    fi
+  fi
+  # Also honor pre-exported XDNA2_INSTRUCTION_BLOB if operator only set env.
+  if [[ -z "$BLOB" && -n "${XDNA2_INSTRUCTION_BLOB:-}" ]]; then
+    BLOB="$XDNA2_INSTRUCTION_BLOB"
   fi
   if [[ -z "${XDNA2_INSTRUCTION_BLOB:-}" && -n "$BLOB" ]]; then
     export XDNA2_INSTRUCTION_BLOB="$BLOB"
+  elif [[ -n "$BLOB" ]]; then
+    # Keep env in sync after .bin→.elf upgrade (child cargo uses env).
+    export XDNA2_INSTRUCTION_BLOB="$BLOB"
+  fi
+  local blob_sz="?"
+  if [[ -n "$BLOB" && -f "$BLOB" ]]; then
+    blob_sz="$(wc -c <"$BLOB" | tr -d ' ')"
   fi
   echo "SILICON_MLADF: PACK=${XDNA2_LAB_PACK:-} KEY=${XDNA2_LAB_MLADF_KEY:-(unset)} \
 OFM=${XDNA2_LAB_OFM:-} WTS=${XDNA2_LAB_WTS_PACKED:-(unset)} \
 CTRL=${XDNA2_LAB_CTRL_PACKED:-(unset)} GOLDEN=${XDNA2_LAB_OFM_GOLDEN:-(unset)} \
-META=${XDNA2_LAB_MLADF_META:-(unset)} BLOB=${BLOB:-(unset)}"
+META=${XDNA2_LAB_MLADF_META:-(unset)} BLOB=${BLOB:-(unset)} size=${blob_sz}"
+  if [[ -n "$BLOB" && "$BLOB" == *.bin ]]; then
+    echo "SILICON_MLADF_WARN: still on raw .bin (size=${blob_sz}) — expect ert_cmd_error / OFM zeros" >&2
+  fi
   if [[ -z "$BLOB" ]]; then
     echo "SILICON_MLADF_WARN: no instruction blob — soft dry-run may still exit 0; \
-use --require-pass-assets or stage lab_instr.bin (DRY_RUN_READY=0 ≠ recipe ready)" >&2
+use --require-pass-assets or stage lab_instr.elf (DRY_RUN_READY=0 ≠ recipe ready)" >&2
   fi
 }
 
@@ -347,10 +383,48 @@ blob_has_not_aie2_provenance() {
   return 1
 }
 
+# Silicon-mladf: refuse raw classic DD txn when aiebu ELF sibling exists (or
+# blob is clearly unpatched 1688 B txn without ELF magic). Live 2026-07-16:
+# raw lab_instr.bin → ert_state=5 Error / APP_LOAD_PDI_FAIL.
+refuse_raw_txn_blob_on_silicon_apply() {
+  [[ "$MODE" == "apply" ]] || return 0
+  [[ "$SILICON_MLADF" -eq 1 ]] || return 0
+  [[ -n "$BLOB" && -f "$BLOB" ]] || return 0
+  local magic="" sz=0
+  magic="$(od -An -tx1 -N4 "$BLOB" 2>/dev/null | tr -d ' \n' || true)"
+  sz="$(wc -c <"$BLOB" | tr -d ' ')"
+  if [[ "$magic" == "7f454c46" ]]; then
+    return 0
+  fi
+  # Try sibling .elf one more time
+  if [[ "$BLOB" == *.bin && -f "${BLOB%.bin}.elf" ]]; then
+    echo "NOTE: apply upgrading raw txn → ${BLOB%.bin}.elf" >&2
+    BLOB="${BLOB%.bin}.elf"
+    export XDNA2_INSTRUCTION_BLOB="$BLOB"
+    return 0
+  fi
+  local sib_dir sib
+  sib_dir="$(dirname -- "$BLOB")"
+  sib="$sib_dir/lab_instr.elf"
+  if [[ -f "$sib" ]]; then
+    echo "NOTE: apply using staged aiebu ELF: $sib" >&2
+    BLOB="$sib"
+    export XDNA2_INSTRUCTION_BLOB="$BLOB"
+    return 0
+  fi
+  die 2 "silicon-mladf apply refuses raw instruction blob (magic=$magic size=$sz).
+  Stage aiebu ELF first:
+    bash tools/stage_aiebu_lab_instr.sh
+  Prefer:
+    bash tools/hitl_c_pass_apply.sh
+  Raw DD txn (e.g. 1688 B lab_instr.bin) → FW APP_LOAD_PDI_FAIL; ≠ ran_on_npu."
+}
+
 require_apply_flags() {
   [[ "$MODE" == "apply" ]] || return 0
   [[ "$ACCEPT_RISK" -eq 1 ]] || die 2 "--apply requires --i-accept-wedge-risk (wedge/oops risk)"
   [[ -n "$BLOB" ]] || die 2 "--apply requires --blob PATH (see scripts/capture_instruction_blob_checklist.md)"
+  refuse_raw_txn_blob_on_silicon_apply
   [[ -f "$BLOB" ]] || die 2 "blob is not a regular file: $BLOB"
   [[ -s "$BLOB" ]] || die 2 "blob is empty: $BLOB"
   local sz
@@ -463,9 +537,14 @@ preflight_refuse() {
 run_verify() {
   [[ "$SKIP_VERIFY" -eq 1 ]] && return 0
   local rc=0
+  local verify_extra=()
+  # Intentional L3 window: do not hard-fail solely because exec_cmd_allow is open.
+  if [[ "$ASSUME_L3_OPEN" -eq 1 ]]; then
+    verify_extra+=(--allow-open-exec-cmd)
+  fi
   if [[ -x "$ROOT/scripts/verify_amdxdna_hardened_host.sh" ]]; then
     set +e
-    bash "$ROOT/scripts/verify_amdxdna_hardened_host.sh" --quiet
+    bash "$ROOT/scripts/verify_amdxdna_hardened_host.sh" --quiet "${verify_extra[@]}"
     rc=$?
     set -e
   else
@@ -478,13 +557,18 @@ run_verify() {
         echo "VERIFY_WARN: hardened verify failed (rc=$rc); continuing ONLY because --allow-stock-kernel (DANGEROUS stock amdxdna NULL risk)" >&2
       else
         die 1 "verify_amdxdna_hardened_host failed (rc=$rc). Refuse apply. \
-To override intentionally: pass --allow-stock-kernel (LAB_EXEC_ALLOW_STOCK=1 alone is NOT enough)."
+To override intentionally: pass --allow-stock-kernel (LAB_EXEC_ALLOW_STOCK=1 alone is NOT enough). \
+If L3 is already open for a lab window: use --assume-l3-already-open (passes --allow-open-exec-cmd to verify)."
       fi
     else
       echo "VERIFY_WARN: hardened verify failed (rc=$rc); dry-run continues"
     fi
   else
-    echo "VERIFY: hardened host OK"
+    if [[ "$ASSUME_L3_OPEN" -eq 1 ]]; then
+      echo "VERIFY: hardened host OK (open exec_cmd_allow allowed under --assume-l3-already-open)"
+    else
+      echo "VERIFY: hardened host OK"
+    fi
   fi
 }
 
@@ -495,8 +579,11 @@ print_human_enable() {
 sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # expect Y or 1
 
-# Then re-run apply with the same flags, optionally:
-#   --assume-l3-already-open
+# Then re-run apply with the SAME flags PLUS --assume-l3-already-open
+# (required so verify does not refuse exec_cmd_allow=Y):
+#   bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets \
+#     --apply --i-accept-wedge-risk --assume-l3-already-open \
+#     --blob testdata/xdna2_cmd/silicon_lab/lab_instr.elf
 
 # After lab (MANDATORY):
 sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
@@ -634,6 +721,16 @@ print_plan() {
   if [[ -n "$BLOB" ]]; then
     abs_blob="$(readlink -f "$BLOB" 2>/dev/null || echo "$BLOB")"
   fi
+  local shape_note=""
+  if [[ "$SILICON_MLADF" -eq 1 ]]; then
+    shape_note="
+SHAPE NOTE (silicon-mladf):
+  Example args ${CARGO_EXTRA[*]} are probe placeholders only.
+  XDNA2_LAB_PACK=mladf_a16w4 overrides compute layout from staged key/meta
+  (typical M=1 K=1152 N=256 Gs=128; IFM=2304 WTS=174080 OFM=512 bf16).
+  TimedOpResult reports plan M/N/K — do not read m=n=k=1 as the silicon GEMM shape.
+"
+  fi
   cat <<EOF
 MODE: dry-run
 PREFLIGHT: verdict=$DIAG_VERDICT refcnt=$REFCNT
@@ -649,7 +746,7 @@ WOULD enable (apply only; not executed now):
   7. timeout ${TIMEOUT_S}s cargo run --features amd-xdna2,xdna2-dangerous-exec-cmd --example $EXAMPLE ${CARGO_EXTRA[*]}
   8. restore exec_cmd_allow=0 only if this script enabled L3; unset ALLOW / LAB_OFM
 THEN: re-run diagnose; expect exec_cmd_allow N/0 after apply we owned
-
+$shape_note
 Honesty:
   - Soft dry-run exit 0 means plan printed only — check silicon preflight DRY_RUN_READY
     and --require-pass-assets for Pass asset gate (instr+WTS+CTRL+non-zero golden).
@@ -659,6 +756,8 @@ Honesty:
   - exit 4 with restore OK is NOT product Pass and does NOT leave gates open.
   - Need known-good blob + non-zero OFM golden match for true Pass.
   - SIGKILL cannot run traps — verify exec_cmd_allow manually after hard kill.
+  - Optional: XDNA2_LAB_BO_DIAG=1 always attaches DevHeap/instr GET_BO_INFO in detail
+    (submit failures already dump bo_diag; journal 0x106 / map_host → status exec_eio).
 
 No state changed (no L3 open, no EXEC).
 EOF
@@ -729,6 +828,12 @@ main() {
     [[ -n "${XDNA2_LAB_CTRL_AUTO_PATCH:-}" ]] && RUN_ENV+=("XDNA2_LAB_CTRL_AUTO_PATCH=$XDNA2_LAB_CTRL_AUTO_PATCH")
   fi
 
+  if [[ "$SILICON_MLADF" -eq 1 ]]; then
+    echo "SHAPE NOTE (silicon-mladf apply): example args ${CARGO_EXTRA[*]} are probe placeholders only."
+    echo "  XDNA2_LAB_PACK=mladf_a16w4 overrides compute layout from staged key/meta"
+    echo "  (typical M=1 K=1152 N=256; IFM=2304 WTS=174080 OFM=512 bf16)."
+    echo "  TimedOpResult reports plan M/N/K — do not read m=n=k=1 as the silicon GEMM shape."
+  fi
   echo "EXEC: single-shot under timeout ${TIMEOUT_S}s (example=$EXAMPLE LAB_OFM=1 silicon_mladf=$SILICON_MLADF)"
   set +e
   (cd "$ROOT" && timeout "${TIMEOUT_S}s" env \

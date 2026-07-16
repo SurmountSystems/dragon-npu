@@ -112,6 +112,21 @@ jobs:
           bash -n scripts/lab_exec_once.sh
           bash -n scripts/extract_instruction_offline.sh
           bash -n scripts/inventory_txn_sources.sh
+          bash -n tools/silicon_lab_operator.sh
+          bash -n tools/silicon_lab_preflight.sh
+      - name: silicon_lab_operator unknown-cmd refuse
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          set +e
+          bash tools/silicon_lab_operator.sh not-a-real-cmd
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "expected exit 2 for unknown operator cmd, got $rc" >&2
+            exit 1
+          fi
+          echo "operator unknown-cmd refuse rc=2 OK"
       - name: inventory_txn_sources smoke (exit 0)
         run: |
           set -euo pipefail

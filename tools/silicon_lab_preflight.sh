@@ -3,7 +3,7 @@
 #
 # Checks staged mladf a16w4 assets under SILICON_LAB_DIR (default
 # testdata/xdna2_cmd/silicon_lab) and/or env paths:
-#   - instruction blob (lab_instr.bin or XDNA2_INSTRUCTION_BLOB)
+#   - instruction blob (lab_instr.elf preferred, or lab_instr.bin / XDNA2_INSTRUCTION_BLOB)
 #   - WTS 174080 non-zero (validate_mladf_wts) — prefers first Pass-candidate
 #   - CTRL 29664 non-zero (validate_mladf_ctrl)
 #   - OFM golden 512/1024 non-zero when path set / --require-pass-assets
@@ -115,7 +115,23 @@ pick_pass_candidate_wts() {
   return 1
 }
 
-INSTR="$(resolve_path "${XDNA2_INSTRUCTION_BLOB:-}" lab_instr.bin)"
+# Prefer aiebu ELF (rela-patchable) over raw DD txn for EXEC.
+if [[ -n "${XDNA2_INSTRUCTION_BLOB:-}" && -f "${XDNA2_INSTRUCTION_BLOB}" ]]; then
+  INSTR="$XDNA2_INSTRUCTION_BLOB"
+  # Auto-upgrade raw .bin → sibling .elf when present (same as lab_exec_once).
+  if [[ "$INSTR" == *.bin || "$INSTR" == *.BIN ]]; then
+    elf_sib="${INSTR%.bin}.elf"
+    elf_sib="${elf_sib%.BIN}.elf"
+    if [[ -f "$elf_sib" ]]; then
+      echo "NOTE: preflight upgrading raw txn → aiebu ELF: $elf_sib" >&2
+      INSTR="$elf_sib"
+    fi
+  fi
+elif [[ -f "$DIR/lab_instr.elf" ]]; then
+  INSTR="$DIR/lab_instr.elf"
+else
+  INSTR="$(resolve_path "" lab_instr.bin)"
+fi
 # WTS precedence: explicit env → first Pass-candidate among staged / export.
 EXPORT_WTS="$ROOT/testdata/xdna2_cmd/mladf_wts_export/wts.bin"
 STAGED_WTS=""
@@ -158,7 +174,7 @@ META_OK=0
 # --- instruction ---
 if [[ -z "$INSTR" || ! -f "$INSTR" ]]; then
   if [[ "$REQUIRE_PASS" -eq 1 ]]; then
-    fail "instruction blob missing (stage lab_instr.bin or set XDNA2_INSTRUCTION_BLOB)"
+    fail "instruction blob missing (stage lab_instr.elf via tools/stage_aiebu_lab_instr.sh)"
   fi
   warn "instruction blob missing"
 else
@@ -169,10 +185,25 @@ else
     fi
     warn "instruction blob empty: $INSTR"
   else
-    if [[ -n "$EXPECT_INSTR" && "$isz" != "$EXPECT_INSTR" ]]; then
-      warn "instruction size $isz != staged expect $EXPECT_INSTR (may still be valid txn)"
+    is_elf=0
+    if [[ "$isz" -ge 4 ]]; then
+      magic="$(od -An -tx1 -N4 "$INSTR" | tr -d ' \n')"
+      # 7f 45 4c 46 = ELF
+      if [[ "$magic" == "7f454c46" ]]; then
+        is_elf=1
+      fi
     fi
-    ok "instr path=$INSTR size=$isz"
+    if [[ "$is_elf" -eq 1 ]]; then
+      ok "instr path=$INSTR size=$isz (aiebu ELF — preferred for EXEC/rela patch)"
+    elif [[ -n "$EXPECT_INSTR" && "$isz" != "$EXPECT_INSTR" ]]; then
+      warn "instruction size $isz != staged expect $EXPECT_INSTR (may still be valid txn)"
+      ok "instr path=$INSTR size=$isz"
+    else
+      if [[ "$INSTR" == *.bin ]]; then
+        warn "raw lab_instr.bin (no ELF) — EXEC often APP_LOAD_PDI_FAIL; stage lab_instr.elf"
+      fi
+      ok "instr path=$INSTR size=$isz"
+    fi
     INSTR_OK=1
   fi
 fi
@@ -307,7 +338,7 @@ if [[ "$PRINT_ENV" -eq 1 ]]; then
   cat <<EOF
 
 # --- env recipe (export in your shell; dry-run first) ---
-export XDNA2_INSTRUCTION_BLOB=$( [[ -n "$INSTR" ]] && abs "$INSTR" || echo "$DIR/lab_instr.bin" )
+export XDNA2_INSTRUCTION_BLOB=$( [[ -n "$INSTR" ]] && abs "$INSTR" || echo "$DIR/lab_instr.elf" )
 export XDNA2_LAB_OFM=1
 export XDNA2_LAB_PACK=mladf_a16w4
 export XDNA2_LAB_MLADF_KEY='$KEY'

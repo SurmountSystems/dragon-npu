@@ -1,3 +1,80 @@
+Latest Turn (HITL B/C runners + offline GT oracle — unstick ping-pong):
+- **You run:** `bash tools/hitl_b_gt_capture.sh` (B, offline±vendor) then later
+  `bash tools/hitl_c_pass_apply.sh` (C, ELF-only Pass apply). Doc: `docs/HITL_BC.md`.
+- **Offline GT:** `examples/dump_mladf_gt_offline.rs` → `gt_capture/` (12 rela patched,
+  ctrl meta patch, kernel_args count4/xrt3, MANIFEST). No L3.
+- **Hardening:** lab_exec silicon apply refuses raw txn; operator apply prefers `.elf`;
+  `silicon_contract_check.sh` + operator `check` / `gt-offline`.
+- **Strategy:** agent continues A-work offline; ≤2 HITL sessions (B then C).
+- **Still open:** silicon Pass after C with ELF+rela; no `ran_on_npu` claimed.
+
+Latest Turn (HITL log: still raw .bin — not aiebu ELF):
+- **User apply:** `lab_instr.bin` size=1688 → `ert_cmd_error` / `ert_state=5(Error)` /
+  OFM all zeros. Detail has **no** `aiebu_elf=1` / `aiebu_rela_patched` (raw DD txn path).
+- **Root cause for this run:** EXEC of unpatched raw txn (known → APP_LOAD_PDI_FAIL
+  0x3000003). Staged `lab_instr.elf` (32264 B, `.ctrltext`+`.rela.dyn` 12 entries) was not used.
+- **Hardening:** `lab_exec_once` + `silicon_lab_preflight` auto-upgrade `.bin`→sibling `.elf`;
+  SILICON_MLADF prints BLOB size; docs prefer `lab_instr.elf`.
+- **Next HITL:** re-apply with ELF (omit `--blob` or pass `.elf`); expect
+  `BLOB size=32264`, `aiebu_elf=1`, `aiebu_rela_patched ctrltext=1688B`, then
+  `ert_state=4(Completed)` and/or non-zero OFM.
+- **Still open:** silicon Pass (`ran_on_npu`) after ELF+rela path.
+
+Latest Turn (D3e HITL: ert_state=Error + xrt3 layout trial):
+- **Live:** `ert_state=5(Error)` — WAIT ok but **FW rejected job** (zero OFM expected).
+  status now classifies `ert_cmd_error`. map_host/align still OK.
+- **Next trial:** `XDNA2_LAB_KERNEL_ARG_LAYOUT=xrt3` (n_bos=3 IFM/WTS/OFM; ctrl pin+patch only)
+  vs default `count4` (ctrl as 4th paddr). Detail shows `layout=xrt3|count4`.
+- Optional FW status: dyndbg `module amdxdna +p` → journal `Response status 0x…`.
+- Gates: fmt; clippy -D amd-xdna2; pack layout tests.
+- **Still open:** layout that yields `ert_state=Completed` + non-zero OFM → `ran_on_npu`.
+
+Latest Turn (post-D3d re-apply still zero OFM + ERT state diag):
+- **HITL after D3d:** still `ofm_verify_failed`, `raw_nonzero_bytes=0`; map_host/align OK.
+- **Diag:** WAIT ioctl ≠ FW COMPLETED — read Cmd BO ERT state before destroy;
+  `ert_state=N(Name)` + `io_paddrs ifm/wts/ofm/ctrl` in detail; `submit_wait_ok` requires
+  ERT Completed when readable.
+- Gates: fmt; clippy -D amd-xdna2; ert unit test.
+- **Still open:** HITL re-apply → note `ert_state=Completed` vs `Error`; if Completed+zero OFM
+  then bind/patch residual (not map_host).
+
+Latest Turn (D3d — ctrl size=6 read_add_write after EXEC accepted):
+- **Live:** D3c worked — DevHeap `vaddr=0x7fc3b4000000` 64 MiB-aligned; `EXEC_CMD+WAIT seq=0 accepted`; no new map_host errors.
+- **Fail:** `ofm_verify_failed` / OFM **all zero** vs non-zero golden (`max_abs_diff=1.0`).
+- **Root cause:** staged ctrl fields hold **tile offsets** (OFM `0x100`, WTS `0x15400`);
+  meta `operation=read_add_write` `size=6` means add BO base — lab u64 overwrite wiped them.
+- **Fix:** `apply_ctrl_patch_location` + `patch_ctrl_from_meta_io_paddrs` do size-aware
+  read/add/write (6 bytes only; overflow refuse).
+- Gates: fmt; clippy -D amd-xdna2; **414+1** lib.
+- **Still open:** HITL re-apply → non-zero OFM + golden allclose → `ran_on_npu`.
+
+Latest Turn (D3c — DevHeap UVA 64 MiB align for MAP_HOST_BUFFER):
+- **Live root cause:** all BO `valid_addr=true` after D2/D2b; still `exec_eio`; journal
+  `aie2_map_host_buf hwctx … addr 0x7f3515400000 size 0x4000000` → FW `0x4000003`
+  (`AIE2_STATUS_INVALID_PARAM`). UVA was 2 MiB-aligned, **not 64 MiB-aligned**.
+- **Fix:** `mmap_dev_heap_drm_aligned` (XRT `mmap_ptr` + `heap_page_size` parity):
+  reserve anon VA, trim to 64 MiB-aligned window, `MAP_FIXED` DRM DevHeap.
+  Helpers: `AIE2_DEV_HEAP_UVA_ALIGN`, `is_dev_heap_uva_aligned`, `next_aligned_addr_usize`.
+- **Docs:** SILICON_PATH_LAB D3c; RESIDUAL D3c landed / HITL re-apply.
+- Gates: fmt; clippy -D amd-xdna2; **413+1** lib.
+- **Still open:** HITL re-apply → aligned DevHeap vaddr + map_host clear → OFM `ran_on_npu`.
+
+Latest Turn (review closeout 5ec798b4 Issues 1–12):
+- **Bugs:** write_dev_bo hold lock (UAF); ensure_dev_heap never Ok untracked mmap; `exec_cmd_requires_filled_cmd_bo`; OFM dump uses env golden; status preflight readiness; tests/classify/CI bash -n operator.
+- **SHMEM PASID pin:** keep mmap after write_bo (map_host offline mitigation); still HITL for live 0x106.
+- **apply** post-check exec_cmd_allow; capture-golden warn if L3 open; apply shape note.
+- Gates: fmt; clippy -D amd-xdna2; **411+1** lib; bash -n operator/lab_exec.
+- **Still open:** HITL re-apply → map_host clear / submit OK → OFM `ran_on_npu`.
+
+Latest Turn (Phase D3/E1/F1/G residual offline — map_host diag + operator UX):
+- **D3:** `format_bo_info_diag` / `collect_lab_bo_diag` / `lab_bo_diag_env_enabled`; submit-fail + invalid-addr dump DevHeap+instr; `XDNA2_LAB_BO_DIAG=1` always-on; trait `tracked_dev_heap_handle`.
+- **E1:** `format_ofm_mismatch_stats` on decide refuse/error (nonzero, first bf16/f32); never Pass claim.
+- **F1:** `silicon_lab_operator.sh apply` + status exec_cmd_allow/readiness; dry-run silicon shape note (not m=n=k=1).
+- **G1:** tiles already via `suggest_hwctx_tiles` (env wins). **G2:** BO reuse residual documented only.
+- **Docs:** SILICON_PATH_LAB 0x106 fingerprints; RESIDUAL rewrite; DIRECT_CAPABILITIES `XDNA2_LAB_BO_DIAG`.
+- Gates: fmt; clippy -D amd-xdna2; lib tests; bash -n operator/lab_exec.
+- **Still open:** HITL re-apply after D2 → map_host clear; OFM allclose → `ran_on_npu`.
+
 Latest Turn (Milestone C review closeout Issues 1–7):
 - **Issue 1 (bug):** `decide_ran_on_npu` → `AllZeroGolden` always refuse product Pass; ALLOW_ZERO only offline resolve.
 - **Issue 2 (bug):** shell golden ALLOW exits **3** (not 0); `XDNA2_LAB_ALLOW_ZERO_GOLDEN` (+ legacy); require-pass unsets ALLOW.
@@ -34,6 +111,13 @@ Latest Turn (Milestone A — real AMD-packed WTS):
 - **Honesty:** gitignore export bins; packing ≠ Pass / ≠ `ran_on_npu`.
 - Gates: fmt; clippy -D amd-xdna2; **392+1** lib; bash -n export/validate/stage; live export 174080/149120 nonzero.
 - **Still open:** non-zero OFM golden; sudo L3 EXEC → `ran_on_npu` only after allclose.
+
+Latest Turn (Phase D P0 — unblock pure-direct EXEC):
+- **D1:** `is_valid_xdna_device_addr` refuses 0 + `u64::MAX`; timed path `inst_blob_addr_invalid`.
+- **D2:** instruction BO `BufferType::Dev` (XRT parity); `write_dev_bo_via_heap` via DevHeap mmap.
+- **D4:** EXEC errors drop stale “payload not implemented”; classify `exec_eio` for EIO/map_host.
+- Gates: clippy -D amd-xdna2; unit tests for addr + classify + timed_matmul stubs.
+- **Next HITL:** re-apply lab_exec_once silicon path; watch journal for 0x106 / valid xdna_addr.
 
 Latest Turn (silicon residual A/B/C offline plumbing):
 - **A WTS:** `validate_mladf_wts_packed_for_pass` (len+non-zero); stage refuses all-zero `--wts-from`; docs for `export_const_params` / capture (no fake shuffle).

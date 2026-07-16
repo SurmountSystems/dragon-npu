@@ -541,16 +541,17 @@ pub enum CtrlPatchBufferRole {
 
 /// One meta `control_packet_patch_locations[]` entry.
 ///
-/// Staged AMD meta uses `operation: "read_add_write"` and `size: 6`. Lab pure
-/// patch [`super::lab_io::patch_ctrl_packet_u64_le`] overwrites **8** LE bytes
-/// at `offset` — not a proven firmware-accurate apply of 6-byte `read_add_write`.
+/// Staged AMD meta uses `operation: "read_add_write"` and `size: 6`. Live apply
+/// is [`super::lab_io::apply_ctrl_patch_location`]: read existing LE field, **add**
+/// BO base paddr, write back `size` bytes (preserves tile sub-offsets like OFM
+/// `0x100` / WTS `0x15400`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtrlPatchLocation {
     /// Byte offset into the control packet.
     pub offset: usize,
-    /// Meta `size` field (often 6). Lab u64 LE write still needs `offset+8` in range.
+    /// Meta `size` field (often 6 = 48-bit LE address field).
     pub size: u32,
-    /// Meta `operation` (e.g. `read_add_write`). Informational for residual fidelity.
+    /// Meta `operation` (e.g. `read_add_write`).
     pub operation: String,
 }
 
@@ -622,11 +623,7 @@ fn parse_patch_locations_array(arr: &Value) -> Result<Vec<CtrlPatchLocation>, Di
 ///
 /// Walks `external_buffers.*.control_packet_patch_locations` and nested
 /// `coalesed_buffers[].control_packet_patch_locations`. Does **not** apply
-/// patches; use [`ctrl_u64_patches_for_io_paddrs`] + lab `patch_ctrl_packet_u64_le`.
-///
-/// **Residual:** meta `size=6` + `read_add_write` is not fully modeled. Pure
-/// lab path overwrites u64 LE at each offset. Do not invent wrong offsets beyond
-/// what meta lists.
+/// patches; use lab `patch_ctrl_from_meta_io_paddrs` (size=6 `read_add_write`).
 ///
 /// # Errors
 ///

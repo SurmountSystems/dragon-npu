@@ -1,6 +1,23 @@
 # DragonNPU Rust Rewrite Plan
 
-## Latest (Milestone C — Live L3 EXEC + OFM → ran_on_npu plumbing)
+## Latest (D3d — ctrl read_add_write after EXEC OK / zero OFM)
+- **Live:** D3c → EXEC+WAIT accepted; OFM all zeros (`ofm_verify_failed`).
+- **Root cause:** meta size=6 `read_add_write` must **add** tile offsets (OFM `0x100`, WTS `0x15400`); u64 overwrite wiped them.
+- **Code:** `apply_ctrl_patch_location` + meta apply path size-aware.
+- **Next (HITL):** re-apply → non-zero OFM + golden allclose → `ran_on_npu`.
+
+## Previous (D3c — DevHeap 64 MiB-aligned UVA for map_host)
+- **Root cause (live journal):** `MAP_HOST_BUFFER` size 64 MiB at UVA `0x7f3515400000` → FW `0x4000003`; need UVA `% 0x4000000 == 0` (XRT heap_page_size).
+- **Code:** `mmap_dev_heap_drm_aligned` in `ensure_dev_heap`; pure align helpers + tests.
+- **Honesty:** no ALLOW=1; no silicon Pass claimed until HITL re-apply + OFM allclose.
+
+## Previous (Phase D3/E1/F1 offline — BO diag + OFM stats + operator apply)
+- **D3:** BO GET_BO_INFO diag on submit failure / invalid instr addr; `XDNA2_LAB_BO_DIAG=1`; kernel 0x106 fingerprints in SILICON_PATH_LAB.
+- **E1:** OFM dump-on-mismatch stats in timed detail; decide path still wired; no Pass claim.
+- **F1:** `silicon_lab_operator.sh apply` + status readiness; dry-run shape honesty for silicon-mladf.
+- **G1/G2:** tiles already wired; BO multi-shot reuse residual only.
+
+## Previous (Milestone C — Live L3 EXEC + OFM → ran_on_npu plumbing)
 - **Done:** airtight Pass criteria (`silicon_ran_on_npu_flags_ok` + decide + classify); OFM golden offline validate (Rust + `tools/validate_mladf_ofm_golden.sh`); `tools/silicon_lab_preflight.sh` + `lab_exec_once --silicon-mladf` / `--require-pass-assets`; SILICON_PATH_LAB Phase C exact dry-run→apply.
 - **Honesty:** dry-run green ≠ `ran_on_npu`; no default-test EXEC/ALLOW; live sudo EXEC **not** claimed this turn.
 - **Next (HITL):** operator non-zero OFM golden + sudo L3 apply → allclose → `ran_on_npu`.

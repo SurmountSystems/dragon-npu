@@ -673,21 +673,214 @@ fn build_compact_hwctx_failure_summary(attempt_logs: &[String]) -> String {
 /// CREATE_BO of type `AMDXDNA_BO_DEV_HEAP` must be a multiple of this value.
 /// `aie2_ctx_init` refuses CREATE_HWCTX with `-ENOENT` until the client has
 /// exactly one such heap BO registered (`client->dev_heap`).
+///
+/// **UVA alignment:** `aie2_map_host_buf` / firmware `MSG_OP_MAP_HOST_BUFFER (0x106)`
+/// maps the heap in `dev_mem_size` (64 MiB) chunks. Firmware returns
+/// `AIE2_STATUS_INVALID_PARAM (0x4000003)` if the **user VA is not 64 MiB-aligned**.
+/// Plain `mmap` of the DRM BO often returns only 2 MiB alignment — XRT reserves an
+/// aligned VA window then `MAP_FIXED`s the BO (see xdna-driver `shim/buffer.cpp`
+/// `mmap_ptr` + `heap_page_size`). Live 2026-07-16: `addr 0x7f3515400000` (misaligned)
+/// → map_host INVALID_PARAM → `exec_eio`.
 pub const AIE2_DEV_HEAP_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Tracked client DevHeap (handle + optional mmap of the full 64 MiB).
+/// Userspace VA alignment required for DevHeap mmap / `MAP_HOST_BUFFER`.
+///
+/// Same numeric value as [`AIE2_DEV_HEAP_SIZE`] (`dev_mem_size` / XRT `heap_page_size`).
+pub const AIE2_DEV_HEAP_UVA_ALIGN: usize = 64 * 1024 * 1024;
+
+/// Driver "invalid" address sentinel (`AMDXDNA_INVALID_ADDR` in amdxdna headers).
+///
+/// Seen on live lab when instruction BO was created as **Shmem** (GET_BO_INFO
+/// returned `xdna_addr=0xffffffffffffffff`). START_NPU must not use this.
+pub const AMDXDNA_INVALID_ADDR: u64 = u64::MAX;
+
+/// True when a device virtual address is usable in START_NPU / kernel args.
+///
+/// Refuses `0` and [`AMDXDNA_INVALID_ADDR`] (`u64::MAX`).
+#[must_use]
+pub fn is_valid_xdna_device_addr(addr: u64) -> bool {
+    addr != 0 && addr != AMDXDNA_INVALID_ADDR
+}
+
+/// True when `align` is a non-zero power of two (for VA rounding helpers).
+#[must_use]
+pub fn is_power_of_two_usize(align: usize) -> bool {
+    align.is_power_of_two()
+}
+
+/// Round `addr` up to the next multiple of `align` (`align` must be power of two).
+///
+/// Pure helper matching XRT `next_aligned_addr` (shim/buffer.cpp).
+#[must_use]
+pub fn next_aligned_addr_usize(addr: usize, align: usize) -> usize {
+    debug_assert!(is_power_of_two_usize(align));
+    (addr + align - 1) & !(align - 1)
+}
+
+/// True when a DevHeap **user** VA is aligned for firmware `MAP_HOST_BUFFER`.
+///
+/// Requires non-null and alignment to [`AIE2_DEV_HEAP_UVA_ALIGN`] (64 MiB).
+#[must_use]
+pub fn is_dev_heap_uva_aligned(addr: usize) -> bool {
+    addr != 0 && addr.is_multiple_of(AIE2_DEV_HEAP_UVA_ALIGN)
+}
+
+/// Tracked client DevHeap (handle + mmap of the full 64 MiB).
 ///
 /// `aie2_ctx_init` pins the heap and then allocates internal DEV BOs from it.
 /// Those allocations require `amdxdna_gem_uva(heap) != INVALID`, which is only
 /// set after userspace mmaps the BO (see amdxdna_gem.c / amdxdna_hmm_register).
+///
+/// **UVA must be 64 MiB-aligned** so firmware `MAP_HOST_BUFFER` accepts the heap
+/// at first submit (`aie2_hwctx_start`). See [`mmap_dev_heap_drm_aligned`].
+///
+/// **Instruction BOs** are XRT-style `AMDXDNA_BO_DEV` carved from this heap;
+/// host fill goes through this mmap (DEV `map_offset` is INVALID in uAPI).
 #[derive(Debug)]
 struct DevHeapState {
     handle: u32,
-    /// Kernel virtual mapping of the heap (kept alive for the fd lifetime).
-    #[allow(dead_code)]
+    /// Userspace mmap of the full DevHeap (64 MiB-aligned; kept for fd lifetime + DEV fills).
     map_ptr: *mut libc::c_void,
-    #[allow(dead_code)]
     map_len: usize,
+    /// Device base address of the heap (`GET_BO_INFO.xdna_addr` after create).
+    xdna_base: u64,
+}
+
+/// mmap DRM DevHeap BO at a **64 MiB-aligned** user VA (XRT `mmap_ptr` parity).
+///
+/// Algorithm (xdna-driver `shim/buffer.cpp` + `kmq/pcidev.cpp` `heap_page_size`):
+/// 1. Reserve anonymous VA of `size + align`.
+/// 2. Choose next `align`-aligned address; munmap head/tail slack.
+/// 3. `mmap(MAP_FIXED|MAP_SHARED)` the DRM BO over that window.
+///
+/// Returns the aligned pointer (munmap with `size` only). On any failure the
+/// reserved window is released and the BO is **not** closed (caller owns it).
+#[allow(
+    unsafe_code,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn mmap_dev_heap_drm_aligned(
+    fd: i32,
+    map_offset: u64,
+    size: usize,
+    align: usize,
+) -> Result<*mut libc::c_void, DirectError> {
+    if size == 0 || !is_power_of_two_usize(align) || align < 4096 {
+        return Err(DirectError::InvalidArgument(format!(
+            "mmap_dev_heap_drm_aligned: bad size={size} align={align:#x}"
+        )));
+    }
+    // XRT: total_sz = size + alignment when alignment > page_size.
+    let total_sz = size.checked_add(align).ok_or_else(|| {
+        DirectError::InvalidArgument("mmap_dev_heap_drm_aligned: size+align overflow".into())
+    })?;
+
+    // SAFETY: anonymous reservation only; no BO touch yet.
+    let anon = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total_sz,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if anon == libc::MAP_FAILED {
+        let err = std::io::Error::last_os_error();
+        return Err(DirectError::IoctlFailed(format!(
+            "mmap_dev_heap_drm_aligned: reserve VA size={total_sz:#x} failed: {err}"
+        )));
+    }
+
+    let anon_u = anon as usize;
+    let aligned_u = next_aligned_addr_usize(anon_u, align);
+    let pre_sz = aligned_u.saturating_sub(anon_u);
+    // After head trim, remaining mapped from aligned_u is total_sz - pre_sz.
+    let remaining = total_sz.saturating_sub(pre_sz);
+    if remaining < size {
+        // SAFETY: release full reservation on arithmetic fail.
+        unsafe {
+            let _ = libc::munmap(anon, total_sz);
+        }
+        return Err(DirectError::IoctlFailed(format!(
+            "mmap_dev_heap_drm_aligned: remaining={remaining:#x} < size={size:#x} \
+             (anon={anon_u:#x} aligned={aligned_u:#x})"
+        )));
+    }
+
+    // Unmap prefix (keep aligned window + optional suffix still mapped).
+    if pre_sz > 0 {
+        // SAFETY: prefix is within the reservation we just created.
+        unsafe {
+            let _ = libc::munmap(anon, pre_sz);
+        }
+    }
+    // Unmap suffix past the size window.
+    if remaining > size {
+        let tail = (aligned_u + size) as *mut libc::c_void;
+        // SAFETY: tail is within original reservation after head trim.
+        unsafe {
+            let _ = libc::munmap(tail, remaining - size);
+        }
+    }
+
+    let aligned = aligned_u as *mut libc::c_void;
+    // Overlay DRM BO at the aligned VA (replaces anonymous mapping).
+    // SAFETY: MAP_FIXED at our reserved aligned window; size matches BO map.
+    let mapped = unsafe {
+        libc::mmap(
+            aligned,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            map_offset as libc::off_t,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: release reserved aligned window if MAP_FIXED failed.
+        unsafe {
+            let _ = libc::munmap(aligned, size);
+        }
+        let hint = if err.raw_os_error() == Some(libc::EACCES)
+            || err.raw_os_error() == Some(libc::EPERM)
+        {
+            " (hint: open /dev/accel O_RDWR — O_RDONLY yields EPERM on PROT_WRITE mmap)"
+        } else {
+            ""
+        };
+        return Err(DirectError::IoctlFailed(format!(
+            "mmap_dev_heap_drm_aligned: MAP_FIXED at {aligned_u:#x} size={size:#x} \
+             map_offset={map_offset:#x} failed: {err}{hint}"
+        )));
+    }
+    if mapped as usize != aligned_u {
+        // SAFETY: unexpected address — unmap whatever we got + intended window.
+        unsafe {
+            let _ = libc::munmap(mapped, size);
+            if mapped as usize != aligned_u {
+                let _ = libc::munmap(aligned, size);
+            }
+        }
+        return Err(DirectError::IoctlFailed(format!(
+            "mmap_dev_heap_drm_aligned: MAP_FIXED returned {mapped:p} expected {aligned_u:#x}"
+        )));
+    }
+    if !is_dev_heap_uva_aligned(mapped as usize) && align == AIE2_DEV_HEAP_UVA_ALIGN {
+        // SAFETY: fail-closed if alignment invariant broken.
+        unsafe {
+            let _ = libc::munmap(mapped, size);
+        }
+        return Err(DirectError::IoctlFailed(format!(
+            "mmap_dev_heap_drm_aligned: mapped UVA {mapped:p} not 64 MiB-aligned \
+             (firmware MAP_HOST_BUFFER requires AIE2_DEV_HEAP_UVA_ALIGN)"
+        )));
+    }
+    Ok(mapped)
 }
 
 // SAFETY: DevHeapState is only mutated under a Mutex; the mmap is process-local.
@@ -696,6 +889,20 @@ unsafe impl Send for DevHeapState {}
 // SAFETY: same as Send — exclusive access via Mutex.
 #[allow(unsafe_code)]
 unsafe impl Sync for DevHeapState {}
+
+/// Process-local SHMEM/CMD mmaps kept so PASID UVA stays device-visible.
+///
+/// Temporary write_bo mmap+munmap can leave `xdna_addr=INVALID` after unmap
+/// (`amdxdna_hmm_register` / PASID). Pin until destroy/drop.
+#[derive(Debug, Default)]
+struct PinnedShmemMaps(std::collections::HashMap<u32, (*mut libc::c_void, usize)>);
+
+// SAFETY: only mutated under Mutex; pointers are process-local mmaps.
+#[allow(unsafe_code)]
+unsafe impl Send for PinnedShmemMaps {}
+// SAFETY: exclusive access via Mutex.
+#[allow(unsafe_code)]
+unsafe impl Sync for PinnedShmemMaps {}
 
 /// The real (non-stub) lightweight direct submission implementation.
 ///
@@ -714,10 +921,13 @@ pub struct RealDirectSubmission {
     /// Client-owned DevHeap (handle + mmap). Interior mutability so
     /// `create_hwctx` can ensure the heap once per submission object.
     dev_heap: std::sync::Mutex<Option<DevHeapState>>,
+    /// Persistent SHMEM/CMD mmaps (PASID UVA lifetime).
+    pinned_shmem: std::sync::Mutex<PinnedShmemMaps>,
 }
 
 impl Drop for RealDirectSubmission {
     fn drop(&mut self) {
+        self.release_all_pinned_shmem();
         self.release_dev_heap();
     }
 }
@@ -853,6 +1063,20 @@ impl DirectSubmission for SharedRealDirectSubmission {
         self.inner.get_bo_info(fd, handle)
     }
 
+    fn tracked_dev_heap_handle(&self) -> Option<u32> {
+        let h = self.inner.dev_heap_handle();
+        if h == 0 { None } else { Some(h) }
+    }
+
+    fn pin_bo_for_device_access(
+        &self,
+        fd: RawFd,
+        handle: u32,
+        size: u64,
+    ) -> Result<u64, DirectError> {
+        self.inner.pin_bo_for_device_access(fd, handle, size)
+    }
+
     fn write_bo_bytes(
         &self,
         fd: RawFd,
@@ -898,6 +1122,7 @@ impl RealDirectSubmission {
         Self {
             fd,
             dev_heap: std::sync::Mutex::new(None),
+            pinned_shmem: std::sync::Mutex::new(PinnedShmemMaps::default()),
         }
     }
 
@@ -908,6 +1133,126 @@ impl RealDirectSubmission {
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.handle))
             .unwrap_or(0)
+    }
+
+    /// Munmap all persistent SHMEM pins (best-effort).
+    #[allow(unsafe_code)]
+    pub fn release_all_pinned_shmem(&self) {
+        let pins = self
+            .pinned_shmem
+            .lock()
+            .ok()
+            .map(|mut g| std::mem::take(&mut g.0));
+        if let Some(pins) = pins {
+            for (_h, (ptr, len)) in pins {
+                if !ptr.is_null() && ptr != libc::MAP_FAILED && len > 0 {
+                    // SAFETY: ptr/len from our mmap tracking.
+                    unsafe {
+                        let _ = libc::munmap(ptr, len);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure SHMEM/CMD BO stays mmap'd so PASID UVA is device-visible.
+    ///
+    /// Returns GET_BO_INFO after pin. Extends existing pin if `size` larger.
+    #[allow(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    pub fn pin_shmem_bo_for_pasid(
+        &self,
+        handle: u32,
+        size: u64,
+    ) -> Result<amdxdna_drm_get_bo_info, DirectError> {
+        let need = usize::try_from(size.max(1)).map_err(|_| {
+            DirectError::InvalidArgument("pin_shmem_bo_for_pasid: size does not fit usize".into())
+        })?;
+        {
+            let guard = self
+                .pinned_shmem
+                .lock()
+                .map_err(|_| DirectError::DriverError(-1))?;
+            if let Some(&(ptr, len)) = guard.0.get(&handle) {
+                if len >= need && !ptr.is_null() {
+                    drop(guard);
+                    let info = self.get_bo_info(self.fd, handle)?;
+                    if !is_valid_xdna_device_addr(info.xdna_addr) {
+                        return Err(DirectError::InvalidArgument(format!(
+                            "pin_shmem_bo_for_pasid: handle={handle} still invalid xdna_addr={:#x} \
+                             after pin (map_offset={:#x} vaddr={:#x})",
+                            info.xdna_addr, info.map_offset, info.vaddr
+                        )));
+                    }
+                    return Ok(info);
+                }
+            }
+        }
+        // Drop old pin if resizing.
+        self.unpin_shmem_bo(handle);
+
+        let info0 = self.get_bo_info(self.fd, handle)?;
+        if info0.map_offset == 0 || info0.map_offset == AMDXDNA_INVALID_ADDR {
+            return Err(DirectError::IoctlFailed(format!(
+                "pin_shmem_bo_for_pasid: handle={handle} invalid map_offset={:#x}",
+                info0.map_offset
+            )));
+        }
+        let map_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                need,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.fd,
+                info0.map_offset as libc::off_t,
+            )
+        };
+        if map_ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            return Err(DirectError::IoctlFailed(format!(
+                "pin_shmem_bo_for_pasid: mmap handle={handle} size={need} failed: {err}"
+            )));
+        }
+        if let Ok(mut guard) = self.pinned_shmem.lock() {
+            guard.0.insert(handle, (map_ptr, need));
+        } else {
+            unsafe {
+                let _ = libc::munmap(map_ptr, need);
+            }
+            return Err(DirectError::DriverError(-1));
+        }
+        let info = self.get_bo_info(self.fd, handle)?;
+        if !is_valid_xdna_device_addr(info.xdna_addr) {
+            self.unpin_shmem_bo(handle);
+            return Err(DirectError::InvalidArgument(format!(
+                "pin_shmem_bo_for_pasid: handle={handle} xdna_addr={:#x} still invalid after mmap \
+                 (PASID UVA not registered?)",
+                info.xdna_addr
+            )));
+        }
+        Ok(info)
+    }
+
+    /// Drop persistent pin for one handle (best-effort).
+    #[allow(unsafe_code)]
+    pub fn unpin_shmem_bo(&self, handle: u32) {
+        let entry = self
+            .pinned_shmem
+            .lock()
+            .ok()
+            .and_then(|mut g| g.0.remove(&handle));
+        if let Some((ptr, len)) = entry {
+            if !ptr.is_null() && ptr != libc::MAP_FAILED && len > 0 {
+                unsafe {
+                    let _ = libc::munmap(ptr, len);
+                }
+            }
+        }
     }
 
     /// Ensure the client has a DevHeap BO registered **and mmap'd**.
@@ -926,6 +1271,7 @@ impl RealDirectSubmission {
     /// ("The client dev heap object not exist").
     /// With the BO but without mmap, CREATE_HWCTX fails later with EINVAL
     /// ("Invalid dev heap userptr").
+    #[allow(clippy::too_many_lines)] // create + mmap + fail-closed store / munmap
     pub fn ensure_dev_heap(&self) -> Result<BufferHandle, DirectError> {
         {
             let guard = self
@@ -962,58 +1308,150 @@ impl RealDirectSubmission {
             }
         };
 
-        // GET_BO_INFO → mmap so amdxdna_gem_uva(heap) becomes valid.
+        // GET_BO_INFO → 64 MiB-aligned mmap so amdxdna_gem_uva(heap) is valid
+        // and firmware MAP_HOST_BUFFER (0x106) accepts the UVA at hwctx start.
         let info = self.get_bo_info(self.fd, heap.0)?;
-        if info.map_offset == 0 || info.map_offset == u64::MAX {
+        if info.map_offset == 0 || info.map_offset == AMDXDNA_INVALID_ADDR {
             let _ = self.destroy_buffer(self.fd, heap.0);
             return Err(DirectError::IoctlFailed(format!(
                 "DevHeap handle={} has invalid map_offset={:#x}; cannot mmap for UVA",
                 heap.0, info.map_offset
             )));
         }
-
-        #[allow(clippy::cast_possible_truncation)]
-        let map_len = AIE2_DEV_HEAP_SIZE as usize;
-        #[allow(
-            unsafe_code,
-            clippy::cast_possible_truncation,
-            clippy::cast_possible_wrap
-        )]
-        let map_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                self.fd,
-                // DRM fake offset is a full u64; cast for mmap off_t.
-                info.map_offset as libc::off_t,
-            )
-        };
-        if map_ptr == libc::MAP_FAILED {
-            let err = std::io::Error::last_os_error();
+        if !is_valid_xdna_device_addr(info.xdna_addr) {
             let _ = self.destroy_buffer(self.fd, heap.0);
-            let hint = if err.raw_os_error() == Some(libc::EACCES)
-                || err.raw_os_error() == Some(libc::EPERM)
-            {
-                " (hint: open /dev/accel O_RDWR — O_RDONLY yields EPERM on PROT_WRITE mmap)"
-            } else {
-                ""
-            };
             return Err(DirectError::IoctlFailed(format!(
-                "mmap DevHeap handle={} map_offset={:#x} size={map_len} failed: {err}{hint}",
-                heap.0, info.map_offset
+                "DevHeap handle={} has invalid xdna_addr={:#x} (need valid device base for BO_DEV)",
+                heap.0, info.xdna_addr
             )));
         }
 
-        if let Ok(mut guard) = self.dev_heap.lock() {
-            *guard = Some(DevHeapState {
-                handle: heap.0,
-                map_ptr,
-                map_len,
-            });
+        #[allow(clippy::cast_possible_truncation)]
+        let map_len = AIE2_DEV_HEAP_SIZE as usize;
+        let map_ptr = match mmap_dev_heap_drm_aligned(
+            self.fd,
+            info.map_offset,
+            map_len,
+            AIE2_DEV_HEAP_UVA_ALIGN,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.destroy_buffer(self.fd, heap.0);
+                return Err(DirectError::IoctlFailed(format!(
+                    "mmap DevHeap handle={} map_offset={:#x} size={map_len} \
+                         (64 MiB-aligned UVA required for MAP_HOST_BUFFER): {e}",
+                    heap.0, info.map_offset
+                )));
+            }
+        };
+
+        // Never return Ok without storing DevHeapState (poison/lock fail must munmap).
+        let Ok(mut guard) = self.dev_heap.lock() else {
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = libc::munmap(map_ptr, map_len);
+            }
+            let _ = self.destroy_buffer(self.fd, heap.0);
+            return Err(DirectError::IoctlFailed(
+                "ensure_dev_heap: DevHeap mutex poisoned after mmap; unmapped and closed \
+                 handle (no untracked mmap left)"
+                    .into(),
+            ));
+        };
+        // Another thread may have raced and stored a heap — prefer kept state,
+        // free this mmap/BO to avoid double-ownership of the client DevHeap.
+        if guard.is_some() {
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = libc::munmap(map_ptr, map_len);
+            }
+            let _ = self.destroy_buffer(self.fd, heap.0);
+            let h = guard.as_ref().map_or(0, |s| s.handle);
+            return Ok(BufferHandle(h));
         }
+        *guard = Some(DevHeapState {
+            handle: heap.0,
+            map_ptr,
+            map_len,
+            xdna_base: info.xdna_addr,
+        });
         Ok(heap)
+    }
+
+    /// Host-fill an `AMDXDNA_BO_DEV` instruction/data carve via DevHeap mmap.
+    ///
+    /// DEV BOs report `map_offset=AMDXDNA_INVALID_ADDR` in GET_BO_INFO; XRT maps
+    /// them as an offset into the client DevHeap. Requires [`Self::ensure_dev_heap`].
+    ///
+    /// **Locking:** holds the DevHeap mutex across the host copy so
+    /// [`Self::release_dev_heap`] cannot munmap under a concurrent writer
+    /// (SharedRealDirectSubmission).
+    #[allow(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::significant_drop_tightening
+    )]
+    fn write_dev_bo_via_heap(
+        &self,
+        handle: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), DirectError> {
+        let _ = self.ensure_dev_heap()?;
+        let info = self.get_bo_info(self.fd, handle)?;
+        if !is_valid_xdna_device_addr(info.xdna_addr) {
+            return Err(DirectError::InvalidArgument(format!(
+                "write_dev_bo_via_heap: handle={handle} invalid xdna_addr={:#x}",
+                info.xdna_addr
+            )));
+        }
+        // Hold guard for the entire copy — map_ptr must not outlive DevHeapState.
+        {
+            let guard = self
+                .dev_heap
+                .lock()
+                .map_err(|_| DirectError::DriverError(-1))?;
+            let Some(ref state) = *guard else {
+                return Err(DirectError::IoctlFailed(
+                    "write_dev_bo_via_heap: DevHeap not owned by this submission".into(),
+                ));
+            };
+            let map_ptr = state.map_ptr;
+            let map_len = state.map_len;
+            let xdna_base = state.xdna_base;
+            let heap_off = info.xdna_addr.checked_sub(xdna_base).ok_or_else(|| {
+                DirectError::InvalidArgument(format!(
+                    "write_dev_bo_via_heap: bo xdna_addr={:#x} < heap base {xdna_base:#x}",
+                    info.xdna_addr
+                ))
+            })?;
+            let write_off = heap_off.checked_add(offset).ok_or_else(|| {
+                DirectError::InvalidArgument("write_dev_bo_via_heap offset overflow".into())
+            })?;
+            let end = write_off.checked_add(data.len() as u64).ok_or_else(|| {
+                DirectError::InvalidArgument("write_dev_bo_via_heap end overflow".into())
+            })?;
+            if end > map_len as u64 {
+                return Err(DirectError::InvalidArgument(format!(
+                    "write_dev_bo_via_heap: write [{write_off},{end}) exceeds DevHeap map_len {map_len}"
+                )));
+            }
+            // SAFETY: guard holds DevHeapState; release_dev_heap cannot munmap until drop.
+            unsafe {
+                let dest = map_ptr.cast::<u8>().add(write_off as usize);
+                std::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+            }
+        }
+        // SYNC via DEV handle (driver redirects pin to heap).
+        self.sync_buffer(
+            self.fd,
+            BufferHandle(handle),
+            SYNC_BO_TO_DEVICE,
+            offset,
+            data.len() as u64,
+        )?;
+        Ok(())
     }
 
     /// Release the client DevHeap (munmap + GEM_CLOSE) if this instance owns it.
@@ -1518,6 +1956,8 @@ impl DirectSubmission for RealDirectSubmission {
     fn destroy_buffer(&self, _fd: RawFd, handle: u32) -> Result<(), DirectError> {
         #[cfg(feature = "amd-xdna2")]
         {
+            // Drop PASID pin before GEM_CLOSE so we do not munmap after free.
+            self.unpin_shmem_bo(handle);
             // amdxdna has no DESTROY_BO ioctl. BOs are standard DRM GEM objects
             // and must be released with DRM_IOCTL_GEM_CLOSE (drm.h).
             // Earlier bring-up incorrectly tried amdxdna command nrs (including
@@ -1557,6 +1997,8 @@ impl DirectSubmission for RealDirectSubmission {
                     exec_cmd_block_reason().to_string(),
                 ));
             }
+            // Empty / unfilled Cmd BO is the same wedge class — refuse even when L1 open.
+            exec_cmd_requires_filled_cmd_bo(cmd)?;
 
             // Remaining hard unknown: real firmware txn / cmdlist payload layout.
             // Even when enabled, only known-good payloads should be submitted.
@@ -1592,19 +2034,32 @@ impl DirectSubmission for RealDirectSubmission {
 
             match ret {
                 Ok(_) => Ok(req.seq),
-                Err(e) => Err(DirectError::IoctlFailed(format!(
-                    "EXEC_CMD failed (hwctx={}, ty={:?}, cmd_bo_handle={:?}, payload_len={}): {e}. \
-                     Note: real command payload (txn ops / control code inside AMDXDNA_BO_CMD BO) \
-                     is not yet implemented. The EXEC_CMD ioctl request code is now exactly \
-                     0xc038_6446. This is currently the main remaining gap for actual model \
-                     execution on real XDNA2 hardware (we have the full ioctl path + rich \
-                     hwctx/BO scaffolding + correct request codes + ability to point at real \
-                     command BOs, but the firmware command format / txn encoding is the unknown).",
-                    cmd.hwctx_handle,
-                    cmd.ty,
-                    cmd.cmd_bo_handle,
-                    cmd.payload.len()
-                ))),
+                Err(e) => {
+                    let errno_hint = format!("{e}");
+                    let kernel_hint = if errno_hint.contains("os error 5")
+                        || errno_hint.contains("Input/output error")
+                    {
+                        " Hint: journal often shows MSG_OP_MAP_HOST_BUFFER (0x106) / \
+                         aie2_map_host_buf on DevHeap (64 MiB) failing at first submit — \
+                         FW wants 64 MiB-aligned DevHeap UVA (XRT mmap_ptr) + BO_DEV instr; \
+                         check bo_diag DevHeap vaddr % 0x4000000 == 0."
+                    } else if errno_hint.contains("Permission denied")
+                        || errno_hint.contains("os error 1")
+                    {
+                        " Hint: exec_cmd_allow=0 or userspace L1 gate (feature + ALLOW)."
+                    } else {
+                        ""
+                    };
+                    Err(DirectError::IoctlFailed(format!(
+                        "EXEC_CMD failed (hwctx={}, ty={:?}, cmd_bo_handle={:?}, payload_len={}, \
+                         arg_count={}): {e}.{kernel_hint}",
+                        cmd.hwctx_handle,
+                        cmd.ty,
+                        cmd.cmd_bo_handle,
+                        cmd.payload.len(),
+                        cmd.arg_bo_handles.len()
+                    )))
+                }
             }
         }
 
@@ -1934,6 +2389,32 @@ impl DirectSubmission for RealDirectSubmission {
         Ok(ver)
     }
 
+    fn tracked_dev_heap_handle(&self) -> Option<u32> {
+        let h = self.dev_heap_handle();
+        if h == 0 { None } else { Some(h) }
+    }
+
+    fn pin_bo_for_device_access(
+        &self,
+        _fd: RawFd,
+        handle: u32,
+        size: u64,
+    ) -> Result<u64, DirectError> {
+        let info0 = self.get_bo_info(self.fd, handle)?;
+        // DEV carve already has device heap address (map_offset invalid).
+        if info0.map_offset == 0 || info0.map_offset == AMDXDNA_INVALID_ADDR {
+            if is_valid_xdna_device_addr(info0.xdna_addr) {
+                return Ok(info0.xdna_addr);
+            }
+            return Err(DirectError::InvalidArgument(format!(
+                "pin_bo_for_device_access: DEV handle={handle} invalid xdna_addr={:#x}",
+                info0.xdna_addr
+            )));
+        }
+        let info = self.pin_shmem_bo_for_pasid(handle, size.max(1))?;
+        Ok(info.xdna_addr)
+    }
+
     /// Get detailed information about a buffer object (map offset, XDNA device address, etc.).
     ///
     /// Uses the dedicated `DRM_IOCTL_AMDXDNA_GET_BO_INFO` ioctl (nr=4), **not**
@@ -2005,43 +2486,36 @@ impl DirectSubmission for RealDirectSubmission {
                 DirectError::InvalidArgument("write_bo_bytes offset+len overflows u64".to_string())
             })?;
             let info = self.get_bo_info(self.fd, handle)?;
-            if info.map_offset == 0 || info.map_offset == u64::MAX {
+            // AMDXDNA_BO_DEV: map_offset is INVALID; fill via DevHeap mmap (XRT parity).
+            if info.map_offset == 0 || info.map_offset == AMDXDNA_INVALID_ADDR {
+                if is_valid_xdna_device_addr(info.xdna_addr) {
+                    return self.write_dev_bo_via_heap(handle, offset, data);
+                }
                 return Err(DirectError::IoctlFailed(format!(
-                    "write_bo_bytes: handle={handle} has invalid map_offset={:#x}",
-                    info.map_offset
+                    "write_bo_bytes: handle={handle} map_offset={:#x} xdna_addr={:#x} \
+                     (DEV needs valid xdna_addr + mmap'd DevHeap; SHMEM/CMD need map_offset)",
+                    info.map_offset, info.xdna_addr
                 )));
             }
-            let map_len = end as usize;
-            let map_ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    map_len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    self.fd,
-                    info.map_offset as libc::off_t,
-                )
+            // SHMEM/CMD: keep mmap for PASID UVA (do not munmap after write).
+            let pin_info = self.pin_shmem_bo_for_pasid(handle, end)?;
+            let map_ptr = {
+                let guard = self
+                    .pinned_shmem
+                    .lock()
+                    .map_err(|_| DirectError::DriverError(-1))?;
+                guard.0.get(&handle).map(|&(p, _)| p).ok_or_else(|| {
+                    DirectError::IoctlFailed(format!(
+                        "write_bo_bytes: pin missing for handle={handle}"
+                    ))
+                })?
             };
-            if map_ptr == libc::MAP_FAILED {
-                let err = std::io::Error::last_os_error();
-                let hint = if err.raw_os_error() == Some(libc::EACCES)
-                    || err.raw_os_error() == Some(libc::EPERM)
-                {
-                    " (hint: open /dev/accel O_RDWR for PROT_WRITE mmap)"
-                } else {
-                    ""
-                };
-                return Err(DirectError::IoctlFailed(format!(
-                    "mmap BO handle={handle} map_offset={:#x} size={map_len} failed: {err}{hint}",
-                    info.map_offset
-                )));
-            }
-            // SAFETY: map_ptr is a successful MAP_SHARED mapping of at least map_len bytes.
+            // SAFETY: map_ptr is our persistent MAP_SHARED of at least `end` bytes.
             unsafe {
                 let dest = map_ptr.cast::<u8>().add(offset as usize);
                 std::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-                let _ = libc::munmap(map_ptr, map_len);
             }
+            let _ = pin_info; // pin_shmem already validated xdna_addr
             // Direction 0 = TO_DEVICE (amdxdna header / bring-up grid).
             self.sync_buffer(
                 self.fd,
@@ -2361,6 +2835,33 @@ pub fn parse_amdxdna_cmd_header_from_bytes(
     }
     let header = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     Ok(unpack_amdxdna_cmd_header(header))
+}
+
+/// Human label for ERT state nibble (post-WAIT diagnostic).
+///
+/// Driver sets [`ErtCmdState::Completed`] only when FW response is
+/// `AIE2_STATUS_SUCCESS`; otherwise [`ErtCmdState::Error`]. WAIT ioctl OK alone
+/// is **not** NPU compute Pass (live 2026-07-16: zero OFM after WAIT accepted).
+#[must_use]
+pub fn ert_cmd_state_name(state: u32) -> &'static str {
+    match state {
+        x if x == ErtCmdState::New as u32 => "New",
+        x if x == ErtCmdState::Queued as u32 => "Queued",
+        x if x == ErtCmdState::Running as u32 => "Running",
+        x if x == ErtCmdState::Completed as u32 => "Completed",
+        x if x == ErtCmdState::Error as u32 => "Error",
+        x if x == ErtCmdState::Abort as u32 => "Abort",
+        x if x == ErtCmdState::Submitted as u32 => "Submitted",
+        x if x == ErtCmdState::Timeout as u32 => "Timeout",
+        x if x == ErtCmdState::NoResponse as u32 => "NoResponse",
+        _ => "Unknown",
+    }
+}
+
+/// True when ERT state is successful hardware completion ([`ErtCmdState::Completed`]).
+#[must_use]
+pub fn ert_cmd_state_is_completed(state: u32) -> bool {
+    state == ErtCmdState::Completed as u32
 }
 
 /// Number of leading CU-mask dwords in `amdxdna_cmd.data[]`.
@@ -2966,10 +3467,36 @@ pub fn submit_and_wait_command(
         ));
     }
     check_finite_wait_timeout(timeout_ms)?;
+    // Defense in depth (also enforced in Real/Stub submit_command).
+    exec_cmd_requires_filled_cmd_bo(cmd)?;
 
     let seq = submission.submit_command(fd, cmd)?;
     submission.wait_command(fd, cmd.hwctx_handle, seq, timeout_ms)?;
     Ok(SubmitWaitResult { seq, timeout_ms })
+}
+
+/// Refuse empty payload or missing Cmd BO handle (2026-07-13 empty EXEC wedge class).
+///
+/// Pure check — no ioctl. Call when L1 is open, before any EXEC_CMD.
+///
+/// # Errors
+///
+/// [`DirectError::InvalidArgument`] when payload is empty or `cmd_bo_handle` is `None`.
+pub fn exec_cmd_requires_filled_cmd_bo(cmd: &Command) -> Result<(), DirectError> {
+    if cmd.payload.is_empty() {
+        return Err(DirectError::InvalidArgument(
+            "EXEC_CMD refuses empty payload (empty Cmd BO is the 2026-07-13 wedge class; \
+             host-fill via fill_cmd_bo_with_payload first)"
+                .into(),
+        ));
+    }
+    if cmd.cmd_bo_handle.is_none() {
+        return Err(DirectError::InvalidArgument(
+            "EXEC_CMD refuses missing cmd_bo_handle (must CREATE_BO(Cmd) + host-fill before submit)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Result of a timed buffer / matmul attempt on the direct path.
@@ -3161,6 +3688,11 @@ impl TimedOpResult {
 ///
 /// Does **not** claim every failure is a payload problem — reserve
 /// `payload_unsupported` for messages that look payload/txn related.
+/// Live 2026-07-16 lab: EIO + map_host → `exec_eio` (not payload_unsupported).
+///
+/// Kernel fingerprints (journal):
+/// - `MSG_OP_MAP_HOST_BUFFER (0x106)` / `aie2_map_host_buf` → heap UVA / map_host class
+/// - often surfaces as EXEC_CMD EIO (`os error 5`) — status `exec_eio`
 fn classify_submit_wait_error(err: &DirectError) -> &'static str {
     let s = err.to_string().to_ascii_lowercase();
     if s.contains("timeout") || s.contains("etimedout") || s.contains("etime") {
@@ -3168,6 +3700,14 @@ fn classify_submit_wait_error(err: &DirectError) -> &'static str {
     } else if s.contains("eperm") || s.contains("permission denied") || s.contains("exec_cmd_allow")
     {
         "exec_cmd_perm"
+    } else if s.contains("map_host")
+        || s.contains("0x106")
+        || s.contains("map host buffer")
+        || s.contains("os error 5")
+        || s.contains("input/output error")
+        || s.contains("eio")
+    {
+        "exec_eio"
     } else if s.contains("payload")
         || s.contains("txn")
         || s.contains("not implemented")
@@ -3178,6 +3718,86 @@ fn classify_submit_wait_error(err: &DirectError) -> &'static str {
     } else {
         "submit_wait_failed"
     }
+}
+
+/// Format one GET_BO_INFO snapshot for timed-path `detail` (no secrets).
+///
+/// Fields: handle, optional type hint, map_offset, xdna_addr, vaddr, valid_addr flag.
+#[must_use]
+pub fn format_bo_info_diag(
+    label: &str,
+    handle: u32,
+    info: Option<&amdxdna_drm_get_bo_info>,
+    ty_hint: Option<&str>,
+) -> String {
+    let ty = ty_hint.unwrap_or("?");
+    info.map_or_else(
+        || format!("{label}: handle={handle} ty={ty} GET_BO_INFO unavailable"),
+        |i| {
+            format!(
+                "{label}: handle={handle} ty={ty} map_offset={:#x} xdna_addr={:#x} \
+                 vaddr={:#x} valid_addr={}",
+                i.map_offset,
+                i.xdna_addr,
+                i.vaddr,
+                is_valid_xdna_device_addr(i.xdna_addr)
+            )
+        },
+    )
+}
+
+/// True when `XDNA2_LAB_BO_DIAG=1` / `true` / `yes` (always attach BO diag on lab path).
+///
+/// Default off: BO diags still attach **on submit failure** and invalid-inst-addr paths.
+#[must_use]
+pub fn lab_bo_diag_env_enabled() -> bool {
+    std::env::var("XDNA2_LAB_BO_DIAG").is_ok_and(|v| {
+        let t = v.trim();
+        t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+    })
+}
+
+/// Best-effort DevHeap + instruction (+ optional lab I/O) BO diag lines for live debug.
+///
+/// Pure formatting of ioctl results — no secrets. Safe on stub (fake GET_BO_INFO).
+#[must_use]
+pub fn collect_lab_bo_diag(
+    submission: &dyn DirectSubmission,
+    inst_handle: Option<u32>,
+    io: Option<&super::lab_io::IoBoSet>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(h) = submission.tracked_dev_heap_handle() {
+        let info = submission.get_bo_info(0, h).ok();
+        parts.push(format_bo_info_diag(
+            "DevHeap",
+            h,
+            info.as_ref(),
+            Some("DevHeap"),
+        ));
+    } else {
+        parts.push("DevHeap: handle=none (not tracked on this submission)".into());
+    }
+    if let Some(h) = inst_handle {
+        let info = submission.get_bo_info(0, h).ok();
+        parts.push(format_bo_info_diag("instr", h, info.as_ref(), Some("Dev")));
+    }
+    if let Some(ios) = io {
+        for (label, h) in [("ifm", ios.ifm.0), ("wts", ios.wts.0), ("ofm", ios.ofm.0)] {
+            let info = submission.get_bo_info(0, h).ok();
+            parts.push(format_bo_info_diag(label, h, info.as_ref(), Some("Shmem")));
+        }
+        if let Some(c) = ios.ctrl {
+            let info = submission.get_bo_info(0, c.0).ok();
+            parts.push(format_bo_info_diag(
+                "ctrl",
+                c.0,
+                info.as_ref(),
+                Some("Shmem"),
+            ));
+        }
+    }
+    parts.join("; ")
 }
 
 /// Host-side f32 matmul reference result (never NPU).
@@ -3290,11 +3910,14 @@ pub fn load_instruction_blob_from_path(path: &str) -> Result<Vec<u8>, DirectErro
             bytes.len()
         )));
     }
-    // Prefer `.ctrltext` from aiebu ELF32; otherwise keep raw bytes (txn or unknown).
-    let payload = crate::backends::amd_xdna2::txn::instruction_payload_bytes(&bytes)?;
+    // Keep **full** file bytes. aiebu ELF must retain `.rela.dyn` for runtime
+    // paddr patch (`patch_aiebu_elf_ctrltext_with_bos`); peeling only `.ctrltext`
+    // here caused live APP_LOAD_PDI_FAIL (0x3000003). Raw txn is unchanged.
+    let payload = bytes;
     // Optional strict txn gate (lab): XDNA2_INSTRUCTION_REQUIRE_TXN=1
     if instruction_require_txn_env() {
-        let kind = crate::backends::amd_xdna2::txn::validate_txn_blob(&payload).map_err(|e| {
+        let stream = crate::backends::amd_xdna2::txn::instruction_payload_bytes(&payload)?;
+        let kind = crate::backends::amd_xdna2::txn::validate_txn_blob(&stream).map_err(|e| {
             DirectError::InvalidArgument(format!(
                 "XDNA2_INSTRUCTION_REQUIRE_TXN=1 but blob is not a valid XAie txn ({path}): {e}"
             ))
@@ -3550,17 +4173,37 @@ pub fn timed_matmul_direct(
     let mut fill_s: Option<f64> = None;
     let mut submit_wait_s: Option<f64> = None;
 
-    // Env wins; else Phase 6 heuristic from resource TOPS when GET works (else 4).
-    let default_tiles = submission
-        .get_resource_info()
-        .map_or(DEFAULT_HWCTX_TILES, |r| suggest_hwctx_tiles(&r));
+    // Env wins. Heuristic: resource TOPS → 4/8 tiles for ordinary bring-up.
+    // Live 2026-07-16 silicon-mladf: FW `APP_LOAD_PDI_FAIL` (0x3000003) with 4–8
+    // tiles — staged mladf txn is **8×6** class; XRT uses `num_tiles = cols * core_rows`
+    // (e.g. 8×4=32). Lab mladf defaults to 32 unless env overrides.
+    let lab_ofm_early = super::lab_io::lab_ofm_env_enabled();
+    let lab_mladf_early = matches!(
+        super::mladf_pack::LabPackMode::try_from_env_raw(
+            std::env::var("XDNA2_LAB_PACK").ok().as_deref(),
+        ),
+        Ok(super::mladf_pack::LabPackMode::MladfA16W4)
+    );
+    let default_tiles = if lab_ofm_early && lab_mladf_early {
+        32
+    } else {
+        submission
+            .get_resource_info()
+            .map_or(DEFAULT_HWCTX_TILES, |r| suggest_hwctx_tiles(&r))
+    };
     let tiles = parse_u32_from_env("XDNA2_HWCTX_TILES_SINGLE", default_tiles).max(1);
     let mem = parse_u32_from_env("XDNA2_HWCTX_MEM_SINGLE", 256 * 1024);
     let umq = parse_u64_from_env("XDNA2_HWCTX_UMQ", 16 * 1024).max(4096);
     let log = parse_u64_from_env("XDNA2_HWCTX_LOG", 128 * 1024).max(4096);
 
     let prep0 = Instant::now();
-    let qos = QosInfo::default();
+    // Zero QoS is soft-invalid (driver logs "Invalid QoS", max DPM). Minimal
+    // gops+fps makes is_valid_qos_dpm_params true (aie2_ctx.c).
+    let mut qos = QosInfo::default();
+    if lab_ofm_early && lab_mladf_early {
+        qos.gops = 100;
+        qos.fps = 30;
+    }
     let hwctx = submission.create_hwctx_with_sizes(0, tiles, mem, umq, log, Some(&qos));
     let hwctx_elapsed = prep0.elapsed().as_secs_f64();
     let hwctx_s = Some(hwctx_elapsed);
@@ -3575,8 +4218,8 @@ pub fn timed_matmul_direct(
             r.hwctx_s = hwctx_s;
             r.status = "hwctx_blocked".to_string();
             r.detail = format!(
-                "CREATE_HWCTX failed (direct path): {e}. \
-                 Real GEMM requires a working hwctx + known-good instruction blob + verify."
+                "CREATE_HWCTX failed tiles={tiles} mladf_tiles_default={lab_mladf_early}: {e}. \
+                 Real GEMM needs working hwctx + known-good instruction blob + verify."
             );
             attach_host_ref(&mut r, m, n, k, dtype);
             return r;
@@ -3601,14 +4244,49 @@ pub fn timed_matmul_direct(
         let mut inst_addr: u64 = 0;
         let mut inst_size: u32 = 0;
         let mut blob_note = String::from("envelope (no instruction blob)");
+        // Full file (may be aiebu ELF). Device fill may wait until I/O paddrs exist
+        // so `.rela.dyn` can be applied (XRT patch_ctrl_code parity).
+        let mut inst_blob_raw: Option<Vec<u8>> = None;
 
         match load_instruction_blob_from_env() {
             Ok(None) => {}
             Ok(Some(blob)) => {
-                let blob_len = blob.len() as u64;
-                match submission.create_buffer(0, blob_len.max(4096), BufferType::Shmem) {
+                let stream = match crate::backends::amd_xdna2::txn::instruction_payload_bytes(&blob)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        fill_s = Some(fill0.elapsed().as_secs_f64());
+                        host_prep_s += fill_s.unwrap_or(0.0);
+                        destroy_hwctx_and_owned_bos(submission, &ctx);
+                        let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                        r.total_s = t0.elapsed().as_secs_f64();
+                        r.host_prep_s = host_prep_s;
+                        r.hwctx_s = hwctx_s;
+                        r.fill_s = fill_s;
+                        r.status = "inst_blob_load_failed".to_string();
+                        r.detail = format!("instruction payload peel failed: {e}");
+                        attach_host_ref(&mut r, m, n, k, dtype);
+                        return r;
+                    }
+                };
+                let is_elf = crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(&blob);
+                let stream_len = stream.len() as u64;
+                // XRT: instruction → AMDXDNA_BO_DEV (heap carve), not SHMEM.
+                // Live lab: Shmem returned xdna_addr=0xffffffffffffffff (invalid).
+                let inst_ty = BufferType::Dev;
+                match submission.create_buffer(0, stream_len.max(4096), inst_ty) {
                     Ok(bh) => {
-                        if let Err(e) = submission.write_bo_bytes(0, bh.0, 0, &blob) {
+                        // Non-ELF: write peel immediately. ELF: defer until I/O paddrs
+                        // (or write unpatched peel as placeholder if no LAB_OFM).
+                        let initial = if is_elf {
+                            // Placeholder zeros until patch (size = ctrltext).
+                            vec![0_u8; stream.len()]
+                        } else {
+                            stream
+                        };
+                        if let Err(e) = submission.write_bo_bytes(0, bh.0, 0, &initial) {
+                            // D3: DevHeap + instr snapshot before destroy (fill path).
+                            let bo_diag = collect_lab_bo_diag(submission, Some(bh.0), None);
                             let _ = submission.destroy_buffer(0, bh.0);
                             fill_s = Some(fill0.elapsed().as_secs_f64());
                             host_prep_s += fill_s.unwrap_or(0.0);
@@ -3620,25 +4298,52 @@ pub fn timed_matmul_direct(
                             r.fill_s = fill_s;
                             r.status = "inst_blob_fill_failed".to_string();
                             r.detail = format!(
-                                "instruction blob loaded ({} bytes) but write_bo_bytes failed: {e}",
+                                "instruction blob loaded ({} bytes) BO ty={inst_ty:?} but \
+                                 write_bo_bytes failed: {e}; bo_diag=[{bo_diag}]",
                                 blob.len()
                             );
                             attach_host_ref(&mut r, m, n, k, dtype);
                             return r;
                         }
                         match submission.get_bo_info(0, bh.0) {
-                            Ok(info) if info.xdna_addr != 0 => {
+                            Ok(info) if is_valid_xdna_device_addr(info.xdna_addr) => {
                                 inst_addr = info.xdna_addr;
-                                inst_size = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+                                inst_size = u32::try_from(initial.len()).unwrap_or(u32::MAX);
                                 inst_handle = Some(bh.0);
                                 used_inst_blob = true;
+                                inst_blob_raw = Some(blob);
+                                let elf_note = if is_elf {
+                                    " aiebu_elf=1 (rela patch after I/O)"
+                                } else {
+                                    " aiebu_elf=0 (raw txn — may APP_LOAD_PDI_FAIL)"
+                                };
                                 blob_note = format!(
-                                    "inst_blob {} bytes xdna_addr={:#x}",
-                                    blob.len(),
-                                    inst_addr
+                                    "inst_blob {} bytes ty={inst_ty:?} xdna_addr={:#x} \
+                                     map_offset={:#x}{elf_note}",
+                                    initial.len(),
+                                    inst_addr,
+                                    info.map_offset
                                 );
                             }
                             Ok(info) => {
+                                let bo_diag = {
+                                    let mut parts = vec![format_bo_info_diag(
+                                        "instr",
+                                        bh.0,
+                                        Some(&info),
+                                        Some("Dev"),
+                                    )];
+                                    if let Some(h) = submission.tracked_dev_heap_handle() {
+                                        let hi = submission.get_bo_info(0, h).ok();
+                                        parts.push(format_bo_info_diag(
+                                            "DevHeap",
+                                            h,
+                                            hi.as_ref(),
+                                            Some("DevHeap"),
+                                        ));
+                                    }
+                                    parts.join("; ")
+                                };
                                 let _ = submission.destroy_buffer(0, bh.0);
                                 fill_s = Some(fill0.elapsed().as_secs_f64());
                                 host_prep_s += fill_s.unwrap_or(0.0);
@@ -3649,11 +4354,12 @@ pub fn timed_matmul_direct(
                                 r.host_prep_s = host_prep_s;
                                 r.hwctx_s = hwctx_s;
                                 r.fill_s = fill_s;
-                                r.status = "inst_blob_addr_zero".to_string();
+                                r.status = "inst_blob_addr_invalid".to_string();
                                 r.detail = format!(
-                                    "instruction BO created but xdna_addr=0 (map_offset={:#x}); \
-                                     refusing START_NPU with zero device addr",
-                                    info.map_offset
+                                    "instruction BO ty={inst_ty:?} xdna_addr={:#x} map_offset={:#x} \
+                                     is not a usable device addr (refuse 0 and u64::MAX); \
+                                     START_NPU buffer must be valid BO_DEV heap carve; {bo_diag}",
+                                    info.xdna_addr, info.map_offset
                                 );
                                 attach_host_ref(&mut r, m, n, k, dtype);
                                 return r;
@@ -3794,7 +4500,68 @@ pub fn timed_matmul_direct(
             match setup {
                 Ok(ios) => {
                     // IFM/WTS/OFM + optional CTRL paddr (count 3 or 4).
+                    // aiebu ELF: apply .rela.dyn with live paddrs into .ctrltext
+                    // (XRT patch_ctrl_code parity) before EXEC.
+                    if let (Some(h), Some(raw)) = (inst_handle, inst_blob_raw.as_ref()) {
+                        if crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(raw) {
+                            match crate::backends::amd_xdna2::txn::patch_aiebu_elf_ctrltext_with_bos(
+                                raw,
+                                ios.ifm_addr,
+                                ios.wts_addr,
+                                ios.ofm_addr,
+                                ios.ctrl_addr,
+                            ) {
+                                Ok(patched) => {
+                                    if let Err(e) = submission.write_bo_bytes(0, h, 0, &patched) {
+                                        super::lab_io::destroy_io_bos(submission, &ios);
+                                        let _ = submission.destroy_buffer(0, h);
+                                        fill_s = Some(fill0.elapsed().as_secs_f64());
+                                        host_prep_s += fill_s.unwrap_or(0.0);
+                                        destroy_hwctx_and_owned_bos(submission, &ctx);
+                                        let mut r = timed_op_base(
+                                            "matmul", m, n, k, dtype, real_ioctl, None,
+                                        );
+                                        r.total_s = t0.elapsed().as_secs_f64();
+                                        r.host_prep_s = host_prep_s;
+                                        r.hwctx_s = hwctx_s;
+                                        r.fill_s = fill_s;
+                                        r.status = "inst_blob_fill_failed".to_string();
+                                        r.detail =
+                                            format!("aiebu ELF rela patch write failed: {e}");
+                                        attach_host_ref(&mut r, m, n, k, dtype);
+                                        return r;
+                                    }
+                                    inst_size = u32::try_from(patched.len()).unwrap_or(u32::MAX);
+                                    blob_note = format!(
+                                        "{blob_note}; aiebu_rela_patched ctrltext={}B",
+                                        patched.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    super::lab_io::destroy_io_bos(submission, &ios);
+                                    let _ = submission.destroy_buffer(0, h);
+                                    fill_s = Some(fill0.elapsed().as_secs_f64());
+                                    host_prep_s += fill_s.unwrap_or(0.0);
+                                    destroy_hwctx_and_owned_bos(submission, &ctx);
+                                    let mut r =
+                                        timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                                    r.total_s = t0.elapsed().as_secs_f64();
+                                    r.host_prep_s = host_prep_s;
+                                    r.hwctx_s = hwctx_s;
+                                    r.fill_s = fill_s;
+                                    r.status = "inst_blob_load_failed".to_string();
+                                    r.detail = format!(
+                                        "aiebu ELF rela patch failed (need aiebu-asm ELF, \
+                                         not raw txn): {e}"
+                                    );
+                                    attach_host_ref(&mut r, m, n, k, dtype);
+                                    return r;
+                                }
+                            }
+                        }
+                    }
                     kernel_args = ios.pack_kernel_args();
+                    let arg_layout = super::lab_io::lab_kernel_arg_layout_from_env();
                     // Pin list: IFM/WTS/OFM, optional CTRL, then instruction.
                     arg_bo_handles = super::lab_io::build_lab_arg_bo_handles_ex(
                         Some((ios.ifm.0, ios.wts.0, ios.ofm.0)),
@@ -3806,15 +4573,20 @@ pub fn timed_matmul_direct(
                     } else {
                         String::new()
                     };
+                    let layout_note = match arg_layout {
+                        super::lab_io::LabKernelArgLayout::Xrt3 => "layout=xrt3",
+                        super::lab_io::LabKernelArgLayout::Count4Ctrl => "layout=count4",
+                    };
                     if ofm_note.is_empty() {
                         ofm_note = format!(
-                            "lab_ofm IFM/WTS/OFM bound (prop_count=0 kernel_args={} ofm_bytes={}{ctrl_note})",
+                            "lab_ofm IFM/WTS/OFM bound (prop_count=0 kernel_args={} \
+                             ofm_bytes={} {layout_note}{ctrl_note})",
                             kernel_args.len(),
                             ios.ofm_bytes
                         );
                     } else {
                         ofm_note = format!(
-                            "{ofm_note}; kernel_args={} ofm_bytes={}{ctrl_note}",
+                            "{ofm_note}; kernel_args={} ofm_bytes={} {layout_note}{ctrl_note}",
                             kernel_args.len(),
                             ios.ofm_bytes
                         );
@@ -3935,6 +4707,24 @@ pub fn timed_matmul_direct(
                     let sw = submit_and_wait_command(submission, 0, &cmd, timeout_ms);
                     let ds = d0.elapsed().as_secs_f64();
                     submit_wait_s = Some(ds);
+                    // Read ERT state **before** GEM_CLOSE of Cmd BO (driver writes
+                    // COMPLETED/ERROR into header after FW response).
+                    let ert_state: Option<u32> = submission
+                        .read_bo_bytes_no_sync(0, handle.0, 0, 4)
+                        .ok()
+                        .and_then(|bytes| {
+                            parse_amdxdna_cmd_header_from_bytes(&bytes)
+                                .ok()
+                                .map(|f| f.state)
+                        });
+                    let ert_note = ert_state.map_or_else(
+                        || "ert_state=unread".to_string(),
+                        |s| format!("ert_state={s}({})", ert_cmd_state_name(s)),
+                    );
+                    // Hardware success for decide: WAIT ok **and** ERT Completed
+                    // (when readable). Unknown state keeps prior WAIT-ok honesty
+                    // for stubs that do not update the header.
+                    let ert_hw_ok = ert_state.is_none_or(ert_cmd_state_is_completed);
                     let _ = submission.destroy_buffer(0, handle.0);
                     match sw {
                         Ok(r) => {
@@ -3944,12 +4734,17 @@ pub fn timed_matmul_direct(
                             let mut ofm_allclose_failed = false;
                             let mut ofm_decide_error = false;
                             let mut detail = format!(
-                                "EXEC_CMD+WAIT accepted seq={} timeout_ms={}; {blob_note}; \
+                                "EXEC_CMD+WAIT seq={} timeout_ms={} {ert_note}; {blob_note}; \
                                  ran_on_npu=false (no numerical verify). Destroying hwctx.",
                                 r.seq, r.timeout_ms
                             );
                             if lab_ofm {
                                 if let Some(ref ios) = io_set {
+                                    // Surface I/O paddrs when OFM stays zero (bind debug).
+                                    let paddr_note = format!(
+                                        "io_paddrs ifm={:#x} wts={:#x} ofm={:#x} ctrl={:#x}",
+                                        ios.ifm_addr, ios.wts_addr, ios.ofm_addr, ios.ctrl_addr
+                                    );
                                     match super::lab_io::readback_ofm(submission, ios) {
                                         Ok(ofm_bytes) => {
                                             ofm_readback_ok = true;
@@ -3959,7 +4754,8 @@ pub fn timed_matmul_direct(
                                                 n: dn,
                                                 k: dk,
                                                 used_inst_blob,
-                                                submit_wait_ok: true,
+                                                // Fail closed: WAIT ok is not enough if ERT Error.
+                                                submit_wait_ok: ert_hw_ok,
                                                 real_ioctl,
                                                 ofm_bytes,
                                                 criteria:
@@ -3969,6 +4765,29 @@ pub fn timed_matmul_direct(
                                             // Pack-mode decide: f32 ones path, or bf16 +
                                             // XDNA2_LAB_OFM_GOLDEN / model golden for mladf.
                                             // Never use f32 ones×ones as a16w4 golden.
+                                            // Best-effort golden for dump stats (LAB_WEIGHT /
+                                            // env golden / f32 ones) — never claims Pass alone.
+                                            let dump_golden: Option<Vec<f32>> =
+                                                ofm_host_golden.as_ref().map_or_else(
+                                                    || match super::lab_io::load_ofm_golden_from_env(
+                                                        dm, dn,
+                                                    ) {
+                                                        Ok(Some(g)) => Some(g),
+                                                        Ok(None)
+                                                            if matches!(
+                                                                decide_pack_mode,
+                                                                super::mladf_pack::LabPackMode::F32Ones
+                                                            ) =>
+                                                        {
+                                                            super::numerical::host_matmul_f32_ones_vec(
+                                                                dm, dn, dk,
+                                                            )
+                                                            .ok()
+                                                        }
+                                                        _ => None,
+                                                    },
+                                                    |g| Some(g.clone()),
+                                                );
                                             let decide =
                                                 super::lab_io::lab_decide_from_ofm_bytes_pack_mode(
                                                     decide_pack_mode,
@@ -3981,15 +4800,15 @@ pub fn timed_matmul_direct(
                                                     // if any honesty flag is missing.
                                                     ran = super::numerical::silicon_ran_on_npu_flags_ok(
                                                         real_ioctl,
-                                                        true, // submit_wait_ok
+                                                        ert_hw_ok,
                                                         used_inst_blob,
                                                         true, // ofm_readback_ok
                                                         true, // decide pass
                                                     );
                                                     if ran {
                                                         detail = format!(
-                                                            "EXEC_CMD+WAIT seq={} + OFM numerical verify \
-                                                             PASS (lab_ofm{}); {blob_note}; {ofm_note}",
+                                                            "EXEC_CMD+WAIT seq={} {ert_note} + OFM numerical \
+                                                             verify PASS (lab_ofm{}); {blob_note}; {ofm_note}",
                                                             r.seq,
                                                             if ofm_host_golden.is_some() {
                                                                 "+model_wts"
@@ -4004,19 +4823,26 @@ pub fn timed_matmul_direct(
                                                         );
                                                     } else {
                                                         detail = format!(
-                                                            "EXEC_CMD+WAIT seq={} decide true but \
+                                                            "EXEC_CMD+WAIT seq={} {ert_note} decide true but \
                                                              silicon_ran_on_npu_flags_ok refused \
-                                                             (real_ioctl={real_ioctl} blob={used_inst_blob}); \
-                                                             {blob_note}; {ofm_note}; ran_on_npu=false",
+                                                             (real_ioctl={real_ioctl} blob={used_inst_blob} \
+                                                             ert_hw_ok={ert_hw_ok}); {blob_note}; {ofm_note}; \
+                                                             ran_on_npu=false",
                                                             r.seq
                                                         );
                                                     }
                                                 }
                                                 Ok((false, reason)) => {
+                                                    let ofm_stats =
+                                                        super::lab_io::format_ofm_mismatch_stats(
+                                                            &plan.ofm_bytes,
+                                                            decide_pack_mode,
+                                                            dump_golden.as_deref(),
+                                                        );
                                                     detail = format!(
-                                                        "EXEC_CMD+WAIT seq={} accepted but OFM verify \
-                                                         refused ({reason:?}); {blob_note}; {ofm_note}; \
-                                                         ran_on_npu=false",
+                                                        "EXEC_CMD+WAIT seq={} {ert_note} accepted but OFM \
+                                                         verify refused ({reason:?}); {blob_note}; {ofm_note}; \
+                                                         {paddr_note}; ofm_stats=[{ofm_stats}]; ran_on_npu=false",
                                                         r.seq
                                                     );
                                                     if super::lab_io::ran_on_npu_reason_is_ofm_verify_fail(
@@ -4028,17 +4854,23 @@ pub fn timed_matmul_direct(
                                                 Err(e) => {
                                                     // Readback succeeded; decide path failed (golden/decode).
                                                     ofm_decide_error = true;
+                                                    let ofm_stats =
+                                                        super::lab_io::format_ofm_mismatch_stats(
+                                                            &plan.ofm_bytes,
+                                                            decide_pack_mode,
+                                                            dump_golden.as_deref(),
+                                                        );
                                                     detail = format!(
-                                                        "EXEC_CMD+WAIT ok but OFM decide error: {e}; \
-                                                         {blob_note}; {ofm_note}"
+                                                        "EXEC_CMD+WAIT {ert_note} but OFM decide error: {e}; \
+                                                         {blob_note}; {ofm_note}; ofm_stats=[{ofm_stats}]"
                                                     );
                                                 }
                                             }
                                         }
                                         Err(e) => {
                                             detail = format!(
-                                                "EXEC_CMD+WAIT ok but OFM readback failed: {e}; \
-                                                 {blob_note}; {ofm_note}"
+                                                "EXEC_CMD+WAIT {ert_note} but OFM readback failed: {e}; \
+                                                 {blob_note}; {ofm_note}; {paddr_note}"
                                             );
                                         }
                                     }
@@ -4049,15 +4881,15 @@ pub fn timed_matmul_direct(
                             // Final product AND (never Pass without readback + flags).
                             ran = super::numerical::silicon_ran_on_npu_flags_ok(
                                 real_ioctl,
-                                true,
+                                ert_hw_ok,
                                 used_inst_blob,
                                 ofm_readback_ok,
                                 ran,
                             );
-                            let st = super::lab_io::classify_lab_matmul_status(
+                            let mut st = super::lab_io::classify_lab_matmul_status(
                                 lab_ofm,
                                 io_set.is_some() || !lab_ofm,
-                                true, // submit_wait_ok
+                                ert_hw_ok,
                                 used_inst_blob,
                                 ofm_readback_ok,
                                 ran,
@@ -4065,6 +4897,19 @@ pub fn timed_matmul_direct(
                                 ofm_decide_error,
                             )
                             .to_string();
+                            // WAIT ioctl OK but FW set ERT Error → more precise than
+                            // generic submit_wait_failed (live 2026-07-16).
+                            if st == "submit_wait_failed"
+                                && ert_state == Some(ErtCmdState::Error as u32)
+                            {
+                                st = "ert_cmd_error".to_string();
+                            }
+                            // Optional always-on BO diag (XDNA2_LAB_BO_DIAG=1) before destroy.
+                            if lab_bo_diag_env_enabled() {
+                                let bo_diag =
+                                    collect_lab_bo_diag(submission, inst_handle, io_set.as_ref());
+                                detail = format!("{detail}; bo_diag=[{bo_diag}]");
+                            }
                             if let Some(ref ios) = io_set {
                                 super::lab_io::destroy_io_bos(submission, ios);
                             }
@@ -4074,6 +4919,9 @@ pub fn timed_matmul_direct(
                             (st, detail, ran)
                         }
                         Err(e) => {
+                            // D3: dump DevHeap + instr (+ I/O) GET_BO_INFO before destroy.
+                            let bo_diag =
+                                collect_lab_bo_diag(submission, inst_handle, io_set.as_ref());
                             if let Some(ref ios) = io_set {
                                 super::lab_io::destroy_io_bos(submission, ios);
                             }
@@ -4085,7 +4933,8 @@ pub fn timed_matmul_direct(
                                 st.to_string(),
                                 format!(
                                     "hwctx ok (handle={}) Cmd BO host-filled ({blob_note}) but \
-                                     submit_and_wait failed ({st}): {e}. {ofm_note}",
+                                     submit_and_wait failed ({st}): {e}. {ofm_note}; \
+                                     bo_diag=[{bo_diag}]",
                                     ctx.handle
                                 ),
                                 false,
@@ -4496,6 +5345,38 @@ pub trait DirectSubmission {
         ))
     }
 
+    /// Client DevHeap BO handle when this submission tracks one (`Real` only).
+    ///
+    /// Default `None` (stub / non-owning). Used by lab BO diagnostics (Phase D3).
+    fn tracked_dev_heap_handle(&self) -> Option<u32> {
+        None
+    }
+
+    /// Ensure BO has a **device-visible** address (PASID UVA for SHMEM, heap for DEV).
+    ///
+    /// Returns `xdna_addr` after pin. Real SHMEM: persistent mmap (do not munmap
+    /// until destroy). Stub: returns GET_BO_INFO.xdna_addr.
+    ///
+    /// # Errors
+    ///
+    /// Invalid map_offset, mmap fail, or still-invalid xdna_addr after pin.
+    fn pin_bo_for_device_access(
+        &self,
+        fd: RawFd,
+        handle: u32,
+        size: u64,
+    ) -> Result<u64, DirectError> {
+        let _ = size;
+        let info = self.get_bo_info(fd, handle)?;
+        if is_valid_xdna_device_addr(info.xdna_addr) {
+            return Ok(info.xdna_addr);
+        }
+        Err(DirectError::InvalidArgument(format!(
+            "pin_bo_for_device_access: handle={handle} xdna_addr={:#x} invalid (map_offset={:#x})",
+            info.xdna_addr, info.map_offset
+        )))
+    }
+
     /// Write host bytes into a BO (mmap path on Real).
     ///
     /// **Required** before EXEC_CMD for Cmd BOs — see [`fill_cmd_bo_with_payload`].
@@ -4721,6 +5602,7 @@ impl DirectSubmission for StubDirectSubmission {
                 exec_cmd_block_reason().to_string(),
             ));
         }
+        exec_cmd_requires_filled_cmd_bo(cmd)?;
         // Would issue DRM_IOCTL_AMDXDNA_EXEC_CMD using the structures from amdxdna_accel.h
         Err(DirectError::Unsupported(format!(
             "stub: EXEC_CMD allowed but real payload/submission not implemented (cmd type: {:?})",
@@ -5183,6 +6065,40 @@ mod tests {
         // AIE2_DEVM_SIZE (64 MiB). If this constant drifts, CREATE_HWCTX will
         // fail with ENOENT / EINVAL on real silicon.
         assert_eq!(AIE2_DEV_HEAP_SIZE, 64 * 1024 * 1024);
+        assert_eq!(AIE2_DEV_HEAP_UVA_ALIGN, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn next_aligned_addr_and_dev_heap_uva_helpers() {
+        assert!(is_power_of_two_usize(64 * 1024 * 1024));
+        assert!(!is_power_of_two_usize(0));
+        assert!(!is_power_of_two_usize(3));
+
+        let align = AIE2_DEV_HEAP_UVA_ALIGN;
+        // Live 2026-07-16 lab UVA that FW rejected (only 2 MiB aligned).
+        let live_misaligned = 0x0000_7f35_1540_0000_usize;
+        assert_eq!(live_misaligned % (2 * 1024 * 1024), 0);
+        assert!(!is_dev_heap_uva_aligned(live_misaligned));
+        let next = next_aligned_addr_usize(live_misaligned, align);
+        assert!(is_dev_heap_uva_aligned(next));
+        assert!(next > live_misaligned);
+        assert_eq!(next, 0x0000_7f35_1800_0000);
+
+        assert!(!is_dev_heap_uva_aligned(0));
+        assert!(is_dev_heap_uva_aligned(0x0000_7f35_1800_0000));
+        // Already aligned → unchanged.
+        assert_eq!(next_aligned_addr_usize(0x1000_0000, align), 0x1000_0000);
+    }
+
+    #[test]
+    fn mmap_dev_heap_drm_aligned_refuses_bad_args() {
+        let err = mmap_dev_heap_drm_aligned(-1, 0, 0, AIE2_DEV_HEAP_UVA_ALIGN).unwrap_err();
+        assert!(
+            format!("{err}").contains("bad size") || format!("{err}").contains("align"),
+            "{err}"
+        );
+        let err2 = mmap_dev_heap_drm_aligned(-1, 0, 4096, 3).unwrap_err();
+        assert!(format!("{err2}").contains("bad"), "{err2}");
     }
 
     #[test]
@@ -5296,6 +6212,20 @@ mod tests {
         // Bare 4-byte LE header also works.
         let f2 = parse_amdxdna_cmd_header_from_bytes(&h.to_le_bytes()).expect("4-byte header");
         assert_eq!(f2, f);
+    }
+
+    #[test]
+    fn ert_cmd_state_name_and_completed() {
+        assert_eq!(
+            ert_cmd_state_name(ErtCmdState::Completed as u32),
+            "Completed"
+        );
+        assert_eq!(ert_cmd_state_name(ErtCmdState::Error as u32), "Error");
+        assert_eq!(ert_cmd_state_name(ErtCmdState::New as u32), "New");
+        assert_eq!(ert_cmd_state_name(99), "Unknown");
+        assert!(ert_cmd_state_is_completed(ErtCmdState::Completed as u32));
+        assert!(!ert_cmd_state_is_completed(ErtCmdState::Error as u32));
+        assert!(!ert_cmd_state_is_completed(ErtCmdState::New as u32));
     }
 
     #[test]
@@ -5561,6 +6491,144 @@ mod tests {
         let f = parse_amdxdna_cmd_header_from_bytes(&p).expect("header");
         assert_eq!(f.count, AMDXDNA_CMD_COUNT_MAX);
         assert_eq!(p.len(), 4 + (AMDXDNA_CMD_COUNT_MAX as usize) * 4);
+    }
+
+    #[test]
+    fn is_valid_xdna_device_addr_refuses_zero_and_max() {
+        assert!(!is_valid_xdna_device_addr(0));
+        assert!(!is_valid_xdna_device_addr(AMDXDNA_INVALID_ADDR));
+        assert!(!is_valid_xdna_device_addr(u64::MAX));
+        assert!(is_valid_xdna_device_addr(0x1_0000_0000));
+        assert!(is_valid_xdna_device_addr(0xdead_beef));
+        assert_eq!(BufferType::Dev as u32, 3);
+        assert_eq!(AMDXDNA_INVALID_ADDR, u64::MAX);
+    }
+
+    #[test]
+    fn classify_submit_wait_error_eio_and_map_host() {
+        let eio = DirectError::IoctlFailed(
+            "EXEC_CMD failed (...): Input/output error (os error 5). Hint: map_host".into(),
+        );
+        assert_eq!(classify_submit_wait_error(&eio), "exec_eio");
+        let map = DirectError::IoctlFailed("aie2_map_host_buf failed opcode 0x106".into());
+        assert_eq!(classify_submit_wait_error(&map), "exec_eio");
+        let perm = DirectError::Unsupported("exec_cmd_allow=0".into());
+        assert_eq!(classify_submit_wait_error(&perm), "exec_cmd_perm");
+        let to = DirectError::IoctlFailed("WAIT_CMD etimedout".into());
+        assert_eq!(classify_submit_wait_error(&to), "wait_timeout");
+        // payload / txn / EINVAL class
+        let pay = DirectError::InvalidArgument("payload txn not implemented".into());
+        assert_eq!(classify_submit_wait_error(&pay), "payload_unsupported");
+        let einval =
+            DirectError::IoctlFailed("ioctl failed: Invalid argument (os error 22)".into());
+        assert_eq!(classify_submit_wait_error(&einval), "payload_unsupported");
+        // priority: timeout wins over eio-looking text when both present
+        let to_first = DirectError::IoctlFailed("timeout after map_host eio".into());
+        assert_eq!(classify_submit_wait_error(&to_first), "wait_timeout");
+        // priority: eperm before eio
+        let perm_eio = DirectError::Unsupported("permission denied eio".into());
+        assert_eq!(classify_submit_wait_error(&perm_eio), "exec_cmd_perm");
+        // generic fallback
+        let other = DirectError::IoctlFailed("unexpected firmware reject 0xdead".into());
+        assert_eq!(classify_submit_wait_error(&other), "submit_wait_failed");
+    }
+
+    #[test]
+    fn exec_cmd_requires_filled_cmd_bo_pure() {
+        let empty = Command {
+            ty: CommandType::SubmitExecBuf,
+            hwctx_handle: 1,
+            payload: vec![],
+            cmd_bo_handle: Some(9),
+            arg_bo_handles: vec![],
+        };
+        let e = exec_cmd_requires_filled_cmd_bo(&empty).expect_err("empty");
+        assert!(e.to_string().contains("empty payload"), "{e}");
+        let no_bo = Command {
+            ty: CommandType::SubmitExecBuf,
+            hwctx_handle: 1,
+            payload: vec![1, 2, 3, 4],
+            cmd_bo_handle: None,
+            arg_bo_handles: vec![],
+        };
+        let e2 = exec_cmd_requires_filled_cmd_bo(&no_bo).expect_err("no bo");
+        assert!(e2.to_string().contains("cmd_bo_handle"), "{e2}");
+        let ok = Command {
+            ty: CommandType::SubmitExecBuf,
+            hwctx_handle: 1,
+            payload: vec![1, 2, 3, 4],
+            cmd_bo_handle: Some(3),
+            arg_bo_handles: vec![],
+        };
+        exec_cmd_requires_filled_cmd_bo(&ok).expect("filled");
+    }
+
+    #[test]
+    fn format_bo_info_diag_pure() {
+        let info = amdxdna_drm_get_bo_info {
+            ext: 0,
+            ext_flags: 0,
+            handle: 7,
+            pad: 0,
+            map_offset: 0x1000,
+            vaddr: 0x2000,
+            xdna_addr: 0x1_0000_0000,
+        };
+        let s = format_bo_info_diag("instr", 7, Some(&info), Some("Dev"));
+        assert!(s.contains("handle=7"), "{s}");
+        assert!(s.contains("ty=Dev"), "{s}");
+        assert!(s.contains("map_offset=0x1000"), "{s}");
+        assert!(s.contains("xdna_addr=0x100000000"), "{s}");
+        assert!(s.contains("valid_addr=true"), "{s}");
+        let bad = amdxdna_drm_get_bo_info {
+            handle: 1,
+            map_offset: AMDXDNA_INVALID_ADDR,
+            xdna_addr: AMDXDNA_INVALID_ADDR,
+            ..info
+        };
+        let s2 = format_bo_info_diag("instr", 1, Some(&bad), Some("Shmem"));
+        assert!(s2.contains("valid_addr=false"), "{s2}");
+        let s3 = format_bo_info_diag("DevHeap", 0, None, Some("DevHeap"));
+        assert!(s3.contains("GET_BO_INFO unavailable"), "{s3}");
+    }
+
+    #[test]
+    fn collect_lab_bo_diag_on_stub() {
+        let stub = StubDirectSubmission::default();
+        // No DevHeap tracked on stub; instr handle 3 gets fake GET_BO_INFO.
+        let s = collect_lab_bo_diag(&stub, Some(3), None);
+        assert!(s.contains("DevHeap: handle=none"), "{s}");
+        assert!(s.contains("instr: handle=3"), "{s}");
+        assert!(s.contains("ty=Dev"), "{s}");
+        assert!(s.contains("valid_addr=true"), "{s}");
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // test-only env isolation
+    fn lab_bo_diag_env_on_off() {
+        let prev = std::env::var("XDNA2_LAB_BO_DIAG").ok();
+        unsafe {
+            std::env::remove_var("XDNA2_LAB_BO_DIAG");
+        }
+        assert!(!lab_bo_diag_env_enabled(), "unset must be off");
+        unsafe {
+            std::env::set_var("XDNA2_LAB_BO_DIAG", "1");
+        }
+        assert!(lab_bo_diag_env_enabled(), "1 must be on");
+        unsafe {
+            std::env::set_var("XDNA2_LAB_BO_DIAG", "true");
+        }
+        assert!(lab_bo_diag_env_enabled(), "true must be on");
+        unsafe {
+            std::env::set_var("XDNA2_LAB_BO_DIAG", "0");
+        }
+        assert!(!lab_bo_diag_env_enabled(), "0 must be off");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDNA2_LAB_BO_DIAG", v),
+                None => std::env::remove_var("XDNA2_LAB_BO_DIAG"),
+            }
+        }
     }
 
     #[test]

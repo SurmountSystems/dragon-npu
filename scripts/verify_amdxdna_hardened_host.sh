@@ -31,6 +31,8 @@ DIAG="${ROOT}/scripts/diagnose_amdxdna.sh"
 QUIET=0
 SKIP_DIAG=0
 POST_REBOOT=0
+# Lab apply with --assume-l3-already-open: soft-pass exec_cmd_allow=Y for this check only.
+ALLOW_OPEN_EXEC=0
 # Optional: expected substring in modinfo filename AND on-disk module path
 # (default: updates/amdxdna-hardened under /lib/modules/$(uname -r)/)
 EXPECT_PATH_SUB="${AMDXDNA_EXPECT_PATH_SUB:-updates/amdxdna-hardened}"
@@ -56,6 +58,8 @@ Options:
   --post-reboot      Same checks as default; labels output for the reboot-proof
                      checklist (does not prove a reboot occurred; wrong-family
                      firmware aliases always hard-fail regardless of this flag)
+  --allow-open-exec-cmd  Soft-pass when exec_cmd_allow is Y/1 (temporary lab
+                     window only; lab_exec_once --assume-l3-already-open uses this)
   -h, --help         This help
 
 Env:
@@ -76,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --quiet) QUIET=1; shift ;;
     --skip-diagnose) SKIP_DIAG=1; shift ;;
     --post-reboot) POST_REBOOT=1; shift ;;
+    --allow-open-exec-cmd) ALLOW_OPEN_EXEC=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *)
       echo "verify: unknown arg: $1" >&2
@@ -213,7 +218,11 @@ if [[ -d /sys/module/amdxdna ]]; then
       ok "exec_cmd_allow=$EXEC_VAL (lab default refuse EXEC_CMD)"
       ;;
     Y | 1 | y)
-      bad "exec_cmd_allow=$EXEC_VAL — EXEC_CMD open in kernel; lab expects 0/N"
+      if [[ "$ALLOW_OPEN_EXEC" -eq 1 ]]; then
+        soft "exec_cmd_allow=$EXEC_VAL — EXEC open (allowed for temporary lab window; restore to 0 after)"
+      else
+        bad "exec_cmd_allow=$EXEC_VAL — EXEC_CMD open in kernel; lab expects 0/N (or re-run verify with --allow-open-exec-cmd during intentional L3 window)"
+      fi
       ;;
     MISSING)
       bad "exec_cmd_allow sysfs param missing while module loaded"
@@ -384,8 +393,10 @@ else
     if [[ -z "${DIAG_VERDICT:-}" ]]; then
       soft "diagnose produced no verdict (rc=$DIAG_RC) — read full: bash scripts/diagnose_amdxdna.sh"
       if [[ -n "$DIAG_ERR" ]]; then
-        # Short hint only; do not dump full stderr
-        err "verify: diagnose stderr hint: $(printf '%s' "$DIAG_ERR" | head -c 200 | tr '\n' ' ')"
+        # Short hint only; do not dump full stderr.
+        # Avoid `head | tr` under pipefail — SIGPIPE → exit 141 (false FAIL).
+        local hint="${DIAG_ERR//$'\n'/ }"
+        err "verify: diagnose stderr hint: ${hint:0:200}"
       fi
     fi
     case "$DIAG_VERDICT" in

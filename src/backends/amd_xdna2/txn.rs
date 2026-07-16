@@ -608,10 +608,203 @@ pub fn instruction_payload_bytes(bytes: &[u8]) -> Result<Vec<u8>, DirectError> {
     }
 }
 
+/// True when `bytes` look like ELF32 LE with a `.ctrltext` section (aiebu output).
+#[must_use]
+pub fn is_aiebu_elf_ctrltext(bytes: &[u8]) -> bool {
+    matches!(
+        classify_instruction_blob(bytes),
+        InstructionBlobKind::Aie2ElfCtrltext { .. }
+    )
+}
+
+/// One ELF32 `.rela.dyn` entry (12 bytes): `r_offset`, `r_info`, `r_addend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elf32Rela {
+    /// Offset into the section being relocated (here: `.ctrltext`).
+    pub offset: u32,
+    /// `(sym << 8) | type` for ELF32.
+    pub info: u32,
+    /// Addend added to the symbol value.
+    pub addend: i32,
+}
+
+impl Elf32Rela {
+    /// Symbol index from `r_info`.
+    #[must_use]
+    pub fn sym(&self) -> u32 {
+        self.info >> 8
+    }
+    /// Relocation type from `r_info`.
+    #[must_use]
+    pub fn rtype(&self) -> u32 {
+        self.info & 0xff
+    }
+}
+
+/// Parse ELF32 little-endian `.rela.dyn` entries (empty if missing).
+///
+/// # Errors
+///
+/// Truncated section table / rela table.
+pub fn parse_elf32_rela_dyn(elf: &[u8]) -> Result<Vec<Elf32Rela>, DirectError> {
+    if elf.len() < 52 || elf[0..4] != [0x7f, b'E', b'L', b'F'] || elf[4] != 1 || elf[5] != 1 {
+        return Ok(Vec::new());
+    }
+    let e_shoff = u32::from_le_bytes(elf[32..36].try_into().unwrap()) as usize;
+    let e_shentsize = u16::from_le_bytes(elf[46..48].try_into().unwrap()) as usize;
+    let e_shnum = u16::from_le_bytes(elf[48..50].try_into().unwrap()) as usize;
+    let e_shstrndx = u16::from_le_bytes(elf[50..52].try_into().unwrap()) as usize;
+    if e_shentsize < 40 || e_shnum == 0 || e_shstrndx >= e_shnum {
+        return Ok(Vec::new());
+    }
+    let sh_end = e_shoff
+        .checked_add(e_shentsize.saturating_mul(e_shnum))
+        .ok_or_else(|| DirectError::InvalidArgument("elf sh_table overflow".into()))?;
+    if sh_end > elf.len() {
+        return Err(DirectError::InvalidArgument(
+            "elf section table out of range".into(),
+        ));
+    }
+    let str_hdr = e_shoff + e_shentsize * e_shstrndx;
+    let str_off = u32::from_le_bytes(elf[str_hdr + 16..str_hdr + 20].try_into().unwrap()) as usize;
+    let str_size = u32::from_le_bytes(elf[str_hdr + 20..str_hdr + 24].try_into().unwrap()) as usize;
+    if str_off.saturating_add(str_size) > elf.len() {
+        return Err(DirectError::InvalidArgument("elf shstrtab OOB".into()));
+    }
+    let strtab = &elf[str_off..str_off + str_size];
+    for i in 0..e_shnum {
+        let h = e_shoff + e_shentsize * i;
+        let name_off = u32::from_le_bytes(elf[h..h + 4].try_into().unwrap()) as usize;
+        let sh_type = u32::from_le_bytes(elf[h + 4..h + 8].try_into().unwrap());
+        // SHT_RELA = 4
+        if sh_type != 4 {
+            continue;
+        }
+        let name = read_c_string(strtab, name_off).unwrap_or("");
+        if name != ".rela.dyn" {
+            continue;
+        }
+        let sec_off = u32::from_le_bytes(elf[h + 16..h + 20].try_into().unwrap()) as usize;
+        let sec_size = u32::from_le_bytes(elf[h + 20..h + 24].try_into().unwrap()) as usize;
+        if sec_off.saturating_add(sec_size) > elf.len() || !sec_size.is_multiple_of(12) {
+            return Err(DirectError::InvalidArgument(
+                "elf .rela.dyn size/offset invalid".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(sec_size / 12);
+        let mut o = sec_off;
+        while o + 12 <= sec_off + sec_size {
+            let offset = u32::from_le_bytes(elf[o..o + 4].try_into().unwrap());
+            let info = u32::from_le_bytes(elf[o + 4..o + 8].try_into().unwrap());
+            let addend = i32::from_le_bytes(elf[o + 8..o + 12].try_into().unwrap());
+            out.push(Elf32Rela {
+                offset,
+                info,
+                addend,
+            });
+            o += 12;
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
+/// Peel `.ctrltext` and apply aiebu `.rela.dyn` with device/buffer paddrs.
+///
+/// XRT/shim (`txn_file2elf` + `patch_ctrl_code`) does this before EXEC. Submitting
+/// **raw** DD txn (or unpatched ctrltext) yields FW `APP_LOAD_PDI_FAIL` (0x3000003)
+/// on live silicon (2026-07-16).
+///
+/// Symbol index mapping (aiebu dynsym 1..n): `1→ifm`, `2→wts`, `3→ofm`, `4→ctrl`
+/// (extra symbols ignored). Reloc type is treated as **u64 LE** store of
+/// `base.wrapping_add(addend as u64)` at `ctrltext[offset]`.
+///
+/// # Errors
+///
+/// Not an aiebu ELF, OOB reloc, or empty ctrltext.
+pub fn patch_aiebu_elf_ctrltext_with_bos(
+    elf: &[u8],
+    ifm_paddr: u64,
+    wts_paddr: u64,
+    ofm_paddr: u64,
+    ctrl_paddr: u64,
+) -> Result<Vec<u8>, DirectError> {
+    let (off, len) = match classify_instruction_blob(elf) {
+        InstructionBlobKind::Aie2ElfCtrltext {
+            ctrltext_off,
+            ctrltext_len,
+            ..
+        } => (ctrltext_off, ctrltext_len),
+        other => {
+            return Err(DirectError::InvalidArgument(format!(
+                "patch_aiebu_elf_ctrltext: need aiebu ELF with .ctrltext, got {}",
+                other.summary()
+            )));
+        }
+    };
+    let mut ctrltext = elf[off..off + len].to_vec();
+    let relas = parse_elf32_rela_dyn(elf)?;
+    if relas.is_empty() {
+        return Err(DirectError::InvalidArgument(
+            "patch_aiebu_elf_ctrltext: ELF has no .rela.dyn entries to apply".into(),
+        ));
+    }
+    let bases = [0_u64, ifm_paddr, wts_paddr, ofm_paddr, ctrl_paddr];
+    for r in &relas {
+        let sym = r.sym() as usize;
+        let base = bases.get(sym).copied().unwrap_or(0);
+        let value = base.wrapping_add(r.addend as u64);
+        let o = r.offset as usize;
+        if o.checked_add(8).is_none_or(|end| end > ctrltext.len()) {
+            return Err(DirectError::InvalidArgument(format!(
+                "patch_aiebu_elf_ctrltext: reloc offset {o}+8 OOB (ctrltext {})",
+                ctrltext.len()
+            )));
+        }
+        // Type 5 observed on aiebu aie2txn output — always write u64 LE.
+        ctrltext[o..o + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(ctrltext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn patch_aiebu_elf_applies_rela_u64() {
+        // Prefer live staged ELF if present (gitignored); else skip-shaped synthetic.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf");
+        if !path.is_file() {
+            return;
+        }
+        let elf = std::fs::read(&path).expect("read elf");
+        assert!(is_aiebu_elf_ctrltext(&elf));
+        let relas = parse_elf32_rela_dyn(&elf).expect("rela");
+        assert!(!relas.is_empty(), "expected .rela.dyn entries");
+        // Staged mladf ELF: 12 relas (8×sym1 IFM, 2×sym2 WTS, 2×sym3 OFM).
+        assert_eq!(relas.len(), 12, "staged ELF rela count");
+        let ifm = 0x1111_0000_u64;
+        let wts = 0x2222_0000_u64;
+        let ofm = 0x3333_0000_u64;
+        let ctrl = 0x4444_0000_u64;
+        let patched =
+            patch_aiebu_elf_ctrltext_with_bos(&elf, ifm, wts, ofm, ctrl).expect("patch");
+        assert_eq!(patched.len(), 0x698);
+        let bases = [0_u64, ifm, wts, ofm, ctrl];
+        for r in &relas {
+            let base = bases.get(r.sym() as usize).copied().unwrap_or(0);
+            let expect = base.wrapping_add(r.addend as u64);
+            let o = r.offset as usize;
+            let v = u64::from_le_bytes(patched[o..o + 8].try_into().unwrap());
+            assert_eq!(v, expect, "rela off={o:#x} sym={} addend={}", r.sym(), r.addend);
+        }
+        // First reloc at 0x2c sym1 + 0 → ifm
+        let v = u64::from_le_bytes(patched[0x2c..0x2c + 8].try_into().unwrap());
+        assert_eq!(v, ifm);
+    }
 
     #[test]
     fn header_roundtrip() {

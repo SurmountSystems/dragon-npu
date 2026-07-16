@@ -11,7 +11,7 @@ Packing/layout alone never sets `ran_on_npu`.
 ## Operator one-liner helper
 
 ```bash
-bash tools/silicon_lab_operator.sh status           # what's missing
+bash tools/silicon_lab_operator.sh status           # assets + exec_cmd_allow + readiness
 bash tools/silicon_lab_operator.sh stage            # Priority 2: instr+ctrl+WTS
 # Priority 1 Option A (vendor NPU OFM — instrumented; may need temporary L3):
 echo 1 | sudo tee /sys/module/amdxdna/parameters/exec_cmd_allow
@@ -19,10 +19,67 @@ bash tools/silicon_lab_operator.sh capture-golden   # DD load_xrt + install-gold
 echo 0 | sudo tee /sys/module/amdxdna/parameters/exec_cmd_allow
 bash tools/silicon_lab_operator.sh preflight        # require-pass assets
 bash tools/silicon_lab_operator.sh dry-run          # no L3 / no dragon-npu EXEC
+# HITL only (explicit wedge risk; wraps lab_exec --apply):
+# bash tools/silicon_lab_operator.sh apply
 ```
 
 `capture-golden` runs `tools/capture_mladf_ofm_golden.sh` (same synthetic tensors
 as WTS export, bf16 ones IFM, vendor `execute`, 512 B bf16 dump).
+
+## Phase D diagnostics (map_host / 0x106)
+
+Live 2026-07-16 pure-direct apply reached EXEC but failed before GEMM Pass:
+
+| Userspace | Kernel journal fingerprint |
+|-----------|----------------------------|
+| `status=exec_eio` (or historical `payload_unsupported`) | `MSG_OP_MAP_HOST_BUFFER (0x106)` |
+| `submit_and_wait` EIO (`os error 5`) | `aie2_map_host_buf size 0x4000000` (64 MiB DevHeap) |
+| FW status `0x4000003` (`AIE2_STATUS_INVALID_PARAM`) | Often **unaligned DevHeap UVA** (not BO handles) |
+| `inst_blob_addr_invalid` if `xdna_addr=0` / `u64::MAX` | (often after Shmem instr BO — XRT uses **BO_DEV**) |
+| `detail` includes `bo_diag=[DevHeap: …; instr: …]` | Compare map_offset / xdna_addr / **vaddr % 0x4000000** |
+
+### Root cause (D3c — 64 MiB UVA align)
+
+Firmware maps the client DevHeap via `aie2_map_host_buf` in `dev_mem_size` (64 MiB) chunks.
+The **user VA must be 64 MiB-aligned**. Plain `mmap` of the DRM BO often returns only
+2 MiB alignment (e.g. live `vaddr=0x7f3515400000` → `INVALID_PARAM`).
+
+XRT (`shim/buffer.cpp` `mmap_ptr` + `kmq/pcidev.cpp` `heap_page_size`) reserves an aligned
+anonymous VA window, then `MAP_FIXED`s the DevHeap BO. Pure-direct now does the same in
+`mmap_dev_heap_drm_aligned` / `ensure_dev_heap`.
+
+After re-apply, `bo_diag` DevHeap `vaddr` should satisfy `vaddr % 0x4000000 == 0`.
+
+**Offline helpers (no L3):**
+
+- Instruction BO = `BufferType::Dev` + `write_dev_bo_via_heap` (D2)
+- SHMEM PASID pin for IFM/WTS/OFM/ctrl (D2b)
+- DevHeap mmap **64 MiB-aligned UVA** (D3c)
+- Refuse invalid `xdna_addr` (D1)
+- On submit failure: auto `bo_diag` dump of DevHeap + instruction (+ IFM/WTS/OFM/ctrl if bound)
+- Optional always-on: `export XDNA2_LAB_BO_DIAG=1`
+- OFM decide refuse: `ofm_stats=[raw_len=… nonzero_f32=… first_bf16_le=…]` (no fake Pass)
+
+**Re-apply (operator HITL) — use aiebu ELF, not raw txn:**
+
+```bash
+# Stage aiebu ELF once (needs system aiebu-asm / libaiebu):
+bash tools/stage_aiebu_lab_instr.sh
+# → testdata/xdna2_cmd/silicon_lab/lab_instr.elf (~32 KiB, has .ctrltext + .rela.dyn)
+
+bash tools/silicon_lab_preflight.sh --require-pass-assets
+export XDNA2_LAB_BO_DIAG=1
+# Prefer .elf (script auto-upgrades .bin → sibling .elf when present):
+# bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets \
+#       --apply --i-accept-wedge-risk --assume-l3-already-open \
+#       --blob testdata/xdna2_cmd/silicon_lab/lab_instr.elf
+# Expect in TimedOpResult.detail:
+#   aiebu_elf=1 … aiebu_rela_patched ctrltext=1688B
+# Raw lab_instr.bin (1688 B) → ert_state=5(Error) / APP_LOAD_PDI_FAIL — not Pass.
+# Success signal: ert_state=4(Completed) and/or ofm_stats raw_nonzero_bytes>0 then allclose.
+cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be N
+# journalctl -k -b | grep -E 'Failed cmd|Status 0x|amdxdna' | tail
+```
 
 ## Stage offline assets
 
@@ -38,8 +95,9 @@ Produces under `testdata/xdna2_cmd/silicon_lab/` (gitignored bins):
 
 | File | Size | Role |
 |------|------|------|
-| `lab_instr.bin` | 1688 | Instruction txn |
-| `lab_ctrl.bin` | 29664 | Control packet |
+| `lab_instr.bin` | 1688 | Raw DD txn (offline dump only) |
+| `lab_instr.elf` | ~32 KiB | **EXEC payload** — aiebu ELF (`.ctrltext` + `.rela.dyn`); stage via `tools/stage_aiebu_lab_instr.sh` |
+| `lab_ctrl.bin` | 29664 | Control packet (= ELF `.ctrldata`) |
 | `lab_ctrl_meta.json` | — | Sizes + patch locations |
 | `ifm.bin` | 2304 | bf16 ones (also rebuilt in Rust) |
 | `wts.bin` | 174080 | zeros unless `--wts-from` / `--export-wts` |
@@ -160,8 +218,9 @@ replaced with this process's IFM/WTS/OFM `xdna_addr` values (u64 LE overwrite re
 **Honesty / residual:**
 
 - `lab_ctrl.bin` is a **vendor DD dump**, not hand-written microcode.  
-- Meta lists `size: 6` and `operation: read_add_write`; lab pure path overwrites
-  **u64 LE** at each listed offset — **not** proven full XRT 6-byte add semantics.  
+- Meta lists `size: 6` and `operation: read_add_write`: lab applies
+  **existing field + BO base** and writes **6** LE bytes (preserves tile offsets
+  e.g. OFM `0x100`, WTS `0x15400`). Full u64 overwrite was wrong (zero OFM after EXEC).  
 - Ctrl attach / count-4 ≠ `ran_on_npu` / silicon Pass.
 
 ## Live EXEC (Phase C / Milestone C — operator HITL)
@@ -246,9 +305,10 @@ bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
 
 # 2) Lab dry-run: diagnose + silicon recipe + env print — NEVER opens L3 / EXEC
 bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets
-# (sets PACK/KEY/META/WTS/CTRL/REQUIRE_*/OFM/AUTO_PATCH + default blob=lab_instr.bin)
+# (sets PACK/KEY/META/WTS/CTRL/REQUIRE_*/OFM/AUTO_PATCH + default blob=lab_instr.elf)
 
 # 3) Apply only if dry-run OK + operator accepts wedge risk (HITL sudo for L3):
+# Prefer lab_instr.elf (aiebu); script upgrades .bin→.elf when sibling exists.
 # bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets \
 #   --apply --i-accept-wedge-risk --blob "$XDNA2_INSTRUCTION_BLOB"
 #
@@ -266,7 +326,7 @@ bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets
 Manual env (equivalent to `--silicon-mladf` wiring):
 
 ```bash
-export XDNA2_INSTRUCTION_BLOB=$PWD/testdata/xdna2_cmd/silicon_lab/lab_instr.bin
+export XDNA2_INSTRUCTION_BLOB=$PWD/testdata/xdna2_cmd/silicon_lab/lab_instr.elf
 export XDNA2_LAB_OFM=1
 export XDNA2_LAB_PACK=mladf_a16w4
 export XDNA2_LAB_MLADF_KEY='mladfmatmulbias_prmptflat_mladf_2x4x4_flat_a16fw4acc16f_1_1152_256_128'

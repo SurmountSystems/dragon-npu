@@ -16,7 +16,7 @@
 
 use super::direct::{
     BufferHandle, BufferType, DirectError, DirectSubmission, HOST_REF_MAX_ELEMENTS,
-    SYNC_BO_FROM_DEVICE,
+    SYNC_BO_FROM_DEVICE, is_valid_xdna_device_addr,
 };
 use super::mladf_pack::{
     LabPackMode, MladfBufferPlan, build_mladf_lab_payloads, load_wts_packed_from_env,
@@ -25,7 +25,7 @@ use super::mladf_pack::{
 };
 use super::numerical::{
     NumericalVerifyCriteria, NumericalVerifyInput, RanOnNpuBlockReason, decide_ran_on_npu_reason,
-    host_matmul_f32_ones_vec,
+    host_matmul_f32_ones_vec, max_abs_diff_f32,
 };
 
 // ---------------------------------------------------------------------------
@@ -188,10 +188,37 @@ pub fn pack_start_npu_kernel_args(ifm_paddr: u64, wts_paddr: u64, ofm_paddr: u64
     pack_start_npu_kernel_args_with_ctrl(ifm_paddr, wts_paddr, ofm_paddr, None)
 }
 
+/// Kernel-arg buffer count / layout for START_NPU PARTIAL_ELF.
+///
+/// Live 2026-07-16: `ert_state=Error` with count-4; XRT shim_test uses **3**
+/// (IFM/WTS/OFM + two trailing zeros). Count-4 with ctrl as 4th paddr is the
+/// mladf meta `xrt_id` hypothesis — still unproven on silicon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LabKernelArgLayout {
+    /// `n_bos=4`, slots IFM/WTS/OFM/CTRL, one trailing u64 zero (historical lab).
+    #[default]
+    Count4Ctrl,
+    /// XRT `elf_io_test` classic: `n_bos=3`, IFM/WTS/OFM, two trailing u64 zeros.
+    /// Control packet is still patched + pinned via `arg_bo_handles` when present.
+    Xrt3,
+}
+
+/// `XDNA2_LAB_KERNEL_ARG_LAYOUT=xrt3|count4` (default **count4**).
+#[must_use]
+pub fn lab_kernel_arg_layout_from_env() -> LabKernelArgLayout {
+    match std::env::var("XDNA2_LAB_KERNEL_ARG_LAYOUT")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "xrt3" | "3" | "classic" => LabKernelArgLayout::Xrt3,
+        _ => LabKernelArgLayout::Count4Ctrl,
+    }
+}
+
 /// Like [`pack_start_npu_kernel_args`] with optional **control packet** paddr.
 ///
-/// When `ctrl_paddr` is `Some`, the leading count dword pair is **4** and the
-/// fourth buffer slot is the control packet address (mladf meta `runtime_control_packet`).
+/// Layout selected by [`lab_kernel_arg_layout_from_env`] / `layout` arg.
 #[must_use]
 pub fn pack_start_npu_kernel_args_with_ctrl(
     ifm_paddr: u64,
@@ -199,16 +226,51 @@ pub fn pack_start_npu_kernel_args_with_ctrl(
     ofm_paddr: u64,
     ctrl_paddr: Option<u64>,
 ) -> Vec<u32> {
-    let n_bos: u64 = if ctrl_paddr.is_some() { 4 } else { 3 };
+    pack_start_npu_kernel_args_with_ctrl_layout(
+        ifm_paddr,
+        wts_paddr,
+        ofm_paddr,
+        ctrl_paddr,
+        lab_kernel_arg_layout_from_env(),
+    )
+}
+
+/// Explicit layout variant of [`pack_start_npu_kernel_args_with_ctrl`].
+#[must_use]
+pub fn pack_start_npu_kernel_args_with_ctrl_layout(
+    ifm_paddr: u64,
+    wts_paddr: u64,
+    ofm_paddr: u64,
+    ctrl_paddr: Option<u64>,
+    layout: LabKernelArgLayout,
+) -> Vec<u32> {
     let mut out = Vec::with_capacity(15);
-    out.extend_from_slice(&u64_to_prop_dwords(n_bos));
-    out.extend_from_slice(&u64_to_prop_dwords(0));
-    out.push(0);
-    out.extend_from_slice(&u64_to_prop_dwords(ifm_paddr));
-    out.extend_from_slice(&u64_to_prop_dwords(wts_paddr));
-    out.extend_from_slice(&u64_to_prop_dwords(ofm_paddr));
-    out.extend_from_slice(&u64_to_prop_dwords(ctrl_paddr.unwrap_or(0)));
-    out.extend_from_slice(&u64_to_prop_dwords(0));
+    match layout {
+        LabKernelArgLayout::Xrt3 => {
+            // XRT elf_io_test_bo_set::init_cmd (START_NPU PARTIAL_ELF):
+            //   u64 3, u64 0, u32 0, ifm, wts, ofm, u64 0, u64 0
+            out.extend_from_slice(&u64_to_prop_dwords(3));
+            out.extend_from_slice(&u64_to_prop_dwords(0));
+            out.push(0);
+            out.extend_from_slice(&u64_to_prop_dwords(ifm_paddr));
+            out.extend_from_slice(&u64_to_prop_dwords(wts_paddr));
+            out.extend_from_slice(&u64_to_prop_dwords(ofm_paddr));
+            out.extend_from_slice(&u64_to_prop_dwords(0));
+            out.extend_from_slice(&u64_to_prop_dwords(0));
+            let _ = ctrl_paddr; // pin-only; not in classic exec-buf args
+        }
+        LabKernelArgLayout::Count4Ctrl => {
+            let n_bos: u64 = if ctrl_paddr.is_some() { 4 } else { 3 };
+            out.extend_from_slice(&u64_to_prop_dwords(n_bos));
+            out.extend_from_slice(&u64_to_prop_dwords(0));
+            out.push(0);
+            out.extend_from_slice(&u64_to_prop_dwords(ifm_paddr));
+            out.extend_from_slice(&u64_to_prop_dwords(wts_paddr));
+            out.extend_from_slice(&u64_to_prop_dwords(ofm_paddr));
+            out.extend_from_slice(&u64_to_prop_dwords(ctrl_paddr.unwrap_or(0)));
+            out.extend_from_slice(&u64_to_prop_dwords(0));
+        }
+    }
     out
 }
 
@@ -574,6 +636,118 @@ pub fn ran_on_npu_reason_is_ofm_verify_fail(reason: Option<RanOnNpuBlockReason>)
     )
 }
 
+/// Pure OFM dump-on-mismatch stats for timed-path `detail` (no secrets; truncated).
+///
+/// Used when decide refuses after submit_wait OK. Never claims Pass / `ran_on_npu`.
+///
+/// Reports: raw len, nonzero count (decoded f32 when possible), first few decoded
+/// values, first few bf16 LE u16 when even-length raw, optional max_abs vs golden.
+#[must_use]
+pub fn format_ofm_mismatch_stats(
+    ofm_bytes: &[u8],
+    pack_mode: LabPackMode,
+    golden: Option<&[f32]>,
+) -> String {
+    format_ofm_mismatch_stats_preview(ofm_bytes, pack_mode, golden, 8)
+}
+
+/// Same as [`format_ofm_mismatch_stats`] with explicit preview length (unit tests).
+#[must_use]
+pub fn format_ofm_mismatch_stats_preview(
+    ofm_bytes: &[u8],
+    pack_mode: LabPackMode,
+    golden: Option<&[f32]>,
+    preview_n: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("raw_len={}", ofm_bytes.len()));
+    let nonzero_raw = ofm_bytes.iter().filter(|&&b| b != 0).count();
+    parts.push(format!("raw_nonzero_bytes={nonzero_raw}"));
+
+    // First + last few bf16 LE pairs as u16 (mladf OFM is 512 B bf16).
+    if ofm_bytes.len() >= 2 && ofm_bytes.len().is_multiple_of(2) {
+        let n_pairs = ofm_bytes.len() / 2;
+        let n = preview_n.min(n_pairs);
+        let mut first: Vec<String> = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * 2;
+            let u = u16::from_le_bytes([ofm_bytes[off], ofm_bytes[off + 1]]);
+            first.push(format!("0x{u:04x}"));
+        }
+        parts.push(format!("first_bf16_le=[{}]", first.join(",")));
+        if n_pairs > n {
+            let mut last: Vec<String> = Vec::with_capacity(n);
+            let start = n_pairs - n;
+            for i in start..n_pairs {
+                let off = i * 2;
+                let u = u16::from_le_bytes([ofm_bytes[off], ofm_bytes[off + 1]]);
+                last.push(format!("0x{u:04x}"));
+            }
+            parts.push(format!("last_bf16_le=[{}]", last.join(",")));
+        } else if n_pairs > 0 {
+            // Single window: still report last element for E1.2 symmetry.
+            let off = (n_pairs - 1) * 2;
+            let u = u16::from_le_bytes([ofm_bytes[off], ofm_bytes[off + 1]]);
+            parts.push(format!("last_bf16_le=[0x{u:04x}]"));
+        }
+    }
+
+    match lab_decode_ofm_bytes(pack_mode, ofm_bytes) {
+        Ok(cand) => {
+            let nz = cand.iter().filter(|&&x| x != 0.0).count();
+            parts.push(format!("decoded_len={} nonzero_f32={nz}", cand.len()));
+            let n = preview_n.min(cand.len());
+            if n > 0 {
+                let prev: Vec<String> = cand
+                    .iter()
+                    .take(n)
+                    .map(|x| {
+                        if x.is_finite() {
+                            format!("{x:.6}")
+                        } else {
+                            format!("{x}")
+                        }
+                    })
+                    .collect();
+                parts.push(format!("first_f32=[{}]", prev.join(",")));
+                if cand.len() > n {
+                    let last: Vec<String> = cand
+                        .iter()
+                        .rev()
+                        .take(n)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .map(|x| {
+                            if x.is_finite() {
+                                format!("{x:.6}")
+                            } else {
+                                format!("{x}")
+                            }
+                        })
+                        .collect();
+                    parts.push(format!("last_f32=[{}]", last.join(",")));
+                }
+            }
+            if let Some(g) = golden {
+                parts.push(format!("golden_len={}", g.len()));
+                if g.len() == cand.len() {
+                    match max_abs_diff_f32(&cand, g) {
+                        Ok(d) => parts.push(format!("max_abs_diff={d:.6e}")),
+                        Err(e) => parts.push(format!("max_abs_diff_err={e}")),
+                    }
+                    let gnz = g.iter().filter(|&&x| x != 0.0).count();
+                    parts.push(format!("golden_nonzero_f32={gnz}"));
+                } else {
+                    parts.push("golden_len_mismatch".into());
+                }
+            }
+        }
+        Err(e) => parts.push(format!("decode_err={e}")),
+    }
+    parts.join(" ")
+}
+
 /// Parse OFM golden bytes as f32 LE (`m*n*4`) or bf16 LE (`m*n*2`).
 ///
 /// Fail-closed on any other length.
@@ -830,11 +1004,12 @@ impl IoBoSet {
     /// START_NPU kernel-arg dwords for this set (includes ctrl paddr when present).
     #[must_use]
     pub fn pack_kernel_args(&self) -> Vec<u32> {
-        pack_start_npu_kernel_args_with_ctrl(
+        pack_start_npu_kernel_args_with_ctrl_layout(
             self.ifm_addr,
             self.wts_addr,
             self.ofm_addr,
             self.ctrl.map(|_| self.ctrl_addr),
+            lab_kernel_arg_layout_from_env(),
         )
     }
 }
@@ -876,7 +1051,8 @@ pub fn build_lab_arg_bo_handles_ex(
 /// Pure status classifier for timed_matmul lab OFM outcomes (no device I/O).
 ///
 /// Callers that have a more specific submit failure string may override the
-/// generic `"submit_wait_failed"` result.
+/// generic `"submit_wait_failed"` result (e.g. `"ert_cmd_error"` when ERT state
+/// is Error after WAIT).
 ///
 /// # Rules
 /// - `lab_ofm && !ofm_setup_ok` → `lab_ofm_setup_failed` (fail closed before EXEC)
@@ -956,14 +1132,17 @@ pub fn lab_io_size_plan(m: u32, n: u32, k: u32, dtype: &str) -> Result<LabIoSize
     })
 }
 
-/// CREATE_BO(Shmem)×3 + `get_bo_info`; refuse zero `xdna_addr`.
+/// CREATE_BO(Shmem)×3 + **PASID pin** + device addrs; refuse invalid `xdna_addr`.
+///
+/// Live lab: temporary mmap+munmap left SHMEM `xdna_addr=u64::MAX` (invalid).
+/// We pin (persistent mmap) so PASID UVA is registered before EXEC.
 ///
 /// Does **not** submit. Does **not** claim compute. Caller must
 /// [`destroy_io_bos`].
 ///
 /// # Errors
 ///
-/// Create / info failures or zero device address.
+/// Create / pin / info failures or invalid device address.
 pub fn create_io_bos(
     submission: &dyn DirectSubmission,
     ifm_bytes: u64,
@@ -1003,39 +1182,40 @@ pub fn create_io_bos(
         let _ = submission.destroy_buffer(0, a);
     };
 
-    let ifm_info = match submission.get_bo_info(0, ifm.0) {
-        Ok(i) if i.xdna_addr != 0 => i,
-        Ok(_) => {
+    // Pin before reading device addrs (PASID UVA registered on mmap).
+    let ifm_addr = match submission.pin_bo_for_device_access(0, ifm.0, ifm_alloc) {
+        Ok(a) if is_valid_xdna_device_addr(a) => a,
+        Ok(a) => {
             cleanup(submission, ifm.0, wts.0, ofm.0);
-            return Err(DirectError::InvalidArgument(
-                "create_io_bos: IFM xdna_addr=0".into(),
-            ));
+            return Err(DirectError::InvalidArgument(format!(
+                "create_io_bos: IFM xdna_addr={a:#x} invalid after pin"
+            )));
         }
         Err(e) => {
             cleanup(submission, ifm.0, wts.0, ofm.0);
             return Err(e);
         }
     };
-    let wts_info = match submission.get_bo_info(0, wts.0) {
-        Ok(i) if i.xdna_addr != 0 => i,
-        Ok(_) => {
+    let wts_addr = match submission.pin_bo_for_device_access(0, wts.0, wts_alloc) {
+        Ok(a) if is_valid_xdna_device_addr(a) => a,
+        Ok(a) => {
             cleanup(submission, ifm.0, wts.0, ofm.0);
-            return Err(DirectError::InvalidArgument(
-                "create_io_bos: WTS xdna_addr=0".into(),
-            ));
+            return Err(DirectError::InvalidArgument(format!(
+                "create_io_bos: WTS xdna_addr={a:#x} invalid after pin"
+            )));
         }
         Err(e) => {
             cleanup(submission, ifm.0, wts.0, ofm.0);
             return Err(e);
         }
     };
-    let ofm_info = match submission.get_bo_info(0, ofm.0) {
-        Ok(i) if i.xdna_addr != 0 => i,
-        Ok(_) => {
+    let ofm_addr = match submission.pin_bo_for_device_access(0, ofm.0, ofm_alloc) {
+        Ok(a) if is_valid_xdna_device_addr(a) => a,
+        Ok(a) => {
             cleanup(submission, ifm.0, wts.0, ofm.0);
-            return Err(DirectError::InvalidArgument(
-                "create_io_bos: OFM xdna_addr=0".into(),
-            ));
+            return Err(DirectError::InvalidArgument(format!(
+                "create_io_bos: OFM xdna_addr={a:#x} invalid after pin"
+            )));
         }
         Err(e) => {
             cleanup(submission, ifm.0, wts.0, ofm.0);
@@ -1048,9 +1228,9 @@ pub fn create_io_bos(
         wts,
         ofm,
         ctrl: None,
-        ifm_addr: ifm_info.xdna_addr,
-        wts_addr: wts_info.xdna_addr,
-        ofm_addr: ofm_info.xdna_addr,
+        ifm_addr,
+        wts_addr,
+        ofm_addr,
         ctrl_addr: 0,
         ifm_bytes,
         wts_bytes,
@@ -1283,7 +1463,7 @@ pub fn create_and_fill_mladf_io_bos_ex(
                 return Err(e);
             }
         }
-        // Optional lab auto-patch: IFM/WTS/OFM device paddrs into ctrl (u64 LE residual).
+        // Optional lab auto-patch: IFM/WTS/OFM base paddrs via meta read_add_write.
         let mut patched_owned: Option<Vec<u8>> = None;
         if lab_ctrl_auto_patch_env() {
             match load_mladf_meta_json_text_from_env() {
@@ -1335,10 +1515,9 @@ pub fn lab_require_ctrl_env() -> bool {
 }
 
 /// `XDNA2_LAB_CTRL_AUTO_PATCH=1` applies meta IFM/WTS/OFM paddrs into the ctrl
-/// buffer before attach (lab **u64 LE overwrite**; size=6 `read_add_write` residual).
+/// buffer before attach (**size=6 `read_add_write`**: existing tile offset + base).
 ///
-/// Default **false**. Requires `XDNA2_LAB_MLADF_META` with patch locations. Opt-in
-/// until XRT-faithful patch semantics are proven.
+/// Default **false**. Requires `XDNA2_LAB_MLADF_META` with patch locations.
 #[must_use]
 pub fn lab_ctrl_auto_patch_env() -> bool {
     lab_ofm_env_value_enabled(std::env::var("XDNA2_LAB_CTRL_AUTO_PATCH").ok().as_deref())
@@ -1446,13 +1625,13 @@ pub fn attach_ctrl_bo(
             return Err(e);
         }
     }
-    let info = match submission.get_bo_info(0, h.0) {
-        Ok(i) if i.xdna_addr != 0 => i,
-        Ok(_) => {
+    let ctrl_addr = match submission.pin_bo_for_device_access(0, h.0, alloc) {
+        Ok(a) if is_valid_xdna_device_addr(a) => a,
+        Ok(a) => {
             let _ = submission.destroy_buffer(0, h.0);
-            return Err(DirectError::InvalidArgument(
-                "attach_ctrl_bo: CTRL xdna_addr=0".into(),
-            ));
+            return Err(DirectError::InvalidArgument(format!(
+                "attach_ctrl_bo: CTRL xdna_addr={a:#x} invalid after pin"
+            )));
         }
         Err(e) => {
             let _ = submission.destroy_buffer(0, h.0);
@@ -1460,22 +1639,17 @@ pub fn attach_ctrl_bo(
         }
     };
     ios.ctrl = Some(h);
-    ios.ctrl_addr = info.xdna_addr;
+    ios.ctrl_addr = ctrl_addr;
     ios.ctrl_bytes = ctrl_bytes;
     ios.ctrl_alloc_bytes = alloc;
     Ok(())
 }
 
-/// Pure patch of LE u64 paddrs into a control-packet buffer at given offsets.
+/// Pure **full u64 LE overwrite** at each offset (plumbing / tests).
 ///
-/// Each patch: write 8-byte little-endian `paddr` at `offset` (must fit in `ctrl`).
-/// Meta often lists `size: 6` and `operation: read_add_write`; this helper still
-/// writes a full **u64 LE overwrite** (lab/plumbing). Full firmware-accurate
-/// `read_add_write` of 6-byte fields is **residual** — do not invent it here.
+/// Prefer [`patch_ctrl_from_meta_io_paddrs`] for live mladf — staged meta uses
+/// `size: 6` + `operation: read_add_write` (see [`apply_ctrl_patch_location`]).
 /// Fail-closed if `offset+8 > len`.
-///
-/// Build `(offset, paddr)` lists from meta via
-/// [`crate::backends::amd_xdna2::mladf_pack::ctrl_u64_patches_for_io_paddrs`].
 ///
 /// # Errors
 ///
@@ -1496,15 +1670,97 @@ pub fn patch_ctrl_packet_u64_le(
     Ok(())
 }
 
-/// Apply meta-derived IFM/WTS/OFM paddr patches into a mutable ctrl buffer (pure).
+/// Apply one meta patch site: AMD `read_add_write` size=6 or u64 overwrite.
 ///
-/// Parses `control_packet_patch_locations` from `ctrl_meta` JSON, maps roles to the
-/// given device paddrs, then calls [`patch_ctrl_packet_u64_le`]. Empty patch list
-/// from meta → no-op Ok (vendor dump may already carry paddrs — still not Pass).
+/// Staged `lab_ctrl_meta.json` lists `size: 6`, `operation: "read_add_write"`.
+/// Firmware fields already hold **tile sub-offsets** (live dump: OFM `0x100`,
+/// WTS `0x15400`). Correct apply is:
+/// 1. Read existing `size` LE bytes as u64 (zero-extend).
+/// 2. `sum = existing.wrapping_add(base_paddr)` (fail if sum does not fit in `size`).
+/// 3. Write **only** `size` LE bytes back — do **not** clobber neighbors.
+///
+/// Full u64 overwrite (old lab residual) **wipes** those offsets → wrong DMA →
+/// zero OFM after EXEC+WAIT (live 2026-07-16 after D3c map_host Pass).
 ///
 /// # Errors
 ///
-/// Meta parse failure or out-of-range patch offset.
+/// OOB, unsupported size, or sum not fitting in the field width.
+pub fn apply_ctrl_patch_location(
+    ctrl: &mut [u8],
+    offset: usize,
+    size: u32,
+    operation: &str,
+    base_paddr: u64,
+) -> Result<(), DirectError> {
+    let size_n = usize::try_from(size).map_err(|_| {
+        DirectError::InvalidArgument(format!("ctrl patch size {size} does not fit usize"))
+    })?;
+    if size_n == 0 || size_n > 8 {
+        return Err(DirectError::InvalidArgument(format!(
+            "ctrl patch size {size} unsupported (need 1..=8)"
+        )));
+    }
+    let end = offset.checked_add(size_n).ok_or_else(|| {
+        DirectError::InvalidArgument(format!(
+            "ctrl patch offset {offset}+{size_n} overflow (ctrl len {})",
+            ctrl.len()
+        ))
+    })?;
+    if end > ctrl.len() {
+        return Err(DirectError::InvalidArgument(format!(
+            "ctrl patch offset {offset}+{size_n} out of range (ctrl len {})",
+            ctrl.len()
+        )));
+    }
+
+    let op = operation.trim().to_ascii_lowercase();
+    // AMD staged: always read_add_write. Empty op + size 6 also treated as add
+    // (fail-closed toward the live meta convention).
+    let do_add = op.is_empty()
+        || op == "read_add_write"
+        || op.contains("add")
+        || (size_n == 6 && op != "write" && op != "overwrite");
+
+    let mut existing_bytes = [0_u8; 8];
+    existing_bytes[..size_n].copy_from_slice(&ctrl[offset..end]);
+    let existing = u64::from_le_bytes(existing_bytes);
+
+    let value = if do_add {
+        existing.checked_add(base_paddr).ok_or_else(|| {
+            DirectError::InvalidArgument(format!(
+                "ctrl patch read_add_write wrap: existing={existing:#x} + base={base_paddr:#x}"
+            ))
+        })?
+    } else {
+        base_paddr
+    };
+
+    let max_for_size = if size_n == 8 {
+        u64::MAX
+    } else {
+        (1_u64 << (size_n * 8)) - 1
+    };
+    if value > max_for_size {
+        return Err(DirectError::InvalidArgument(format!(
+            "ctrl patch value {value:#x} does not fit size={size_n} (max {max_for_size:#x}); \
+             existing={existing:#x} base={base_paddr:#x} op={operation:?}"
+        )));
+    }
+
+    let out = value.to_le_bytes();
+    ctrl[offset..end].copy_from_slice(&out[..size_n]);
+    Ok(())
+}
+
+/// Apply meta-derived IFM/WTS/OFM paddr patches into a mutable ctrl buffer (pure).
+///
+/// Parses `control_packet_patch_locations`, maps roles → paddrs, then
+/// [`apply_ctrl_patch_location`] per site (**size=6 `read_add_write`** by default).
+/// Empty patch list → no-op Ok (still not Pass).
+///
+/// # Errors
+///
+/// Meta parse failure, OOB, or field-width overflow.
 pub fn patch_ctrl_from_meta_io_paddrs(
     ctrl: &mut [u8],
     ctrl_meta_json: &str,
@@ -1512,12 +1768,22 @@ pub fn patch_ctrl_from_meta_io_paddrs(
     wts_paddr: u64,
     ofm_paddr: u64,
 ) -> Result<(), DirectError> {
-    let entries =
-        crate::backends::amd_xdna2::mladf_pack::parse_mladf_ctrl_patch_locations(ctrl_meta_json)?;
-    let patches = crate::backends::amd_xdna2::mladf_pack::ctrl_u64_patches_for_io_paddrs(
-        &entries, ifm_paddr, wts_paddr, ofm_paddr,
-    );
-    patch_ctrl_packet_u64_le(ctrl, &patches)
+    use crate::backends::amd_xdna2::mladf_pack::{
+        CtrlPatchBufferRole, parse_mladf_ctrl_patch_locations,
+    };
+    let entries = parse_mladf_ctrl_patch_locations(ctrl_meta_json)?;
+    for e in entries {
+        let paddr = match e.role {
+            CtrlPatchBufferRole::Ifm => ifm_paddr,
+            CtrlPatchBufferRole::Wts => wts_paddr,
+            CtrlPatchBufferRole::Ofm => ofm_paddr,
+            CtrlPatchBufferRole::Ctrl | CtrlPatchBufferRole::Other => continue,
+        };
+        for loc in &e.locations {
+            apply_ctrl_patch_location(ctrl, loc.offset, loc.size, &loc.operation, paddr)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve pack mode + create/fill I/O BOs for lab.
@@ -1861,18 +2127,41 @@ mod tests {
 
     #[test]
     fn pack_kernel_args_partial_elf_layout() {
-        let args = pack_start_npu_kernel_args(0xa, 0xb, 0xc);
+        let args = pack_start_npu_kernel_args_with_ctrl_layout(
+            0xa,
+            0xb,
+            0xc,
+            None,
+            LabKernelArgLayout::Count4Ctrl,
+        );
         // 2+2+1+2+2+2+2+2 = 15 dwords
         assert_eq!(args.len(), 15);
         assert_eq!(args[0], 3);
-        let with_ctrl = pack_start_npu_kernel_args_with_ctrl(0xa, 0xb, 0xc, Some(0xd));
+        let with_ctrl = pack_start_npu_kernel_args_with_ctrl_layout(
+            0xa,
+            0xb,
+            0xc,
+            Some(0xd),
+            LabKernelArgLayout::Count4Ctrl,
+        );
         assert_eq!(with_ctrl.len(), 15);
         assert_eq!(with_ctrl[0], 4); // num_data_bos
         assert_eq!(with_ctrl[11], 0xd); // ctrl lo (slot after ofm)
-        assert_eq!(
-            pack_start_npu_kernel_args(1, 2, 3),
-            pack_start_npu_kernel_args_with_ctrl(1, 2, 3, None)
+        // XRT classic 3-arg: n_bos=3, two trailing zeros (ctrl not in exec-buf).
+        let xrt3 = pack_start_npu_kernel_args_with_ctrl_layout(
+            0xa,
+            0xb,
+            0xc,
+            Some(0xd),
+            LabKernelArgLayout::Xrt3,
         );
+        assert_eq!(xrt3.len(), 15);
+        assert_eq!(xrt3[0], 3);
+        assert_eq!(xrt3[5], 0xa);
+        assert_eq!(xrt3[7], 0xb);
+        assert_eq!(xrt3[9], 0xc);
+        assert_eq!(xrt3[11], 0); // not ctrl
+        assert_eq!(xrt3[13], 0);
         assert_eq!(args[1], 0);
         assert_eq!(args[2], 0);
         assert_eq!(args[3], 0);
@@ -2385,6 +2674,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_ctrl_patch_size6_read_add_preserves_tile_offset() {
+        // Live staged lab_ctrl: OFM sites hold 0x100, WTS sites hold 0x15400.
+        // read_add_write must ADD base, write only 6 bytes (not wipe offset / neighbors).
+        let mut buf = vec![0xEE_u8; 16];
+        // existing 6-byte LE 0x100 at offset 0; neighbors 0xEE at [6..].
+        buf[0..6].copy_from_slice(&0x100_u64.to_le_bytes()[..6]);
+        apply_ctrl_patch_location(&mut buf, 0, 6, "read_add_write", 0x7fc3_b8d8_b000).unwrap();
+        let mut got = [0_u8; 8];
+        got[..6].copy_from_slice(&buf[0..6]);
+        let val = u64::from_le_bytes(got);
+        assert_eq!(val, 0x7fc3_b8d8_b000 + 0x100);
+        assert_eq!(buf[6], 0xEE, "must not clobber byte after size=6 field");
+        assert_eq!(buf[7], 0xEE);
+
+        // WTS-style 0x15400 + base
+        let mut wts = vec![0_u8; 8];
+        wts[0..6].copy_from_slice(&0x1_5400_u64.to_le_bytes()[..6]);
+        apply_ctrl_patch_location(&mut wts, 0, 6, "read_add_write", 0x1000).unwrap();
+        let mut g2 = [0_u8; 8];
+        g2[..6].copy_from_slice(&wts[0..6]);
+        assert_eq!(u64::from_le_bytes(g2), 0x1000 + 0x1_5400);
+
+        // Overflow past 48 bits refuses.
+        let mut big = vec![0_u8; 8];
+        let u48max = (1_u64 << 48) - 1;
+        big[0..6].copy_from_slice(&u48max.to_le_bytes()[..6]);
+        let err = apply_ctrl_patch_location(&mut big, 0, 6, "read_add_write", 1).expect_err("ovf");
+        assert!(
+            err.to_string().contains("does not fit") || err.to_string().contains("wrap"),
+            "{err}"
+        );
+    }
+
+    #[test]
     #[allow(unsafe_code)]
     fn bytes_are_all_zero_and_wts_exec_check() {
         assert!(!bytes_are_all_zero(&[]));
@@ -2793,17 +3116,25 @@ mod tests {
             std::env::remove_var("XDNA2_LAB_REQUIRE_NONZERO_WTS");
             std::env::set_var("XDNA2_LAB_ALLOW_ZERO_WTS", "1");
         }
-        let mut ctrl = vec![0xEE_u8; 40];
-        ctrl[0] = 1; // non-zero for optional REQUIRE paths
+        // Patch fields at 0/8/16 start zero (like staged IFM); mark non-zero elsewhere
+        // so REQUIRE_CTRL plumbing still sees non-all-zero payload.
+        let mut ctrl = vec![0_u8; 40];
+        ctrl[32] = 1;
+        // Seed OFM tile offset 0x100 at offset 16 (size-6), as staged dump does.
+        ctrl[16..22].copy_from_slice(&0x100_u64.to_le_bytes()[..6]);
         let ios = create_and_fill_mladf_io_bos_ex(&stub, &plan, None, None, Some(&ctrl))
             .expect("auto-patch attach");
         let ctrl_h = ios.ctrl.expect("ctrl bo").0;
         let written = stub
             .read_bo_bytes_no_sync(0, ctrl_h, 0, 40)
             .expect("read ctrl bo");
-        assert_eq!(&written[0..8], &ios.ifm_addr.to_le_bytes());
-        assert_eq!(&written[8..16], &ios.wts_addr.to_le_bytes());
-        assert_eq!(&written[16..24], &ios.ofm_addr.to_le_bytes());
+        // size=6: IFM/WTS = base only (existing 0); OFM = base + 0x100
+        assert_eq!(&written[0..6], &ios.ifm_addr.to_le_bytes()[..6]);
+        assert_eq!(&written[8..14], &ios.wts_addr.to_le_bytes()[..6]);
+        let mut ofm_le = [0_u8; 8];
+        ofm_le[..6].copy_from_slice(&written[16..22]);
+        assert_eq!(u64::from_le_bytes(ofm_le), ios.ofm_addr + 0x100);
+        assert_eq!(written[32], 1, "bytes outside patch sites preserved");
         // Without AUTO_PATCH, dump bytes keep original (no paddr overwrite).
         destroy_io_bos(&stub, &ios);
         unsafe {
@@ -2813,8 +3144,9 @@ mod tests {
             .expect("no auto-patch");
         let h2 = ios2.ctrl.expect("ctrl").0;
         let raw = stub.read_bo_bytes_no_sync(0, h2, 0, 40).expect("read raw");
-        assert_eq!(raw[0], 1);
-        assert_eq!(raw[1], 0xEE);
+        assert_eq!(raw[0], 0);
+        assert_eq!(raw[32], 1);
+        assert_eq!(&raw[16..22], &0x100_u64.to_le_bytes()[..6]);
         destroy_io_bos(&stub, &ios2);
         let _ = std::fs::remove_file(&meta_path);
         unsafe {
@@ -2958,11 +3290,18 @@ mod tests {
           }
         }"#;
         let mut buf = vec![0u8; 40];
+        // Seed tile offsets like staged dump (OFM 0x100 at offset 24).
+        buf[24..30].copy_from_slice(&0x100_u64.to_le_bytes()[..6]);
         patch_ctrl_from_meta_io_paddrs(&mut buf, json, 0xAAA, 0xBBB, 0xCCC).unwrap();
-        assert_eq!(&buf[0..8], &0xAAA_u64.to_le_bytes());
-        assert_eq!(&buf[8..16], &0xBBB_u64.to_le_bytes());
-        assert_eq!(&buf[16..24], &0xAAA_u64.to_le_bytes());
-        assert_eq!(&buf[24..32], &0xCCC_u64.to_le_bytes());
+        // size=6 write: only low 6 bytes; high 2 stay 0 from zeroed buffer.
+        assert_eq!(&buf[0..6], &0xAAA_u64.to_le_bytes()[..6]);
+        assert_eq!(&buf[6..8], &[0, 0]);
+        assert_eq!(&buf[8..14], &0xBBB_u64.to_le_bytes()[..6]);
+        assert_eq!(&buf[16..22], &0xAAA_u64.to_le_bytes()[..6]);
+        // OFM: existing 0x100 + 0xCCC
+        let mut ofm = [0_u8; 8];
+        ofm[..6].copy_from_slice(&buf[24..30]);
+        assert_eq!(u64::from_le_bytes(ofm), 0xCCC + 0x100);
         // OOB offset from meta fails closed
         let bad = r#"{
           "external_buffers": {
@@ -3209,7 +3548,23 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)] // test-only env isolation for ambient silicon-lab vars
     fn pack_mode_mladf_require_dims_match_refuses() {
+        // Isolate ambient silicon-lab env so plan comes from staged key constants,
+        // not operator META/WTS that change the error path before timed dims check.
+        let prev_key = std::env::var("XDNA2_LAB_MLADF_KEY").ok();
+        let prev_meta = std::env::var("XDNA2_LAB_MLADF_META").ok();
+        let prev_wts = std::env::var("XDNA2_LAB_WTS_PACKED").ok();
+        let prev_req = std::env::var("XDNA2_LAB_REQUIRE_NONZERO_WTS").ok();
+        let prev_ctrl_req = std::env::var("XDNA2_LAB_REQUIRE_CTRL").ok();
+        // SAFETY: test-only env isolation; single-threaded intent for this case.
+        unsafe {
+            std::env::remove_var("XDNA2_LAB_MLADF_KEY");
+            std::env::remove_var("XDNA2_LAB_MLADF_META");
+            std::env::remove_var("XDNA2_LAB_WTS_PACKED");
+            std::env::remove_var("XDNA2_LAB_REQUIRE_NONZERO_WTS");
+            std::env::remove_var("XDNA2_LAB_REQUIRE_CTRL");
+        }
         let stub = StubDirectSubmission::new(-1);
         let err = create_and_fill_lab_io_bos_for_pack_mode(
             &stub,
@@ -3221,7 +3576,33 @@ mod tests {
             true,
         )
         .expect_err("dims");
-        assert!(err.to_string().contains("timed dims"));
+        let msg = err.to_string();
+        unsafe {
+            match prev_key {
+                Some(v) => std::env::set_var("XDNA2_LAB_MLADF_KEY", v),
+                None => std::env::remove_var("XDNA2_LAB_MLADF_KEY"),
+            }
+            match prev_meta {
+                Some(v) => std::env::set_var("XDNA2_LAB_MLADF_META", v),
+                None => std::env::remove_var("XDNA2_LAB_MLADF_META"),
+            }
+            match prev_wts {
+                Some(v) => std::env::set_var("XDNA2_LAB_WTS_PACKED", v),
+                None => std::env::remove_var("XDNA2_LAB_WTS_PACKED"),
+            }
+            match prev_req {
+                Some(v) => std::env::set_var("XDNA2_LAB_REQUIRE_NONZERO_WTS", v),
+                None => std::env::remove_var("XDNA2_LAB_REQUIRE_NONZERO_WTS"),
+            }
+            match prev_ctrl_req {
+                Some(v) => std::env::set_var("XDNA2_LAB_REQUIRE_CTRL", v),
+                None => std::env::remove_var("XDNA2_LAB_REQUIRE_CTRL"),
+            }
+        }
+        assert!(
+            msg.contains("timed dims") || msg.contains("dim"),
+            "unexpected err={msg}"
+        );
     }
 
     #[test]
@@ -3316,6 +3697,44 @@ mod tests {
     }
 
     #[test]
+    fn format_ofm_mismatch_stats_bf16_preview() {
+        use crate::backends::amd_xdna2::mladf_pack::f32_to_bf16_bits;
+        let mut ofm = Vec::new();
+        ofm.extend_from_slice(&f32_to_bf16_bits(1.0).to_le_bytes());
+        ofm.extend_from_slice(&f32_to_bf16_bits(2.0).to_le_bytes());
+        ofm.extend_from_slice(&0u16.to_le_bytes());
+        ofm.extend_from_slice(&0u16.to_le_bytes());
+        let s = format_ofm_mismatch_stats_preview(
+            &ofm,
+            LabPackMode::MladfA16W4,
+            Some(&[1.0_f32, 0.0, 0.0, 0.0]),
+            4,
+        );
+        assert!(s.contains("raw_len=8"), "{s}");
+        assert!(s.contains("raw_nonzero_bytes="), "{s}");
+        assert!(s.contains("first_bf16_le=["), "{s}");
+        assert!(s.contains("last_bf16_le=["), "{s}");
+        assert!(s.contains("decoded_len=4"), "{s}");
+        assert!(s.contains("nonzero_f32=2"), "{s}");
+        assert!(s.contains("first_f32=["), "{s}");
+        assert!(s.contains("max_abs_diff="), "{s}");
+        assert!(s.contains("golden_nonzero_f32=1"), "{s}");
+        // Odd length: must fail decode (not vacuous raw_len only).
+        let odd = format_ofm_mismatch_stats(&[0xab], LabPackMode::MladfA16W4, None);
+        assert!(odd.contains("raw_len=1"), "{odd}");
+        assert!(
+            odd.contains("decode_err="),
+            "odd bf16 must surface decode_err: {odd}"
+        );
+        // No golden → no max_abs; with golden of wrong len → mismatch marker
+        let no_g = format_ofm_mismatch_stats_preview(&ofm, LabPackMode::MladfA16W4, None, 2);
+        assert!(!no_g.contains("max_abs_diff="), "{no_g}");
+        let bad_g =
+            format_ofm_mismatch_stats_preview(&ofm, LabPackMode::MladfA16W4, Some(&[1.0]), 2);
+        assert!(bad_g.contains("golden_len_mismatch"), "{bad_g}");
+    }
+
+    #[test]
     fn mladf_pack_mode_decide_with_bf16_golden_slice() {
         use crate::backends::amd_xdna2::mladf_pack::f32_to_bf16_bits;
         let mut ofm = Vec::new();
@@ -3339,7 +3758,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn mladf_pack_mode_decide_refuses_zero_golden_slice() {
+        // Isolate ALLOW — parallel tests may leave it set.
+        let prev = std::env::var_os("XDNA2_LAB_ALLOW_ZERO_GOLDEN");
+        // SAFETY: unit-test env isolation.
+        unsafe {
+            std::env::remove_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN");
+        }
         let ofm = vec![0_u8; 4]; // 2 bf16 zeros
         let plan = LabOfmVerifyPlan {
             m: 1,
@@ -3353,10 +3779,25 @@ mod tests {
         };
         let golden = vec![0.0_f32, 0.0];
         // Default: resolve refuses zero golden (Err) unless ALLOW env set.
-        let err =
-            lab_decide_from_ofm_bytes_pack_mode(LabPackMode::MladfA16W4, &plan, Some(&golden))
-                .expect_err("zero golden refuse");
-        assert!(err.to_string().contains("all-zero") || err.to_string().contains("false-Pass"));
+        let result =
+            lab_decide_from_ofm_bytes_pack_mode(LabPackMode::MladfA16W4, &plan, Some(&golden));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN", v),
+                None => std::env::remove_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN"),
+            }
+        }
+        // Either Err at resolve, or Ok(false) with AllZeroGolden if ALLOW ambient races.
+        match result {
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("all-zero") || e.to_string().contains("false-Pass"),
+                    "err={e}"
+                );
+            }
+            Ok((false, Some(RanOnNpuBlockReason::AllZeroGolden))) => {}
+            other => panic!("expected zero golden refuse, got {other:?}"),
+        }
     }
 
     #[test]

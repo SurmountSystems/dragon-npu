@@ -92,12 +92,14 @@ With **hwctx create/destroy working**, the remaining blocker for real compute is
 | `XDNA2_LAB_WTS_PACKED` | Path to pre-packed WTS for mladf (exact meta length, e.g. 174080; read capped 64 MiB). Prefer `tools/export_mladf_wts.sh` → `wts.bin` (vendor `export_const_params`); also pack `--wts-from` / capture |
 | `XDNA2_LAB_CTRL_PACKED` | Path to control packet bin (e.g. 29664 B staged `lab_ctrl.bin`); fourth START_NPU kernel-arg BO. Prefer stage dump + `tools/validate_mladf_ctrl.sh` |
 | `XDNA2_LAB_REQUIRE_CTRL` | `1`/`true`: refuse mladf fill when plan has `ctrl_bytes` but ctrl missing/empty/all-zero (fill API + pack mode); pack mode also refuses unset path. Default off for unit tests |
-| `XDNA2_LAB_CTRL_AUTO_PATCH` | `1`/`true`: opt-in lab — apply meta IFM/WTS/OFM paddrs into ctrl (u64 LE overwrite residual) before attach; needs `XDNA2_LAB_MLADF_META`. Default off until size=6 `read_add_write` proven |
+| `XDNA2_LAB_CTRL_AUTO_PATCH` | `1`/`true`: opt-in lab — apply meta IFM/WTS/OFM paddrs into ctrl (`size=6` `read_add_write`: existing tile offset + base) before attach; needs `XDNA2_LAB_MLADF_META`. Default off |
+| `XDNA2_LAB_KERNEL_ARG_LAYOUT` | `count4` (default): n_bos=4 IFM/WTS/OFM/CTRL; `xrt3`: XRT classic n_bos=3 IFM/WTS/OFM (ctrl still pin+patch). Live Error after WAIT → try `xrt3` |
 | `XDNA2_LAB_REQUIRE_NONZERO_WTS` | `1`/`true`: refuse all-zero WTS at BO fill; pack mode also refuses unset `XDNA2_LAB_WTS_PACKED` (Pass readiness). **Wins over** `ALLOW_ZERO_WTS` when both set |
 | `XDNA2_LAB_ALLOW_ZERO_WTS` | `1`/`true`: allow zero WTS for plumbing only when **REQUIRE is unset** (not Pass). Does **not** override REQUIRE |
 | `XDNA2_LAB_OFM_GOLDEN` | OFM golden for pack-mode decide: f32 LE `m*n*4` or bf16 LE `m*n*2`. **Required** for mladf; **all-zero refused** by default. Offline: `tools/validate_mladf_ofm_golden.sh` |
 | `XDNA2_LAB_ALLOW_ZERO_GOLDEN` | `1`/`true` bypasses **offline resolve/load** only (shell validator exits 3, not 0). Product `decide_ran_on_npu` **always** refuses all-zero golden (`AllZeroGolden`). Never greened by `--require-pass-assets` |
 | `XDNA2_LAB_MLADF_KEY` / `XDNA2_LAB_MLADF_META` | mladf instr key / ctrl_meta JSON for BO sizes (meta sizes capped 64 MiB) |
+| `XDNA2_LAB_BO_DIAG` | `1`/`true`: always attach DevHeap + instr (+ I/O) GET_BO_INFO into timed `detail`. Submit failures dump `bo_diag` even when unset. No secrets. |
 | `XDNA2_PACK_WTS_FROM` | **pack_mladf_ref / stage tools only** (same as `--wts-from`); not read by Rust lab path |
 | `DD_ROOT` / `AIEBU_LIB` | **export_mladf_wts.sh only** — Ryzen AI DynamicDispatch root + libaiebu path |
 | `SILICON_LAB_DIR` | **scripts only** — default `testdata/xdna2_cmd/silicon_lab` for `silicon_lab_preflight` / `lab_exec_once --silicon-mladf` |

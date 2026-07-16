@@ -60,10 +60,11 @@ pub mod txn;
 pub use crate::TIMED_OP_JSON_SCHEMA_VERSION;
 
 pub use direct::{
-    AMDXDNA_CMD_COUNT_MAX, AMDXDNA_SET_PARAM_POWER_MODE, AmdxdnaCmdHeaderFields, BufferHandle,
-    Command, CommandType, DEFAULT_BO_ROUNDTRIP_SIZE, DEFAULT_HWCTX_TILES,
-    DEFAULT_WAIT_CMD_TIMEOUT_MS, DirectCapability, DirectError, DirectSubmission, ErtCmdOpcode,
-    ErtCmdState, ExecCmdPayloadHeader, HOST_REF_MAX_ELEMENTS, HardwareContext, HostMatmulRef,
+    AIE2_DEV_HEAP_SIZE, AIE2_DEV_HEAP_UVA_ALIGN, AMDXDNA_CMD_COUNT_MAX, AMDXDNA_INVALID_ADDR,
+    AMDXDNA_SET_PARAM_POWER_MODE, AmdxdnaCmdHeaderFields, BufferHandle, BufferType, Command,
+    CommandType, DEFAULT_BO_ROUNDTRIP_SIZE, DEFAULT_HWCTX_TILES, DEFAULT_WAIT_CMD_TIMEOUT_MS,
+    DirectCapability, DirectError, DirectSubmission, ErtCmdOpcode, ErtCmdState,
+    ExecCmdPayloadHeader, HOST_REF_MAX_ELEMENTS, HardwareContext, HostMatmulRef,
     MAX_INSTRUCTION_BLOB_BYTES, MAX_SUGGESTED_HWCTX_TILES, SYNC_BO_FROM_DEVICE, SYNC_BO_TO_DEVICE,
     SharedRealDirectSubmission, StubDirectSubmission, SubmitWaitResult, TimedOpResult,
     amdxdna_cmd_num_cu_masks, amdxdna_drm_set_power_mode, amdxdna_drm_set_state,
@@ -71,13 +72,16 @@ pub use direct::{
     build_ert_start_npu_cmd_bo, build_ert_start_npu_cmd_bo_ex,
     build_ert_start_npu_cmd_bo_with_kernel_args, build_ert_start_npu_preempt_cmd_bo,
     build_ert_start_npu_preempt_elf_cmd_bo, build_exec_cmd_payload_scaffold,
-    check_finite_wait_timeout, check_wait_timeout_or_infinite_opt_in, decode_instruction_hex,
-    destroy_hwctx_and_owned_bos, exec_cmd_block_reason, exec_cmd_is_enabled,
-    fill_cmd_bo_with_payload, host_matmul_f32_ones, load_instruction_blob_from_env,
-    load_instruction_blob_from_path, pack_amdxdna_cmd_header, parse_amdxdna_cmd_header_from_bytes,
-    power_mode, submit_and_wait_command, suggest_hwctx_tiles, suggest_hwctx_tiles_from_tops,
-    timed_bo_roundtrip_direct, timed_matmul_direct, unpack_amdxdna_cmd_header,
-    wait_infinite_is_allowed,
+    check_finite_wait_timeout, check_wait_timeout_or_infinite_opt_in, collect_lab_bo_diag,
+    decode_instruction_hex, destroy_hwctx_and_owned_bos, ert_cmd_state_is_completed,
+    ert_cmd_state_name, exec_cmd_block_reason, exec_cmd_is_enabled,
+    exec_cmd_requires_filled_cmd_bo, fill_cmd_bo_with_payload, format_bo_info_diag,
+    host_matmul_f32_ones, is_dev_heap_uva_aligned, is_power_of_two_usize,
+    is_valid_xdna_device_addr, lab_bo_diag_env_enabled, load_instruction_blob_from_env,
+    load_instruction_blob_from_path, next_aligned_addr_usize, pack_amdxdna_cmd_header,
+    parse_amdxdna_cmd_header_from_bytes, power_mode, submit_and_wait_command, suggest_hwctx_tiles,
+    suggest_hwctx_tiles_from_tops, timed_bo_roundtrip_direct, timed_matmul_direct,
+    unpack_amdxdna_cmd_header, wait_infinite_is_allowed,
 };
 
 pub use numerical::{
@@ -87,33 +91,37 @@ pub use numerical::{
 };
 
 pub use lab_io::{
-    IoBoSet, LabIoSizePlan, LabOfmVerifyPlan, SiliconPassAssetReadiness, WeightExecBind,
-    WeightExecFillRequest, attach_ctrl_bo, build_lab_arg_bo_handles, build_lab_arg_bo_handles_ex,
-    bytes_are_all_zero, check_mladf_ofm_golden_not_all_zero, check_mladf_pack_dtype,
+    IoBoSet, LabIoSizePlan, LabKernelArgLayout, LabOfmVerifyPlan, SiliconPassAssetReadiness,
+    WeightExecBind, WeightExecFillRequest, apply_ctrl_patch_location, attach_ctrl_bo,
+    build_lab_arg_bo_handles, build_lab_arg_bo_handles_ex, bytes_are_all_zero,
+    check_mladf_ofm_golden_not_all_zero, check_mladf_pack_dtype,
     check_mladf_wts_not_all_zero_for_exec, classify_lab_matmul_status,
     create_and_fill_lab_io_bos_for_pack_mode, create_and_fill_mladf_io_bos,
     create_and_fill_mladf_io_bos_ex, create_and_fill_ones_io_bos, create_and_fill_weight_io_bos,
     create_io_bos, destroy_io_bos, destroy_weight_exec_bind, f32_slice_from_le_bytes,
-    f32_slice_to_le_bytes, fill_ifm_wts, host_matmul_f32_ones_ifm_with_wts,
+    f32_slice_to_le_bytes, fill_ifm_wts, format_ofm_mismatch_stats,
+    format_ofm_mismatch_stats_preview, host_matmul_f32_ones_ifm_with_wts,
     host_ones_f32_matrix_bytes, lab_allow_zero_ofm_golden_env, lab_ctrl_auto_patch_env,
     lab_decide_candidate_f32_with_golden, lab_decide_from_ofm_bytes,
     lab_decide_from_ofm_bytes_bool, lab_decide_from_ofm_bytes_pack_mode,
     lab_decide_from_ofm_bytes_with_golden, lab_decode_ofm_bytes, lab_io_size_plan,
-    lab_matmul_ifm_nbytes, lab_matmul_ofm_nbytes, lab_matmul_wts_nbytes, lab_ofm_env_enabled,
-    lab_ofm_env_value_enabled, lab_require_ctrl_env, lab_require_non_zero_wts_env,
-    lab_weight_env_enabled, load_ctrl_packed_from_env, load_mladf_meta_json_text_from_env,
-    load_ofm_golden_from_env, ofm_golden_is_all_zero, pack_start_npu_kernel_args,
-    pack_start_npu_kernel_args_no_io, pack_start_npu_kernel_args_with_ctrl, parse_ofm_golden_bytes,
-    patch_ctrl_from_meta_io_paddrs, patch_ctrl_packet_u64_le, ran_on_npu_reason_is_ofm_verify_fail,
-    readback_ofm, resolve_pack_mode_ofm_golden, silicon_pass_asset_readiness, u64_to_prop_dwords,
-    validate_mladf_ctrl_packed_for_pass, validate_mladf_ofm_golden_packed_for_pass,
-    validate_mladf_wts_packed_for_pass, zero_ofm,
+    lab_kernel_arg_layout_from_env, lab_matmul_ifm_nbytes, lab_matmul_ofm_nbytes,
+    lab_matmul_wts_nbytes, lab_ofm_env_enabled, lab_ofm_env_value_enabled, lab_require_ctrl_env,
+    lab_require_non_zero_wts_env, lab_weight_env_enabled, load_ctrl_packed_from_env,
+    load_mladf_meta_json_text_from_env, load_ofm_golden_from_env, ofm_golden_is_all_zero,
+    pack_start_npu_kernel_args, pack_start_npu_kernel_args_no_io,
+    pack_start_npu_kernel_args_with_ctrl, pack_start_npu_kernel_args_with_ctrl_layout,
+    parse_ofm_golden_bytes, patch_ctrl_from_meta_io_paddrs, patch_ctrl_packet_u64_le,
+    ran_on_npu_reason_is_ofm_verify_fail, readback_ofm, resolve_pack_mode_ofm_golden,
+    silicon_pass_asset_readiness, u64_to_prop_dwords, validate_mladf_ctrl_packed_for_pass,
+    validate_mladf_ofm_golden_packed_for_pass, validate_mladf_wts_packed_for_pass, zero_ofm,
 };
 
 pub use txn::{
-    InstructionBlobKind, XAIE_TXN_HEADER_SIZE, XaieTxnHeader, XaieTxnOp, XaieTxnOpcode,
+    Elf32Rela, InstructionBlobKind, XAIE_TXN_HEADER_SIZE, XaieTxnHeader, XaieTxnOp, XaieTxnOpcode,
     build_minimal_noop_txn, build_strix_research_noop_txn, classify_instruction_blob,
-    instruction_payload_bytes, validate_txn_blob, walk_txn_ops_v01,
+    instruction_payload_bytes, is_aiebu_elf_ctrltext, parse_elf32_rela_dyn,
+    patch_aiebu_elf_ctrltext_with_bos, validate_txn_blob, walk_txn_ops_v01,
 };
 
 pub use mladf_pack::{
