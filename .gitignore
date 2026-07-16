@@ -157,3 +157,9 @@ testdata/xdna2_cmd/mladf_wts_export/**
 !testdata/xdna2_cmd/mladf_wts_export/
 !testdata/xdna2_cmd/mladf_wts_export/PROVENANCE.md
 !testdata/xdna2_cmd/mladf_wts_export/**/PROVENANCE.md
+
+# OFM golden capture (vendor Option A; do not commit blobs)
+testdata/xdna2_cmd/mladf_ofm_capture/**
+!testdata/xdna2_cmd/mladf_ofm_capture/
+!testdata/xdna2_cmd/mladf_ofm_capture/**/PROVENANCE*
+target/capture_mladf_ofm_golden

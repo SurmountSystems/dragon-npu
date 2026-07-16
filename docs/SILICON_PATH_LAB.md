@@ -8,14 +8,30 @@
 
 Packing/layout alone never sets `ran_on_npu`.
 
+## Operator one-liner helper
+
+```bash
+bash tools/silicon_lab_operator.sh status           # what's missing
+bash tools/silicon_lab_operator.sh stage            # Priority 2: instr+ctrl+WTS
+# Priority 1 Option A (vendor NPU OFM — instrumented; may need temporary L3):
+echo 1 | sudo tee /sys/module/amdxdna/parameters/exec_cmd_allow
+bash tools/silicon_lab_operator.sh capture-golden   # DD load_xrt + install-golden
+echo 0 | sudo tee /sys/module/amdxdna/parameters/exec_cmd_allow
+bash tools/silicon_lab_operator.sh preflight        # require-pass assets
+bash tools/silicon_lab_operator.sh dry-run          # no L3 / no dragon-npu EXEC
+```
+
+`capture-golden` runs `tools/capture_mladf_ofm_golden.sh` (same synthetic tensors
+as WTS export, bf16 ones IFM, vendor `execute`, 512 B bf16 dump).
+
 ## Stage offline assets
 
 ```bash
 # needs Ryzen AI DD install for dump_dd_txn
-bash tools/stage_silicon_lab_assets.sh
-# real AMD-packed WTS (pick one):
-#   bash tools/stage_silicon_lab_assets.sh --export-wts
-#   bash tools/stage_silicon_lab_assets.sh --wts-from /path/to/amd_packed_wts.bin
+bash tools/silicon_lab_operator.sh stage
+# or low-level:
+# bash tools/stage_silicon_lab_assets.sh --export-wts
+# bash tools/stage_silicon_lab_assets.sh --wts-from /path/to/amd_packed_wts.bin
 ```
 
 Produces under `testdata/xdna2_cmd/silicon_lab/` (gitignored bins):
