@@ -93,7 +93,10 @@ With **hwctx create/destroy working**, the remaining blocker for real compute is
 | `XDNA2_LAB_CTRL_PACKED` | Path to control packet bin (e.g. 29664 B staged `lab_ctrl.bin`); fourth START_NPU kernel-arg BO. Prefer stage dump + `tools/validate_mladf_ctrl.sh` |
 | `XDNA2_LAB_REQUIRE_CTRL` | `1`/`true`: refuse mladf fill when plan has `ctrl_bytes` but ctrl missing/empty/all-zero (fill API + pack mode); pack mode also refuses unset path. Default off for unit tests |
 | `XDNA2_LAB_CTRL_AUTO_PATCH` | `1`/`true`: opt-in lab — apply meta IFM/WTS/OFM paddrs into ctrl (`size=6` `read_add_write`: existing tile offset + base) before attach; needs `XDNA2_LAB_MLADF_META`. Default off |
-| `XDNA2_LAB_KERNEL_ARG_LAYOUT` | `count4` (default): n_bos=4 IFM/WTS/OFM/CTRL; `xrt3`: XRT classic n_bos=3 IFM/WTS/OFM (ctrl still pin+patch). Live Error after WAIT → try `xrt3` |
+| `XDNA2_LAB_KERNEL_ARG_LAYOUT` | `count4` (default) or `xrt3`. Aliases: `4`→count4; `3`/`classic`→xrt3. **Unknown tokens refuse** (`lab_env_invalid`) |
+| `XDNA2_LAB_INSTR_SIZE_MODE` | `content` (default): START_NPU size = min(ctrltext, bo_alloc); `bo`: BO alloc. Aliases: `alloc`/`page`→bo. **Unknown refuse** |
+| `XDNA2_LAB_RELA_MODE` | `overwrite` (default) or `add` (RMW). Alias: `rmw`→add. **Unknown refuse** |
+| `XDNA2_HITL_SKIP_CONTRACT` | `1`/`true`/`yes`/`on`: skip long contract (still ELF+preflight). Sticky env warned; ≠ proof of prior green. Or `--skip-offline-contract` |
 | `XDNA2_LAB_REQUIRE_NONZERO_WTS` | `1`/`true`: refuse all-zero WTS at BO fill; pack mode also refuses unset `XDNA2_LAB_WTS_PACKED` (Pass readiness). **Wins over** `ALLOW_ZERO_WTS` when both set |
 | `XDNA2_LAB_ALLOW_ZERO_WTS` | `1`/`true`: allow zero WTS for plumbing only when **REQUIRE is unset** (not Pass). Does **not** override REQUIRE |
 | `XDNA2_LAB_OFM_GOLDEN` | OFM golden for pack-mode decide: f32 LE `m*n*4` or bf16 LE `m*n*2`. **Required** for mladf; **all-zero refused** by default. Offline: `tools/validate_mladf_ofm_golden.sh` |

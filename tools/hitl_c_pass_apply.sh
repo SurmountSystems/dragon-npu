@@ -4,6 +4,20 @@
 # Forces aiebu ELF (not raw 1688 B txn), silicon-mladf assets, L1+L3 window,
 # single-shot npu_direct_bench, always restores exec_cmd_allow=0.
 #
+# Policy: run only when agent explicitly says ready. See RESIDUAL.md.
+# SSoT unlock line (soft NOTE only, never hard-blocks apply):
+#   C_UNLOCK=<impl> one-shot; restore L3 (exec_cmd_allow=0); ≠ ran_on_npu until Pass
+# IMPL b17b0119: C_UNLOCK=b17b0119 (one-shot). Not permanent open season.
+# L3 = amdxdna exec_cmd_allow (driver). Userspace ALLOW = XDNA2_ALLOW_EXEC_CMD
+# (Cargo double-gate). Leave neither open; unlock is not permanent either.
+# SSoT: vendor classic body often EXISTS (unpatched CLASS A offline).
+# Never unlocks C alone: CONTRACT_OK, unpatched CLASS A / mere diff rc=0,
+# registry_get_instr_bo (Transaction/cache, not live run_ BO), vendor miss
+# soft-skip, residual_class / CLASSIFY_SOFT_OK / app_load_checklist,
+# run_offline_gates / OFFLINE_GATES_OK. Soft-WARNs if vendor bin missing;
+# does NOT hard-block. Missing C_UNLOCK stamp also does NOT hard-block.
+# Missing silicon_contract_check.sh fails closed unless --force-apply.
+#
 # Fish-safe: run with bash.
 #
 # Usage:
@@ -15,7 +29,16 @@
 #   # Or let lab_exec try to open L3 (may print human sudo steps):
 #   bash tools/hitl_c_pass_apply.sh
 #
-# Exit: same as lab_exec_once (0 rare Pass; 4 = !ran_on_npu common; 5 restore fail).
+#   # Research only — apply even if offline contract red / script missing:
+#   bash tools/hitl_c_pass_apply.sh --force-apply-despite-offline-red --assume-l3-already-open
+#
+#   # Faster re-apply when operator already ran contract green this session:
+#   XDNA2_HITL_SKIP_CONTRACT=1 bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+#   # or: bash tools/hitl_c_pass_apply.sh --skip-offline-contract --assume-l3-already-open
+#   # Still refuses non-ELF magic; does NOT skip ELF / preflight asset gates.
+#
+# Exit: same as lab_exec_once (0 rare Pass; 4 = !ran_on_npu common; 5 restore fail / L3 open).
+#       2 = offline contract red/missing script (default) or missing ELF / unknown args.
 set -euo pipefail
 export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,19 +46,51 @@ cd "$ROOT"
 
 ASSUME=()
 BO_DIAG=1
+FORCE_APPLY=0
+NO_BUILD=0
+SKIP_CONTRACT=0
+TIMEOUT_S=""
+# Env opt-in for skip (re-apply UX); flag also works. Truthy: 1/true/yes/on (case-insens).
+_skip_env="${XDNA2_HITL_SKIP_CONTRACT:-}"
+case "${_skip_env,,}" in
+  1|true|yes|on) SKIP_CONTRACT=1 ;;
+esac
+SKIP_CONTRACT_FROM_ENV=0
+[[ "$SKIP_CONTRACT" -eq 1 ]] && SKIP_CONTRACT_FROM_ENV=1
+CONTRACT_STATUS="not_run"  # green|red_forced|skipped|not_run|missing_forced
+CONTRACT_RC=""
 for a in "$@"; do
   case "$a" in
     --assume-l3-already-open|--assume-l3-open)
       ASSUME+=(--assume-l3-already-open)
       ;;
     --no-bo-diag) BO_DIAG=0 ;;
+    --no-build) NO_BUILD=1 ;;
+    --force-apply-despite-offline-red|--force-apply) FORCE_APPLY=1 ;;
+    --skip-offline-contract|--skip-contract) SKIP_CONTRACT=1 ;;
+    --timeout-s=*)
+      TIMEOUT_S="${a#--timeout-s=}"
+      ;;
+    --timeout-s)
+      echo "ERROR: use --timeout-s=N (joined form)" >&2
+      exit 2
+      ;;
     -h|--help)
-      sed -n '1,35p' "$0" | sed 's/^# \?//'
+      # Comment-only help (never dump executable body past header).
+      grep -E '^#([^!]|$)' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
+    --blob|--cargo-args|--allow-stock-kernel|--allow-research-blob|--allow-suspicious-refcnt)
+      echo "ERROR: hitl_c refuses $a (ELF force + allowlist only; no blob override)" >&2
+      exit 2
+      ;;
+    --blob=*|--cargo-args=*|--allow-*)
+      echo "ERROR: hitl_c refuses $a (use lab_exec_once only for research flags)" >&2
+      exit 2
+      ;;
     *)
-      # forward unknown to lab_exec
-      ASSUME+=("$a")
+      echo "ERROR: unknown arg: $a (allowlist: --assume-l3-already-open --no-bo-diag --no-build --timeout-s=N --force-apply-despite-offline-red --skip-offline-contract)" >&2
+      exit 2
       ;;
   esac
 done
@@ -45,6 +100,46 @@ ELF="$DIR/lab_instr.elf"
 BIN="$DIR/lab_instr.bin"
 
 echo "=== Milestone C: pure-direct Pass apply ==="
+
+# Soft unlock stamp from RESIDUAL SSoT (NOTE only — never hard-blocks apply).
+# Tolerate markdown: **C_UNLOCK=…**, `C_UNLOCK=…`, indent, mid-line.
+_c_unlock_tok=""
+if [[ -f "$ROOT/RESIDUAL.md" ]]; then
+  _c_unlock_tok="$(
+    { grep -m1 -oE 'C_UNLOCK=[A-Za-z0-9_]+' "$ROOT/RESIDUAL.md" || true; } \
+      | head -n1 | tr -d '`"*' | tr -d '[:space:]'
+  )"
+fi
+if [[ -n "${_c_unlock_tok}" ]]; then
+  echo "NOTE: ${_c_unlock_tok} one-shot; restore L3 (exec_cmd_allow=0); ≠ ran_on_npu until Pass" >&2
+  echo "NOTE: unlock ≠ Pass ≠ permanent open season. L3=exec_cmd_allow; userspace ALLOW=XDNA2_ALLOW_EXEC_CMD (leave both closed after)." >&2
+else
+  echo "NOTE: no C_UNLOCK= stamp in RESIDUAL.md (soft; not a hard refuse)." >&2
+  echo "NOTE: prefer agent unlock stamp before live apply; research force still allowed." >&2
+fi
+
+# Always emit unlock-ban (classic EXISTS SSoT; not gated on vendor miss).
+echo "NOTE: unlock-ban — false unlocks alone never equal Pass:" >&2
+echo "NOTE:   CONTRACT_OK / OFFLINE_GATES_OK / run_offline_gates green" >&2
+echo "NOTE:   unpatched CLASS A / mere diff rc=0 (body match only)" >&2
+echo "NOTE:   registry BO alone (Transaction/cache, not live run_ BO)" >&2
+echo "NOTE:   residual_class / CLASSIFY_SOFT_OK / app_load_checklist" >&2
+echo "NOTE: See RESIDUAL.md / docs/HITL_C_APP_LOAD_RECIPE.md." >&2
+
+# Soft policy WARN: vendor miss (do not hard-block). Classic body may still EXISTS via sibling.
+VENDOR_INSTR="$ROOT/testdata/xdna2_cmd/gt_capture/instr_vendor_post_patch.bin"
+if [[ ! -f "$VENDOR_INSTR" ]]; then
+  echo "WARN: vendor bin MISSING: $VENDOR_INSTR" >&2
+  echo "WARN: CONTRACT_OK with miss ≠ C-ready. Optional capture if body missing:" >&2
+  echo "WARN:   sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+  echo "WARN:   bash tools/silicon_lab_operator.sh capture-instr" >&2
+  echo "WARN:   sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+  echo "WARN:   bash tools/diff_vendor_instr_parity.sh" >&2
+  echo "WARN:     rc=0 unpatched CLASS A = body match only → still ≠ C-ready" >&2
+  echo "WARN:     rc=2 mismatch + CLASS_HINT → agent offline fix first (not C-ready)" >&2
+  echo "WARN:     rc=3 miss (this case) → capture optional; not C-ready" >&2
+  echo "WARN: continuing (soft docs policy; not a hard refuse)." >&2
+fi
 
 if [[ ! -f "$ELF" ]]; then
   if [[ -f "$BIN" ]]; then
@@ -65,15 +160,42 @@ if [[ "$head32" != "7f454c46" ]]; then
   exit 2
 fi
 
-# Offline gate (soft if GT missing)
-if [[ -x "$ROOT/tools/silicon_contract_check.sh" ]] || [[ -f "$ROOT/tools/silicon_contract_check.sh" ]]; then
+# Offline gate: hard-fail unless --force-apply-despite-offline-red (A9).
+# Skip: operator claim only — NOT proof of prior green (sticky env is loud-warned).
+# Missing contract script: fail closed (exit 2) unless force-apply (research).
+if [[ "$SKIP_CONTRACT" -eq 1 ]]; then
+  CONTRACT_STATUS="skipped"
+  echo "--- offline contract check SKIPPED (--skip-offline-contract / XDNA2_HITL_SKIP_CONTRACT) ---"
+  echo "WARN: skip ≠ proof of prior CONTRACT_OK this session (sticky env can disable A9)." >&2
+  echo "NOTE: ELF magic still enforced; preflight Pass assets still run. Prefer re-run contract after asset restage."
+  if [[ "$SKIP_CONTRACT_FROM_ENV" -eq 1 ]]; then
+    echo "WARN: XDNA2_HITL_SKIP_CONTRACT is set in environment (sticky). Unset when done re-applying." >&2
+  fi
+elif [[ -f "$ROOT/tools/silicon_contract_check.sh" ]]; then
   echo "--- offline contract check ---"
   set +e
-  bash "$ROOT/tools/silicon_contract_check.sh"
+  bash "$ROOT/tools/silicon_contract_check.sh" --require-pass-assets
   cc=$?
   set -e
+  CONTRACT_RC="$cc"
   if [[ "$cc" -ne 0 ]]; then
-    echo "WARN: silicon_contract_check rc=$cc — continuing apply (HITL may still teach)" >&2
+    if [[ "$FORCE_APPLY" -eq 1 ]]; then
+      CONTRACT_STATUS="red_forced"
+      echo "WARN: silicon_contract_check rc=$cc — continuing (--force-apply-despite-offline-red)" >&2
+    else
+      echo "ERROR: offline contract red (rc=$cc). Fix offline or pass --force-apply-despite-offline-red" >&2
+      exit 2
+    fi
+  else
+    CONTRACT_STATUS="green"
+  fi
+else
+  if [[ "$FORCE_APPLY" -eq 1 ]]; then
+    CONTRACT_STATUS="missing_forced"
+    echo "WARN: tools/silicon_contract_check.sh missing — continuing (--force-apply-despite-offline-red)" >&2
+  else
+    echo "ERROR: tools/silicon_contract_check.sh missing (fail closed). Restore script or pass --force-apply-despite-offline-red" >&2
+    exit 2
   fi
 fi
 
@@ -81,15 +203,71 @@ echo "--- preflight Pass assets ---"
 bash tools/silicon_lab_preflight.sh --require-pass-assets
 
 export XDNA2_LAB_BO_DIAG="${XDNA2_LAB_BO_DIAG:-$BO_DIAG}"
-# Clear layout override so default count4 is used unless you set it.
-# (fish: set -e XDNA2_LAB_KERNEL_ARG_LAYOUT before invoking)
 
-echo "--- apply (wedge risk accepted by flag) ---"
+ALLOW_PATH="/sys/module/amdxdna/parameters/exec_cmd_allow"
+read_allow() {
+  if [[ -r "$ALLOW_PATH" ]]; then
+    tr -d '[:space:]' <"$ALLOW_PATH" || true
+  else
+    echo "missing"
+  fi
+}
+allow_now="$(read_allow)"
+echo "driver: exec_cmd_allow=$allow_now"
+
+# --assume-l3-already-open means YOU already opened L3. If N, fail early with the
+# exact recovery recipe (this is not a silicon Pass failure).
+if [[ ${#ASSUME[@]} -gt 0 ]]; then
+  case "$allow_now" in
+    1|Y|y) ;;
+    *)
+      echo "" >&2
+      echo "ERROR: --assume-l3-already-open but exec_cmd_allow=$allow_now (L3 closed)." >&2
+      case "$CONTRACT_STATUS" in
+        green)
+          echo "This is NOT an NPU/FW failure — offline contract was green; you only skipped sudo open." >&2
+          ;;
+        skipped)
+          echo "This is NOT an NPU/FW failure — offline contract was SKIPPED; you only skipped sudo open." >&2
+          echo "(skip ≠ proof of prior green; ELF+preflight still ran)" >&2
+          ;;
+        red_forced)
+          echo "This is NOT an NPU/FW failure — offline contract was RED but --force-apply; you only skipped sudo open." >&2
+          ;;
+        *)
+          echo "This is NOT an NPU/FW failure — you only skipped sudo open (contract status=$CONTRACT_STATUS)." >&2
+          ;;
+      esac
+      echo "" >&2
+      echo "Fish (recommended — open L3, apply, restore):" >&2
+      echo "  sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+      echo "  bash tools/hitl_c_pass_apply.sh --assume-l3-already-open" >&2
+      echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+      echo "" >&2
+      echo "Or omit --assume-l3-already-open and let lab_exec try sudo -n / print human steps:" >&2
+      echo "  bash tools/hitl_c_pass_apply.sh" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+EXTRA=()
+[[ "$NO_BUILD" -eq 1 ]] && EXTRA+=(--no-build)
+[[ -n "$TIMEOUT_S" ]] && EXTRA+=(--timeout-s "$TIMEOUT_S")
+
+# Residual trial env banner (paste-friendly).
+echo "RESIDUAL_ENV: INSTR_SIZE_MODE=${XDNA2_LAB_INSTR_SIZE_MODE:-content(default)} \
+RELA_MODE=${XDNA2_LAB_RELA_MODE:-overwrite(default)} \
+KERNEL_ARG_LAYOUT=${XDNA2_LAB_KERNEL_ARG_LAYOUT:-count4(default)} \
+contract_status=$CONTRACT_STATUS"
+
+echo "--- apply (wedge risk accepted by flag; ELF forced last) ---"
 set +e
 bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets \
   --apply --i-accept-wedge-risk \
-  --blob "$ELF" \
-  "${ASSUME[@]}"
+  "${ASSUME[@]}" \
+  "${EXTRA[@]}" \
+  --blob "$ELF"
 rc=$?
 set -e
 
@@ -103,13 +281,19 @@ case "$allow" in
   *)
     echo "CRITICAL: restore L3:" >&2
     echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+    # Always restore-failed class when L3 still open (never mask prior rc with
+    # non-5 exits such as 1/2/3). Prior code only elevated 0/4.
+    rc=5
     ;;
 esac
 
 echo ""
 echo "What to paste for the agent (if !ran_on_npu):"
 echo "  - status=… line / TimedOpResult JSON status field"
-echo "  - detail snippets: aiebu_elf=  aiebu_rela_patched=  ert_state=  ofm_stats="
+echo "  - detail: aiebu_elf= rela_count= qos_gops= tiles= ert_state= ofm_stats= fw_status_hint="
+echo "  - residual: inst_size_mode= content_size= bo_size= start_npu_size= rela_mode= layout="
+echo "  - RESIDUAL_ENV banner line from this run"
+echo "  - optional: testdata/xdna2_cmd/last_apply.json or \$XDNA2_LAB_LAST_APPLY_JSON"
 echo "  - journal: journalctl -k -b --no-pager | rg -i 'Failed cmd|Status 0x|APP_LOAD|amdxdna' | tail -20"
 echo ""
 echo "Success signal: ran_on_npu=true (bench exit 0). Common: exit 4 until Pass."

@@ -203,22 +203,61 @@ pub enum LabKernelArgLayout {
     Xrt3,
 }
 
-/// `XDNA2_LAB_KERNEL_ARG_LAYOUT=xrt3|count4` (default **count4**).
-#[must_use]
-pub fn lab_kernel_arg_layout_from_env() -> LabKernelArgLayout {
-    match std::env::var("XDNA2_LAB_KERNEL_ARG_LAYOUT")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "xrt3" | "3" | "classic" => LabKernelArgLayout::Xrt3,
-        _ => LabKernelArgLayout::Count4Ctrl,
+impl LabKernelArgLayout {
+    /// Stable token for detail / batch diag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count4Ctrl => "count4",
+            Self::Xrt3 => "xrt3",
+        }
     }
+}
+
+/// Fail-closed parse of `XDNA2_LAB_KERNEL_ARG_LAYOUT`.
+///
+/// Unset / empty → [`LabKernelArgLayout::Count4Ctrl`]. Known: `count4`/`4`,
+/// `xrt3`/`3`/`classic`. Unknown → `Err` (typo must not burn HITL trial).
+///
+/// # Errors
+///
+/// Unrecognized non-empty token.
+pub fn try_lab_kernel_arg_layout_from_str(raw: Option<&str>) -> Result<LabKernelArgLayout, String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or(Ok(LabKernelArgLayout::Count4Ctrl), |s| {
+            match s.to_ascii_lowercase().as_str() {
+                "count4" | "4" => Ok(LabKernelArgLayout::Count4Ctrl),
+                "xrt3" | "3" | "classic" => Ok(LabKernelArgLayout::Xrt3),
+                other => Err(format!(
+                    "unknown XDNA2_LAB_KERNEL_ARG_LAYOUT={other:?}; expected count4|xrt3 \
+                     (aliases 4→count4; 3|classic→xrt3)"
+                )),
+            }
+        })
+}
+
+/// Convenience for known-good / None; unknown falls back to count4 (prefer try).
+#[must_use]
+pub fn lab_kernel_arg_layout_from_str(raw: Option<&str>) -> LabKernelArgLayout {
+    try_lab_kernel_arg_layout_from_str(raw).unwrap_or(LabKernelArgLayout::Count4Ctrl)
+}
+
+/// `XDNA2_LAB_KERNEL_ARG_LAYOUT=xrt3|count4` (default **count4**; fail-closed).
+///
+/// # Errors
+///
+/// Unknown token set in env.
+pub fn lab_kernel_arg_layout_from_env() -> Result<LabKernelArgLayout, String> {
+    try_lab_kernel_arg_layout_from_str(std::env::var("XDNA2_LAB_KERNEL_ARG_LAYOUT").ok().as_deref())
 }
 
 /// Like [`pack_start_npu_kernel_args`] with optional **control packet** paddr.
 ///
-/// Layout selected by [`lab_kernel_arg_layout_from_env`] / `layout` arg.
+/// Layout from env when valid; unknown env is treated as default count4 here
+/// (timed path refuses invalid env **before** EXEC via
+/// [`lab_kernel_arg_layout_from_env`]). Prefer
+/// [`pack_start_npu_kernel_args_with_ctrl_layout`] when layout is known.
 #[must_use]
 pub fn pack_start_npu_kernel_args_with_ctrl(
     ifm_paddr: u64,
@@ -226,13 +265,8 @@ pub fn pack_start_npu_kernel_args_with_ctrl(
     ofm_paddr: u64,
     ctrl_paddr: Option<u64>,
 ) -> Vec<u32> {
-    pack_start_npu_kernel_args_with_ctrl_layout(
-        ifm_paddr,
-        wts_paddr,
-        ofm_paddr,
-        ctrl_paddr,
-        lab_kernel_arg_layout_from_env(),
-    )
+    let layout = lab_kernel_arg_layout_from_env().unwrap_or(LabKernelArgLayout::Count4Ctrl);
+    pack_start_npu_kernel_args_with_ctrl_layout(ifm_paddr, wts_paddr, ofm_paddr, ctrl_paddr, layout)
 }
 
 /// Explicit layout variant of [`pack_start_npu_kernel_args_with_ctrl`].
@@ -1002,14 +1036,25 @@ impl IoBoSet {
     }
 
     /// START_NPU kernel-arg dwords for this set (includes ctrl paddr when present).
+    ///
+    /// Uses env layout when valid; default count4 if unset. Timed path must
+    /// fail-closed-parse env before calling this for residual HITL.
     #[must_use]
     pub fn pack_kernel_args(&self) -> Vec<u32> {
+        self.pack_kernel_args_layout(
+            lab_kernel_arg_layout_from_env().unwrap_or(LabKernelArgLayout::Count4Ctrl),
+        )
+    }
+
+    /// Explicit layout variant of [`Self::pack_kernel_args`].
+    #[must_use]
+    pub fn pack_kernel_args_layout(&self, layout: LabKernelArgLayout) -> Vec<u32> {
         pack_start_npu_kernel_args_with_ctrl_layout(
             self.ifm_addr,
             self.wts_addr,
             self.ofm_addr,
             self.ctrl.map(|_| self.ctrl_addr),
-            lab_kernel_arg_layout_from_env(),
+            layout,
         )
     }
 }
@@ -2123,6 +2168,43 @@ mod tests {
             [0x3333_4444, 0x1111_2222]
         );
         assert_eq!(u64_to_prop_dwords(0), [0, 0]);
+    }
+
+    #[test]
+    fn lab_kernel_arg_layout_from_str_truth_table() {
+        assert_eq!(
+            try_lab_kernel_arg_layout_from_str(None).unwrap(),
+            LabKernelArgLayout::Count4Ctrl
+        );
+        assert_eq!(
+            try_lab_kernel_arg_layout_from_str(Some("")).unwrap(),
+            LabKernelArgLayout::Count4Ctrl
+        );
+        assert_eq!(
+            try_lab_kernel_arg_layout_from_str(Some("count4")).unwrap(),
+            LabKernelArgLayout::Count4Ctrl
+        );
+        assert_eq!(
+            try_lab_kernel_arg_layout_from_str(Some("xrt3")).unwrap(),
+            LabKernelArgLayout::Xrt3
+        );
+        assert_eq!(
+            try_lab_kernel_arg_layout_from_str(Some("3")).unwrap(),
+            LabKernelArgLayout::Xrt3
+        );
+        assert_eq!(
+            try_lab_kernel_arg_layout_from_str(Some("CLASSIC")).unwrap(),
+            LabKernelArgLayout::Xrt3
+        );
+        // Fail-closed: typos must not silently become count4.
+        assert!(try_lab_kernel_arg_layout_from_str(Some("nope")).is_err());
+        assert!(try_lab_kernel_arg_layout_from_str(Some("xrt")).is_err());
+        assert!(try_lab_kernel_arg_layout_from_str(Some("xrt-3")).is_err());
+        // Legacy convenience still defaults unknown for pure helpers.
+        assert_eq!(
+            lab_kernel_arg_layout_from_str(Some("nope")),
+            LabKernelArgLayout::Count4Ctrl
+        );
     }
 
     #[test]

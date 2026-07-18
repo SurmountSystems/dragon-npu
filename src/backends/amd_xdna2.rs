@@ -54,6 +54,7 @@ pub mod host_graph;
 pub mod lab_io;
 pub mod mladf_pack;
 pub mod numerical;
+pub mod silicon_contract;
 pub mod txn;
 
 /// Re-export feature-free colibrì schema version (defined on crate root).
@@ -105,23 +106,52 @@ pub use lab_io::{
     lab_decide_candidate_f32_with_golden, lab_decide_from_ofm_bytes,
     lab_decide_from_ofm_bytes_bool, lab_decide_from_ofm_bytes_pack_mode,
     lab_decide_from_ofm_bytes_with_golden, lab_decode_ofm_bytes, lab_io_size_plan,
-    lab_kernel_arg_layout_from_env, lab_matmul_ifm_nbytes, lab_matmul_ofm_nbytes,
-    lab_matmul_wts_nbytes, lab_ofm_env_enabled, lab_ofm_env_value_enabled, lab_require_ctrl_env,
-    lab_require_non_zero_wts_env, lab_weight_env_enabled, load_ctrl_packed_from_env,
-    load_mladf_meta_json_text_from_env, load_ofm_golden_from_env, ofm_golden_is_all_zero,
-    pack_start_npu_kernel_args, pack_start_npu_kernel_args_no_io,
+    lab_kernel_arg_layout_from_env, lab_kernel_arg_layout_from_str, lab_matmul_ifm_nbytes,
+    lab_matmul_ofm_nbytes, lab_matmul_wts_nbytes, lab_ofm_env_enabled, lab_ofm_env_value_enabled,
+    lab_require_ctrl_env, lab_require_non_zero_wts_env, lab_weight_env_enabled,
+    load_ctrl_packed_from_env, load_mladf_meta_json_text_from_env, load_ofm_golden_from_env,
+    ofm_golden_is_all_zero, pack_start_npu_kernel_args, pack_start_npu_kernel_args_no_io,
     pack_start_npu_kernel_args_with_ctrl, pack_start_npu_kernel_args_with_ctrl_layout,
     parse_ofm_golden_bytes, patch_ctrl_from_meta_io_paddrs, patch_ctrl_packet_u64_le,
     ran_on_npu_reason_is_ofm_verify_fail, readback_ofm, resolve_pack_mode_ofm_golden,
-    silicon_pass_asset_readiness, u64_to_prop_dwords, validate_mladf_ctrl_packed_for_pass,
-    validate_mladf_ofm_golden_packed_for_pass, validate_mladf_wts_packed_for_pass, zero_ofm,
+    silicon_pass_asset_readiness, try_lab_kernel_arg_layout_from_str, u64_to_prop_dwords,
+    validate_mladf_ctrl_packed_for_pass, validate_mladf_ofm_golden_packed_for_pass,
+    validate_mladf_wts_packed_for_pass, zero_ofm,
+};
+
+pub use silicon_contract::{
+    ContractCheck, LAB_DEFAULT_QOS_FPS, LAB_DEFAULT_QOS_GOPS, LabBatchDiag, LabInstrSizeMode,
+    LastApplyDetailSignals, LastApplyEvidenceFingerprint, START_NPU_PROP_COUNT_BYTE_OFF,
+    SiliconPassEval, SiliconPassEvidence, SiliconResidualClass, VendorPaddrs, aie2_fw_status_name,
+    blob_kind_token, classify_last_apply_residual, classify_last_apply_residual_ex,
+    contract_classify_blob, contract_dynsym_report, contract_instr_size_modes,
+    contract_kernel_arg_layouts, contract_post_patch_txn, contract_post_patch_txn_mode,
+    contract_report, default_last_apply_path, evaluate_silicon_pass_evidence,
+    finalize_lab_timed_result, format_app_load_offline_checklist, format_app_load_residual_diag,
+    format_instr_size_detail, format_lab_batch_diag, format_silicon_pass_eval_note,
+    format_silicon_residual_class_note, fw_status_hint_for_lab, instr_map_offset_is_no_mmap,
+    instr_size_content_clamped, is_valid_device_paddr, journal_line_has_app_load_hint,
+    lab_instr_size_mode_from_env, lab_instr_size_mode_from_str, lab_qos_gops_fps_from_env,
+    last_apply_bo_gt_content, last_apply_evidence_fingerprint, last_apply_has_rela_evidence,
+    last_apply_is_same_fixture_fingerprint, last_apply_load_path_is_allowed,
+    last_apply_matches_locked_app_load_baseline, last_apply_path_is_allowed,
+    last_apply_start_npu_matches_content, parse_io_paddrs_from_detail,
+    parse_last_apply_detail_signals, parse_paddr_json_value, parse_vendor_paddrs_json,
+    prop_count_from_start_npu_cmd_bo, residual_note_has_exact_token, resolve_lab_qos_gops_fps,
+    resolve_start_npu_inst_size, silicon_pass_evidence_ert_completed,
+    silicon_pass_evidence_from_last_apply, silicon_pass_evidence_has_ert_error,
+    try_lab_instr_size_mode_from_str, vendor_paddrs_json_from_io, write_last_apply_best_effort,
+    write_last_apply_to_path,
 };
 
 pub use txn::{
-    Elf32Rela, InstructionBlobKind, XAIE_TXN_HEADER_SIZE, XaieTxnHeader, XaieTxnOp, XaieTxnOpcode,
-    build_minimal_noop_txn, build_strix_research_noop_txn, classify_instruction_blob,
-    instruction_payload_bytes, is_aiebu_elf_ctrltext, parse_elf32_rela_dyn,
-    patch_aiebu_elf_ctrltext_with_bos, validate_txn_blob, walk_txn_ops_v01,
+    Elf32DynSym, Elf32Rela, InstructionBlobKind, LabRelaMode, XAIE_TXN_HEADER_SIZE, XaieTxnHeader,
+    XaieTxnOp, XaieTxnOpcode, build_minimal_noop_txn, build_strix_research_noop_txn,
+    classify_instruction_blob, format_dynsym_report, instruction_payload_bytes,
+    is_aiebu_elf_ctrltext, lab_rela_mode_from_env, lab_rela_mode_from_str, parse_elf32_dynsym,
+    parse_elf32_rela_dyn, patch_aiebu_elf_ctrltext_with_bos, patch_aiebu_elf_ctrltext_with_bos_ex,
+    try_lab_rela_mode_from_str, validate_patched_ctrltext_classic, validate_txn_blob,
+    walk_txn_ops_v01,
 };
 
 pub use mladf_pack::{

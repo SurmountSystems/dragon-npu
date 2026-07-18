@@ -100,6 +100,32 @@ jobs:
           fi
           cargo test --features amd-xdna2,xdna2-dangerous-exec-cmd --lib
 
+  # Light offline residual suite (no ALLOW / no EXEC / ≠ C-ready).
+  # Single step: tools/run_offline_gates.sh already hard-runs pure_direct +
+  # silicon_contract + classic_1688 (refuse 0 matched) + fmt/clippy/bash -n.
+  # Named filters are NOT duplicated here (was dual-step cost); full --lib matrix
+  # still covers them in clippy-test/msrv. RESIDUAL table honesty = runner.
+  offline-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: run_offline_gates soft-assets (≠ C-ready)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          unset XDNA2_ALLOW_EXEC_CMD || true
+          if [ -n "${XDNA2_ALLOW_EXEC_CMD:-}" ]; then
+            echo "XDNA2_ALLOW_EXEC_CMD must be unset in CI offline-gates" >&2
+            exit 1
+          fi
+          # Clean CI: lab_instr.elf / last_apply gitignored → unit hard + soft skip.
+          # Never --require-assets here. Green ≠ unlock C / ≠ ran_on_npu.
+          # pure_direct + silicon_contract are hard steps inside the runner.
+          bash tools/run_offline_gates.sh
+
   # Lab wrapper: syntax + dry-run only (never --apply; no EXEC/sudo).
   lab-script:
     runs-on: ubuntu-latest
@@ -114,6 +140,29 @@ jobs:
           bash -n scripts/inventory_txn_sources.sh
           bash -n tools/silicon_lab_operator.sh
           bash -n tools/silicon_lab_preflight.sh
+          bash -n tools/silicon_contract_check.sh
+          bash -n tools/diff_gt_parity.sh
+          bash -n tools/hitl_b_gt_capture.sh
+          bash -n tools/hitl_c_pass_apply.sh
+          bash -n tools/dump_mladf_gt_offline.sh
+          bash -n tools/stage_aiebu_lab_instr.sh
+          bash -n tools/run_offline_gates.sh
+          bash -n tools/classify_last_apply_residual.sh
+          bash -n tools/test_diff_vendor_parity_offline.sh
+          bash -n tools/diff_vendor_instr_parity.sh
+      - name: silicon_contract_check soft (assets optional)
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          # Never set XDNA2_ALLOW_EXEC_CMD; never --apply / EXEC.
+          # Soft: skip when gitignored lab_instr.elf is absent (clean CI checkout).
+          ELF="testdata/xdna2_cmd/silicon_lab/lab_instr.elf"
+          if [[ ! -f "$ELF" ]]; then
+            echo "SKIP silicon_contract_check: no $ELF (gitignored assets)"
+            exit 0
+          fi
+          echo "Running silicon_contract_check (ELF present; offline only)…"
+          bash tools/silicon_contract_check.sh
       - name: silicon_lab_operator unknown-cmd refuse
         run: |
           set -euo pipefail

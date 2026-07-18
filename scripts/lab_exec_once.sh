@@ -206,6 +206,20 @@ while [[ $# -gt 0 ]]; do
       fi
       # shellcheck disable=SC2206
       CARGO_EXTRA=($2)
+      # Force example-only args: bare `--` so Cargo never interprets tokens as
+      # global options (config/rustc-wrapper RCE class during apply).
+      if [[ ${#CARGO_EXTRA[@]} -eq 0 || "${CARGO_EXTRA[0]}" != "--" ]]; then
+        CARGO_EXTRA=(-- "${CARGO_EXTRA[@]}")
+      fi
+      # Refuse cargo-looking globals that might still sneak before `--` misuse.
+      for tok in "${CARGO_EXTRA[@]}"; do
+        case "$tok" in
+          --) continue ;;
+          --config|--config=*|-Z*|--offline|--target-dir|--manifest-path|--out-dir)
+            die 2 "--cargo-args refuses Cargo global-like token: $tok (example flags only after --)"
+            ;;
+        esac
+      done
       shift 2
       ;;
     --print-sudo-only) PRINT_SUDO_ONLY=1; shift ;;
@@ -628,7 +642,14 @@ enable_l3() {
         L3_WE_ENABLED=1
         return 0
         ;;
-      *) die 1 "--assume-l3-already-open but exec_cmd_allow=$cur (not enabled)" ;;
+      *)
+        echo "ERROR: --assume-l3-already-open but exec_cmd_allow=$cur (L3 closed)." >&2
+        echo "  Not a silicon failure — open L3 first, then re-run apply:" >&2
+        echo "    sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+        echo "    bash tools/hitl_c_pass_apply.sh --assume-l3-already-open" >&2
+        echo "    sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+        die 1 "--assume-l3-already-open requires exec_cmd_allow=1/Y (got $cur)"
+        ;;
     esac
   fi
   if [[ "$PRINT_SUDO_ONLY" -eq 1 ]]; then

@@ -105,6 +105,10 @@ testdata/xdna2_cmd/**
 !testdata/xdna2_cmd/**/PROVENANCE.md
 !testdata/xdna2_cmd/**/*.sha256
 !testdata/xdna2_cmd/**/*.txt
+# gt_capture bins + last_apply snapshot stay ignored (under ** above);
+# PROVENANCE.md un-ignored. Explicit last_apply name for belt-and-suspenders:
+testdata/xdna2_cmd/last_apply.json
+**/last_apply.json
 
 # Belt-and-suspenders: common mis-staged instruction paths outside staging dir
 **/lab_instr.bin

@@ -1661,9 +1661,11 @@ impl DirectSubmission for RealDirectSubmission {
                 //   copy_from_user(&ctx->qos, u64_to_user_ptr(args->qos_p), ...)
                 // ALWAYS runs — qos_p MUST be a valid userspace pointer. Passing 0
                 // yields -EFAULT (or EINVAL on some kernels). Official clients always
-                // supply a qos struct; zeroed defaults are fine (is_valid_qos_dpm_params
-                // then falls back to max/low DPM).
-                // XDNA2_HWCTX_QOS_NULL=1 reverts to the old null experiment.
+                // supply a qos struct. Zeroed gops/fps still succeed but are
+                // soft-invalid (driver logs "Invalid QoS", max DPM). Lab timed path
+                // defaults to gops=100 fps=30 via lab_qos_gops_fps_from_env /
+                // XDNA2_HWCTX_QOS_*; research-only zeros: XDNA2_HWCTX_QOS_ZERO=1.
+                // XDNA2_HWCTX_QOS_NULL=1 reverts to the old null-pointer experiment.
                 let force_null_qos = std::env::var("XDNA2_HWCTX_QOS_NULL")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
                 let qos_p = if force_null_qos {
@@ -4173,6 +4175,40 @@ pub fn timed_matmul_direct(
     let mut fill_s: Option<f64> = None;
     let mut submit_wait_s: Option<f64> = None;
 
+    // Offline contract-only short-circuit: never opens EXEC even if L1 set.
+    // XDNA2_LAB_CONTRACT_ONLY=1 → pure checklist from instruction blob env (if any).
+    if std::env::var("XDNA2_LAB_CONTRACT_ONLY")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        let blob = load_instruction_blob_from_env().ok().flatten();
+        let checks = super::silicon_contract::contract_report(
+            blob.as_deref(),
+            0xa11f_0000_1000,
+            0xa11f_0000_2000,
+            0xa11f_0000_3000,
+            0xa11f_0000_4000,
+        );
+        let all_ok = checks.iter().all(|c| c.ok);
+        let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+        r.total_s = t0.elapsed().as_secs_f64();
+        r.ran_on_npu = false;
+        r.status = if all_ok {
+            "contract_only_ok".to_string()
+        } else {
+            "contract_only_failed".to_string()
+        };
+        let checklist: Vec<String> = checks
+            .iter()
+            .map(|c| format!("{}={}({})", c.id, c.ok, c.detail))
+            .collect();
+        r.detail = format!(
+            "XDNA2_LAB_CONTRACT_ONLY=1 (no EXEC / no hwctx); contract_checklist=[{}]; \
+             ran_on_npu=false",
+            checklist.join("; ")
+        );
+        return r;
+    }
+
     // Env wins. Heuristic: resource TOPS → 4/8 tiles for ordinary bring-up.
     // Live 2026-07-16 silicon-mladf: FW `APP_LOAD_PDI_FAIL` (0x3000003) with 4–8
     // tiles — staged mladf txn is **8×6** class; XRT uses `num_tiles = cols * core_rows`
@@ -4184,6 +4220,8 @@ pub fn timed_matmul_direct(
         ),
         Ok(super::mladf_pack::LabPackMode::MladfA16W4)
     );
+    // XRT: num_tiles = partition_cols * core_rows (often 4). Staged mladf txn
+    // is classic v0.1 with num_cols=8 → 8*4=32.
     let default_tiles = if lab_ofm_early && lab_mladf_early {
         32
     } else {
@@ -4197,13 +4235,50 @@ pub fn timed_matmul_direct(
     let log = parse_u64_from_env("XDNA2_HWCTX_LOG", 128 * 1024).max(4096);
 
     let prep0 = Instant::now();
-    // Zero QoS is soft-invalid (driver logs "Invalid QoS", max DPM). Minimal
-    // gops+fps makes is_valid_qos_dpm_params true (aie2_ctx.c).
+    // Zero QoS is soft-invalid (driver logs "Invalid QoS gops 0 fps 0", max DPM).
+    // Always set defaults for timed path. Explicit env `0` is clamped unless
+    // XDNA2_HWCTX_QOS_ZERO=1 (research). See resolve_lab_qos_gops_fps.
     let mut qos = QosInfo::default();
-    if lab_ofm_early && lab_mladf_early {
-        qos.gops = 100;
-        qos.fps = 30;
-    }
+    let (qg, qf) = super::silicon_contract::lab_qos_gops_fps_from_env();
+    qos.gops = qg;
+    qos.fps = qf;
+    // Diag state for every exit (A7).
+    let mut diag_rela_count: Option<usize> = None;
+    let mut diag_aiebu: Option<bool> = None;
+    let mut diag_ert_error = false;
+    let mut diag_layout: &'static str = "na";
+    let mut diag_kernel_args_len: usize = 0;
+    // Residual trial tokens always stamped (Cell so early exits see latest parse).
+    let diag_instr_size_mode = std::cell::Cell::new("na");
+    let diag_rela_mode_tok = std::cell::Cell::new("na");
+    let stamp = |r: &mut TimedOpResult,
+                 tiles: u32,
+                 qos: &QosInfo,
+                 rela: Option<usize>,
+                 aiebu: Option<bool>,
+                 ert_err: bool,
+                 layout: &'static str,
+                 kargs: usize,
+                 write_la: bool| {
+        super::silicon_contract::finalize_lab_timed_result(
+            r,
+            super::silicon_contract::LabBatchDiag {
+                tiles,
+                qos_gops: qos.gops,
+                qos_fps: qos.fps,
+                rela_count: rela,
+                aiebu_elf: aiebu,
+                ert_error: ert_err,
+                layout,
+                instr_size_mode: diag_instr_size_mode.get(),
+                rela_mode: diag_rela_mode_tok.get(),
+            },
+            kargs,
+            write_la,
+        );
+    };
+    let write_la_default = lab_ofm_early || std::env::var_os("XDNA2_LAB_LAST_APPLY_JSON").is_some();
+
     let hwctx = submission.create_hwctx_with_sizes(0, tiles, mem, umq, log, Some(&qos));
     let hwctx_elapsed = prep0.elapsed().as_secs_f64();
     let hwctx_s = Some(hwctx_elapsed);
@@ -4221,6 +4296,17 @@ pub fn timed_matmul_direct(
                 "CREATE_HWCTX failed tiles={tiles} mladf_tiles_default={lab_mladf_early}: {e}. \
                  Real GEMM needs working hwctx + known-good instruction blob + verify."
             );
+            stamp(
+                &mut r,
+                tiles,
+                &qos,
+                None,
+                None,
+                false,
+                "na",
+                0,
+                write_la_default,
+            );
             attach_host_ref(&mut r, m, n, k, dtype);
             return r;
         }
@@ -4232,6 +4318,7 @@ pub fn timed_matmul_direct(
     // Populated when LAB_OFM uses mladf plan (report plan M/N/K on TimedOpResult).
     let mut report_dims: Option<(u32, u32, u32)> = None;
     let mut used_mladf_pack = false;
+    let write_la = write_la_default || try_submit;
 
     let (status, detail, ran_on_npu) = if try_submit {
         let fill0 = Instant::now();
@@ -4242,11 +4329,96 @@ pub fn timed_matmul_direct(
         let mut inst_handle: Option<u32> = None;
         let mut used_inst_blob = false;
         let mut inst_addr: u64 = 0;
+        // START_NPU instruction_buffer_size field (may be content or BO alloc).
         let mut inst_size: u32 = 0;
+        // Device BO allocation (page pad); always write this many bytes.
+        let mut inst_bo_alloc: u32 = 0;
+        // Fail-closed residual env parse before any EXEC (typos must not burn HITL).
+        let instr_size_mode =
+            match crate::backends::amd_xdna2::silicon_contract::lab_instr_size_mode_from_env() {
+                Ok(m) => {
+                    diag_instr_size_mode.set(m.as_str());
+                    m
+                }
+                Err(e) => {
+                    destroy_hwctx_and_owned_bos(submission, &ctx);
+                    let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                    r.total_s = t0.elapsed().as_secs_f64();
+                    r.hwctx_s = hwctx_s;
+                    r.status = "lab_env_invalid".to_string();
+                    r.detail = e;
+                    stamp(
+                        &mut r,
+                        tiles,
+                        &qos,
+                        diag_rela_count,
+                        diag_aiebu,
+                        diag_ert_error,
+                        diag_layout,
+                        diag_kernel_args_len,
+                        write_la,
+                    );
+                    return r;
+                }
+            };
+        let rela_mode = match crate::backends::amd_xdna2::txn::lab_rela_mode_from_env() {
+            Ok(m) => {
+                diag_rela_mode_tok.set(m.as_str());
+                m
+            }
+            Err(e) => {
+                destroy_hwctx_and_owned_bos(submission, &ctx);
+                let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                r.total_s = t0.elapsed().as_secs_f64();
+                r.hwctx_s = hwctx_s;
+                r.status = "lab_env_invalid".to_string();
+                r.detail = e;
+                stamp(
+                    &mut r,
+                    tiles,
+                    &qos,
+                    diag_rela_count,
+                    diag_aiebu,
+                    diag_ert_error,
+                    diag_layout,
+                    diag_kernel_args_len,
+                    write_la,
+                );
+                return r;
+            }
+        };
+        let arg_layout = match super::lab_io::lab_kernel_arg_layout_from_env() {
+            Ok(l) => {
+                diag_layout = l.as_str();
+                l
+            }
+            Err(e) => {
+                destroy_hwctx_and_owned_bos(submission, &ctx);
+                let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                r.total_s = t0.elapsed().as_secs_f64();
+                r.hwctx_s = hwctx_s;
+                r.status = "lab_env_invalid".to_string();
+                r.detail = e;
+                stamp(
+                    &mut r,
+                    tiles,
+                    &qos,
+                    diag_rela_count,
+                    diag_aiebu,
+                    diag_ert_error,
+                    diag_layout,
+                    diag_kernel_args_len,
+                    write_la,
+                );
+                return r;
+            }
+        };
         let mut blob_note = String::from("envelope (no instruction blob)");
         // Full file (may be aiebu ELF). Device fill may wait until I/O paddrs exist
         // so `.rela.dyn` can be applied (XRT patch_ctrl_code parity).
         let mut inst_blob_raw: Option<Vec<u8>> = None;
+        // aiebu ELF must be rela-patched before EXEC (never submit zero Dev BO).
+        let mut aiebu_rela_applied = false;
 
         match load_instruction_blob_from_env() {
             Ok(None) => {}
@@ -4266,24 +4438,46 @@ pub fn timed_matmul_direct(
                         r.status = "inst_blob_load_failed".to_string();
                         r.detail = format!("instruction payload peel failed: {e}");
                         attach_host_ref(&mut r, m, n, k, dtype);
+                        stamp(
+                            &mut r,
+                            tiles,
+                            &qos,
+                            diag_rela_count,
+                            diag_aiebu,
+                            diag_ert_error,
+                            diag_layout,
+                            diag_kernel_args_len,
+                            write_la,
+                        );
                         return r;
                     }
                 };
                 let is_elf = crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(&blob);
+                diag_aiebu = Some(is_elf);
+                if is_elf {
+                    if let Ok(relas) = crate::backends::amd_xdna2::txn::parse_elf32_rela_dyn(&blob)
+                    {
+                        diag_rela_count = Some(relas.len());
+                    }
+                }
                 let stream_len = stream.len() as u64;
                 // XRT: instruction → AMDXDNA_BO_DEV (heap carve), not SHMEM.
                 // Live lab: Shmem returned xdna_addr=0xffffffffffffffff (invalid).
+                // Driver page-aligns BO size. START_NPU size field is dual-mode:
+                // `XDNA2_LAB_INSTR_SIZE_MODE=content|bo` (default content after
+                // bo_size=4096 still APP_LOAD_PDI_FAIL). BO always zero-padded.
                 let inst_ty = BufferType::Dev;
-                match submission.create_buffer(0, stream_len.max(4096), inst_ty) {
+                let inst_alloc = stream_len.max(4096);
+                match submission.create_buffer(0, inst_alloc, inst_ty) {
                     Ok(bh) => {
-                        // Non-ELF: write peel immediately. ELF: defer until I/O paddrs
-                        // (or write unpatched peel as placeholder if no LAB_OFM).
-                        let initial = if is_elf {
-                            // Placeholder zeros until patch (size = ctrltext).
-                            vec![0_u8; stream.len()]
-                        } else {
-                            stream
-                        };
+                        // Full alloc zeroed; content written at offset 0 (patch may re-write).
+                        let alloc_usize = usize::try_from(inst_alloc).unwrap_or(usize::MAX);
+                        let mut initial = vec![0_u8; alloc_usize];
+                        if !is_elf {
+                            let copy_n = stream.len().min(initial.len());
+                            initial[..copy_n].copy_from_slice(&stream[..copy_n]);
+                        }
+                        // ELF: leave zeros until rela patch re-fills (zero-padded page).
                         if let Err(e) = submission.write_bo_bytes(0, bh.0, 0, &initial) {
                             // D3: DevHeap + instr snapshot before destroy (fill path).
                             let bo_diag = collect_lab_bo_diag(submission, Some(bh.0), None);
@@ -4303,26 +4497,51 @@ pub fn timed_matmul_direct(
                                 blob.len()
                             );
                             attach_host_ref(&mut r, m, n, k, dtype);
+                            stamp(
+                                &mut r,
+                                tiles,
+                                &qos,
+                                diag_rela_count,
+                                diag_aiebu,
+                                diag_ert_error,
+                                diag_layout,
+                                diag_kernel_args_len,
+                                write_la,
+                            );
                             return r;
                         }
                         match submission.get_bo_info(0, bh.0) {
                             Ok(info) if is_valid_xdna_device_addr(info.xdna_addr) => {
                                 inst_addr = info.xdna_addr;
-                                inst_size = u32::try_from(initial.len()).unwrap_or(u32::MAX);
+                                // GET_BO_INFO has no size; track BO alloc vs content separately.
+                                inst_bo_alloc = u32::try_from(inst_alloc).unwrap_or(u32::MAX);
+                                let content_len = u32::try_from(stream_len).unwrap_or(u32::MAX);
+                                inst_size = crate::backends::amd_xdna2::silicon_contract::resolve_start_npu_inst_size(
+                                    content_len,
+                                    inst_bo_alloc,
+                                    instr_size_mode,
+                                );
                                 inst_handle = Some(bh.0);
                                 used_inst_blob = true;
                                 inst_blob_raw = Some(blob);
                                 let elf_note = if is_elf {
-                                    " aiebu_elf=1 (rela patch after I/O)"
+                                    diag_rela_count.map_or_else(
+                                        || " aiebu_elf=1 (rela pending)".to_string(),
+                                        |n| format!(" aiebu_elf=1 (rela pending) rela_count={n}"),
+                                    )
                                 } else {
-                                    " aiebu_elf=0 (raw txn — may APP_LOAD_PDI_FAIL)"
+                                    " aiebu_elf=0 (raw txn — may APP_LOAD_PDI_FAIL)".to_string()
                                 };
+                                let size_note = crate::backends::amd_xdna2::silicon_contract::format_instr_size_detail(
+                                    instr_size_mode,
+                                    content_len,
+                                    inst_bo_alloc,
+                                    inst_size,
+                                );
                                 blob_note = format!(
-                                    "inst_blob {} bytes ty={inst_ty:?} xdna_addr={:#x} \
-                                     map_offset={:#x}{elf_note}",
-                                    initial.len(),
-                                    inst_addr,
-                                    info.map_offset
+                                    "inst_blob content={}B bo_size={inst_alloc}B ty={inst_ty:?} \
+                                     xdna_addr={:#x} map_offset={:#x}; {size_note}{elf_note}",
+                                    stream_len, inst_addr, info.map_offset
                                 );
                             }
                             Ok(info) => {
@@ -4362,6 +4581,17 @@ pub fn timed_matmul_direct(
                                     info.xdna_addr, info.map_offset
                                 );
                                 attach_host_ref(&mut r, m, n, k, dtype);
+                                stamp(
+                                    &mut r,
+                                    tiles,
+                                    &qos,
+                                    diag_rela_count,
+                                    diag_aiebu,
+                                    diag_ert_error,
+                                    diag_layout,
+                                    diag_kernel_args_len,
+                                    write_la,
+                                );
                                 return r;
                             }
                             Err(e) => {
@@ -4378,6 +4608,17 @@ pub fn timed_matmul_direct(
                                 r.status = "inst_blob_bo_info_failed".to_string();
                                 r.detail = format!("get_bo_info for instruction BO failed: {e}");
                                 attach_host_ref(&mut r, m, n, k, dtype);
+                                stamp(
+                                    &mut r,
+                                    tiles,
+                                    &qos,
+                                    diag_rela_count,
+                                    diag_aiebu,
+                                    diag_ert_error,
+                                    diag_layout,
+                                    diag_kernel_args_len,
+                                    write_la,
+                                );
                                 return r;
                             }
                         }
@@ -4394,6 +4635,17 @@ pub fn timed_matmul_direct(
                         r.status = "inst_blob_bo_failed".to_string();
                         r.detail = format!("CREATE_BO for instruction blob failed: {e}");
                         attach_host_ref(&mut r, m, n, k, dtype);
+                        stamp(
+                            &mut r,
+                            tiles,
+                            &qos,
+                            diag_rela_count,
+                            diag_aiebu,
+                            diag_ert_error,
+                            diag_layout,
+                            diag_kernel_args_len,
+                            write_la,
+                        );
                         return r;
                     }
                 }
@@ -4410,6 +4662,17 @@ pub fn timed_matmul_direct(
                 r.status = "inst_blob_load_failed".to_string();
                 r.detail = format!("instruction blob env present but load failed: {e}");
                 attach_host_ref(&mut r, m, n, k, dtype);
+                stamp(
+                    &mut r,
+                    tiles,
+                    &qos,
+                    diag_rela_count,
+                    diag_aiebu,
+                    diag_ert_error,
+                    diag_layout,
+                    diag_kernel_args_len,
+                    write_la,
+                );
                 return r;
             }
         }
@@ -4504,15 +4767,21 @@ pub fn timed_matmul_direct(
                     // (XRT patch_ctrl_code parity) before EXEC.
                     if let (Some(h), Some(raw)) = (inst_handle, inst_blob_raw.as_ref()) {
                         if crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(raw) {
-                            match crate::backends::amd_xdna2::txn::patch_aiebu_elf_ctrltext_with_bos(
+                            match crate::backends::amd_xdna2::txn::patch_aiebu_elf_ctrltext_with_bos_ex(
                                 raw,
                                 ios.ifm_addr,
                                 ios.wts_addr,
                                 ios.ofm_addr,
                                 ios.ctrl_addr,
+                                rela_mode,
                             ) {
                                 Ok(patched) => {
-                                    if let Err(e) = submission.write_bo_bytes(0, h, 0, &patched) {
+                                    // Zero-pad to BO alloc (page), not START_NPU size field.
+                                    let pad_len = inst_bo_alloc.max(1) as usize;
+                                    let mut padded = vec![0_u8; pad_len];
+                                    let copy_n = patched.len().min(padded.len());
+                                    padded[..copy_n].copy_from_slice(&patched[..copy_n]);
+                                    if let Err(e) = submission.write_bo_bytes(0, h, 0, &padded) {
                                         super::lab_io::destroy_io_bos(submission, &ios);
                                         let _ = submission.destroy_buffer(0, h);
                                         fill_s = Some(fill0.elapsed().as_secs_f64());
@@ -4529,12 +4798,91 @@ pub fn timed_matmul_direct(
                                         r.detail =
                                             format!("aiebu ELF rela patch write failed: {e}");
                                         attach_host_ref(&mut r, m, n, k, dtype);
+                                        stamp(
+                                            &mut r,
+                                            tiles,
+                                            &qos,
+                                            diag_rela_count,
+                                            diag_aiebu,
+                                            diag_ert_error,
+                                            diag_layout,
+                                            diag_kernel_args_len,
+                                            write_la,
+                                        );
                                         return r;
                                     }
-                                    inst_size = u32::try_from(patched.len()).unwrap_or(u32::MAX);
+                                    // Offline+live: refuse EXEC if classic walk breaks
+                                    // (staged mladf: 1688 B / 40 ops).
+                                    let expect_staged = patched.len() == 1688;
+                                    if let Err(e) = crate::backends::amd_xdna2::txn::validate_patched_ctrltext_classic(
+                                        &patched,
+                                        expect_staged,
+                                    ) {
+                                        super::lab_io::destroy_io_bos(submission, &ios);
+                                        let _ = submission.destroy_buffer(0, h);
+                                        fill_s = Some(fill0.elapsed().as_secs_f64());
+                                        host_prep_s += fill_s.unwrap_or(0.0);
+                                        destroy_hwctx_and_owned_bos(submission, &ctx);
+                                        let mut r = timed_op_base(
+                                            "matmul", m, n, k, dtype, real_ioctl, None,
+                                        );
+                                        r.total_s = t0.elapsed().as_secs_f64();
+                                        r.host_prep_s = host_prep_s;
+                                        r.hwctx_s = hwctx_s;
+                                        r.fill_s = fill_s;
+                                        r.status = "inst_blob_load_failed".to_string();
+                                        r.detail = format!(
+                                            "aiebu post-patch classic walk refuse: {e}"
+                                        );
+                                        attach_host_ref(&mut r, m, n, k, dtype);
+                                        stamp(
+                                            &mut r,
+                                            tiles,
+                                            &qos,
+                                            diag_rela_count,
+                                            diag_aiebu,
+                                            diag_ert_error,
+                                            diag_layout,
+                                            diag_kernel_args_len,
+                                            write_la,
+                                        );
+                                        return r;
+                                    }
+                                    // START_NPU size: content (default) or BO alloc;
+                                    // content mode clamps to bo_alloc (never advertise
+                                    // DMA longer than written bytes).
+                                    let content_len =
+                                        u32::try_from(patched.len()).unwrap_or(u32::MAX);
+                                    if inst_bo_alloc == 0 {
+                                        inst_bo_alloc = content_len.max(4096);
+                                    }
+                                    let clamped = crate::backends::amd_xdna2::silicon_contract::instr_size_content_clamped(
+                                        content_len,
+                                        inst_bo_alloc,
+                                        instr_size_mode,
+                                    );
+                                    inst_size = crate::backends::amd_xdna2::silicon_contract::resolve_start_npu_inst_size(
+                                        content_len,
+                                        inst_bo_alloc,
+                                        instr_size_mode,
+                                    );
+                                    let size_note = crate::backends::amd_xdna2::silicon_contract::format_instr_size_detail(
+                                        instr_size_mode,
+                                        content_len,
+                                        inst_bo_alloc,
+                                        inst_size,
+                                    );
+                                    let clamp_note = if clamped {
+                                        " content_clamped_to_bo=1"
+                                    } else {
+                                        ""
+                                    };
+                                    aiebu_rela_applied = true;
                                     blob_note = format!(
-                                        "{blob_note}; aiebu_rela_patched ctrltext={}B",
-                                        patched.len()
+                                        "{blob_note}; aiebu_rela_patched ctrltext={}B \
+                                         rela_mode={} {size_note}{clamp_note}",
+                                        patched.len(),
+                                        rela_mode.as_str(),
                                     );
                                 }
                                 Err(e) => {
@@ -4555,13 +4903,24 @@ pub fn timed_matmul_direct(
                                          not raw txn): {e}"
                                     );
                                     attach_host_ref(&mut r, m, n, k, dtype);
+                                    stamp(
+                                        &mut r,
+                                        tiles,
+                                        &qos,
+                                        diag_rela_count,
+                                        diag_aiebu,
+                                        diag_ert_error,
+                                        diag_layout,
+                                        diag_kernel_args_len,
+                                        write_la,
+                                    );
                                     return r;
                                 }
                             }
                         }
                     }
-                    kernel_args = ios.pack_kernel_args();
-                    let arg_layout = super::lab_io::lab_kernel_arg_layout_from_env();
+                    kernel_args = ios.pack_kernel_args_layout(arg_layout);
+                    diag_kernel_args_len = kernel_args.len();
                     // Pin list: IFM/WTS/OFM, optional CTRL, then instruction.
                     arg_bo_handles = super::lab_io::build_lab_arg_bo_handles_ex(
                         Some((ios.ifm.0, ios.wts.0, ios.ofm.0)),
@@ -4576,6 +4935,10 @@ pub fn timed_matmul_direct(
                     let layout_note = match arg_layout {
                         super::lab_io::LabKernelArgLayout::Xrt3 => "layout=xrt3",
                         super::lab_io::LabKernelArgLayout::Count4Ctrl => "layout=count4",
+                    };
+                    diag_layout = match arg_layout {
+                        super::lab_io::LabKernelArgLayout::Xrt3 => "xrt3",
+                        super::lab_io::LabKernelArgLayout::Count4Ctrl => "count4",
                     };
                     if ofm_note.is_empty() {
                         ofm_note = format!(
@@ -4619,6 +4982,17 @@ pub fn timed_matmul_direct(
                     );
                     r.ran_on_npu = false;
                     attach_host_ref(&mut r, m, n, k, dtype);
+                    stamp(
+                        &mut r,
+                        tiles,
+                        &qos,
+                        diag_rela_count,
+                        diag_aiebu,
+                        diag_ert_error,
+                        diag_layout,
+                        diag_kernel_args_len,
+                        write_la,
+                    );
                     return r;
                 }
             }
@@ -4639,6 +5013,54 @@ pub fn timed_matmul_direct(
             r.detail = e.to_string();
             r.ran_on_npu = false;
             attach_host_ref(&mut r, m, n, k, dtype);
+            stamp(
+                &mut r,
+                tiles,
+                &qos,
+                diag_rela_count,
+                diag_aiebu,
+                diag_ert_error,
+                diag_layout,
+                diag_kernel_args_len,
+                write_la,
+            );
+            return r;
+        }
+
+        // aiebu ELF left zero-filled until rela patch — never EXEC without patch.
+        if diag_aiebu == Some(true) && !aiebu_rela_applied {
+            if let Some(ref ios) = io_set {
+                super::lab_io::destroy_io_bos(submission, ios);
+            }
+            if let Some(h) = inst_handle {
+                let _ = submission.destroy_buffer(0, h);
+            }
+            fill_s = Some(fill0.elapsed().as_secs_f64());
+            host_prep_s += fill_s.unwrap_or(0.0);
+            destroy_hwctx_and_owned_bos(submission, &ctx);
+            let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+            r.total_s = t0.elapsed().as_secs_f64();
+            r.host_prep_s = host_prep_s;
+            r.hwctx_s = hwctx_s;
+            r.fill_s = fill_s;
+            r.status = "aiebu_rela_required".to_string();
+            r.detail = format!(
+                "aiebu ELF requires rela patch before EXEC (set XDNA2_LAB_OFM=1 + I/O paddrs); \
+                 refuse zero Dev BO; {blob_note}"
+            );
+            r.ran_on_npu = false;
+            attach_host_ref(&mut r, m, n, k, dtype);
+            stamp(
+                &mut r,
+                tiles,
+                &qos,
+                diag_rela_count,
+                diag_aiebu,
+                diag_ert_error,
+                diag_layout,
+                diag_kernel_args_len,
+                write_la,
+            );
             return r;
         }
 
@@ -4667,6 +5089,17 @@ pub fn timed_matmul_direct(
                 r.status = "payload_build_failed".to_string();
                 r.detail = format!("build_ert_start_npu_cmd_bo failed: {e}");
                 attach_host_ref(&mut r, m, n, k, dtype);
+                stamp(
+                    &mut r,
+                    tiles,
+                    &qos,
+                    diag_rela_count,
+                    diag_aiebu,
+                    diag_ert_error,
+                    diag_layout,
+                    diag_kernel_args_len,
+                    write_la,
+                );
                 return r;
             }
         };
@@ -4721,6 +5154,9 @@ pub fn timed_matmul_direct(
                         || "ert_state=unread".to_string(),
                         |s| format!("ert_state={s}({})", ert_cmd_state_name(s)),
                     );
+                    if ert_state == Some(ErtCmdState::Error as u32) {
+                        diag_ert_error = true;
+                    }
                     // Hardware success for decide: WAIT ok **and** ERT Completed
                     // (when readable). Unknown state keeps prior WAIT-ok honesty
                     // for stubs that do not update the header.
@@ -4995,6 +5431,18 @@ pub fn timed_matmul_direct(
     result.ran_on_device_path = false;
     result.status = status;
     result.detail = detail;
+    // A7: always append tiles / QoS / rela / fw_status_hint (cheap; no secrets).
+    stamp(
+        &mut result,
+        tiles,
+        &qos,
+        diag_rela_count,
+        diag_aiebu,
+        diag_ert_error,
+        diag_layout,
+        diag_kernel_args_len,
+        write_la,
+    );
     if used_mladf_pack {
         // f32 ones×ones host_ref is invalid for a16w4; do not auto-run large ones GEMM.
         result.host_ref_ok = false;
@@ -6779,6 +7227,13 @@ mod tests {
         assert!(!r.ran_on_npu);
         assert!(!r.ran_on_device_path);
         assert!(r.hwctx_s.is_some(), "hwctx stage should be timed");
+        // A2/A7: batch diag always stamped (even hwctx_ok / gated path).
+        assert!(
+            r.detail.contains("qos_gops=100") && r.detail.contains("qos_fps=30"),
+            "detail missing default QoS: {}",
+            r.detail
+        );
+        assert!(r.detail.contains("tiles="), "detail={}", r.detail);
         // Branch on gate so a deliberate dangerous+ALLOW process still has honest asserts
         // (lib tests normally run with gate closed → hwctx_ok).
         if exec_cmd_is_enabled() {
@@ -7007,20 +7462,37 @@ mod tests {
     #[allow(unsafe_code)]
     fn timed_matmul_lab_ofm_mladf_never_pass_on_stub() {
         // LAB_OFM + mladf must never claim ran_on_npu without non-zero golden + real path.
+        // Serialize env mutations (parallel lib tests).
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev_ofm = std::env::var_os("XDNA2_LAB_OFM");
         let prev_pack = std::env::var_os("XDNA2_LAB_PACK");
         let prev_gold = std::env::var_os("XDNA2_LAB_OFM_GOLDEN");
         let prev_zero = std::env::var_os("XDNA2_LAB_ALLOW_ZERO_GOLDEN");
-        // SAFETY: test-only env for lab pack path; restore below.
+        let prev_la = std::env::var_os("XDNA2_LAB_LAST_APPLY_JSON");
+        let la_path = std::env::temp_dir().join(format!(
+            "dragon_npu_la_mladf_stub_{}.json",
+            std::process::id()
+        ));
+        // SAFETY: test-only env for lab pack path; restore below under lock.
         unsafe {
             std::env::set_var("XDNA2_LAB_OFM", "1");
             std::env::set_var("XDNA2_LAB_PACK", "mladf_a16w4");
             std::env::remove_var("XDNA2_LAB_OFM_GOLDEN");
             std::env::remove_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN");
+            std::env::set_var("XDNA2_LAB_LAST_APPLY_JSON", &la_path);
         }
         let stub = StubDirectSubmission::new(-1);
         let r = timed_matmul_direct(&stub, 1, 1, 1, "f32");
         assert!(!r.ran_on_npu, "status={} detail={}", r.status, r.detail);
+        assert!(
+            r.detail.contains("qos_gops="),
+            "early/gated path should stamp batch diag: {}",
+            r.detail
+        );
         if exec_cmd_is_enabled() {
             // Setup should have applied staged plan dims even if submit fails.
             assert_eq!(r.m, 1, "plan M");
@@ -7062,7 +7534,12 @@ mod tests {
                 Some(v) => std::env::set_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN", v),
                 None => std::env::remove_var("XDNA2_LAB_ALLOW_ZERO_GOLDEN"),
             }
+            match prev_la {
+                Some(v) => std::env::set_var("XDNA2_LAB_LAST_APPLY_JSON", v),
+                None => std::env::remove_var("XDNA2_LAB_LAST_APPLY_JSON"),
+            }
         }
+        let _ = std::fs::remove_file(&la_path);
     }
 
     #[test]

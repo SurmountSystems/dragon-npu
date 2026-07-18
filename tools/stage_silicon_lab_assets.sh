@@ -111,12 +111,29 @@ if wts_bytes_all_zero "$OUT/wts.bin" 174080; then
   WTS_ZERO=1
 fi
 
+# Prefer aiebu ELF for EXEC (raw .bin → APP_LOAD_PDI_FAIL on live silicon).
+if [[ ! -f "$OUT/lab_instr.elf" ]]; then
+  if [[ -x "$ROOT/tools/stage_aiebu_lab_instr.sh" ]] || [[ -f "$ROOT/tools/stage_aiebu_lab_instr.sh" ]]; then
+    echo "NOTE: staging aiebu ELF from lab_instr.bin (EXEC payload) …"
+    if ! bash "$ROOT/tools/stage_aiebu_lab_instr.sh" "$OUT"; then
+      echo "WARN: stage_aiebu_lab_instr failed — recipe below is offline-only (no EXEC blob)" >&2
+    fi
+  fi
+fi
+INSTR_BLOB=""
+if [[ -f "$OUT/lab_instr.elf" ]]; then
+  INSTR_BLOB="$OUT/lab_instr.elf"
+else
+  echo "NOTE: lab_instr.elf missing — PROVENANCE will not set XDNA2_INSTRUCTION_BLOB to raw .bin" >&2
+fi
+
 cat > "$OUT/PROVENANCE_SILICON.md" << MD
 # Silicon lab staging provenance
 
 - **date_utc:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
 - **key:** \`${KEY}\`
-- **lab_instr.bin:** 1688 B (classic v0.1 txn from DD dump — **vendor extract**, not hand-written)
+- **lab_instr.bin:** 1688 B classic v0.1 txn from DD dump — **offline dump only**, not EXEC payload
+- **lab_instr.elf:** aiebu ELF (\`.ctrltext\` + \`.rela.dyn\`) — **preferred EXEC blob** (stage via \`tools/stage_aiebu_lab_instr.sh\`)
 - **lab_ctrl.bin:** 29664 B (runtime control packet from DD dump — **vendor extract**, not hand-written microcode)
 - **lab_ctrl_meta.json:** sizes + \`control_packet_patch_locations\` (IFM/WTS/OFM paddrs; size=6 read_add_write residual for full XRT fidelity)
 - **ifm.bin:** 2304 B bf16 ones (host pack)
@@ -125,10 +142,11 @@ cat > "$OUT/PROVENANCE_SILICON.md" << MD
 - **NOT silicon Pass** until non-zero AMD WTS + non-zero OFM golden + L1/L3 EXEC + allclose
 - Ctrl BO attach / kernel-arg count 4 ≠ \`ran_on_npu\`
 
-## Env recipe (dry-run first)
+## Env recipe (dry-run first) — use ELF, not raw .bin
 
 \`\`\`bash
-export XDNA2_INSTRUCTION_BLOB=$OUT/lab_instr.bin
+# Prefer lab_instr.elf (raw lab_instr.bin → ert Error / APP_LOAD_PDI_FAIL)
+$(if [[ -n "$INSTR_BLOB" ]]; then echo "export XDNA2_INSTRUCTION_BLOB=$INSTR_BLOB"; else echo "# export XDNA2_INSTRUCTION_BLOB=\$OUT/lab_instr.elf  # MISSING — run stage_aiebu_lab_instr.sh"; fi)
 export XDNA2_LAB_OFM=1
 export XDNA2_LAB_PACK=mladf_a16w4
 export XDNA2_LAB_MLADF_KEY='${KEY}'
@@ -137,24 +155,32 @@ export XDNA2_LAB_WTS_PACKED=$OUT/wts.bin
 export XDNA2_LAB_CTRL_PACKED=$OUT/lab_ctrl.bin
 export XDNA2_LAB_REQUIRE_CTRL=1
 export XDNA2_LAB_REQUIRE_NONZERO_WTS=1
-export XDNA2_LAB_CTRL_AUTO_PATCH=1   # lab u64-LE paddr patch from meta (size=6 read_add_write residual)
+export XDNA2_LAB_CTRL_AUTO_PATCH=1   # lab size=6 read_add_write from meta
 # export XDNA2_LAB_OFM_GOLDEN=/path/to/nonzero_bf16_ofm.bin  # required for Pass
 bash tools/silicon_lab_preflight.sh --print-env
 # Pass-readiness fail-closed:
 # bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
-bash scripts/lab_exec_once.sh --silicon-mladf --blob "\$XDNA2_INSTRUCTION_BLOB"
-# apply only with operator risk accept + temporary exec_cmd_allow=1
-# bash scripts/lab_exec_once.sh --silicon-mladf --apply --i-accept-wedge-risk --blob "\$XDNA2_INSTRUCTION_BLOB"
+bash scripts/lab_exec_once.sh --silicon-mladf
+# Offline CONTRACT_OK ≠ C-ready. Unpatched CLASS A / mere diff rc=0 = body match only ≠ C-ready.
+# Optional capture for logs only (post-patch dump research closed offline).
+# Milestone C only if agent says ready (not unpatched A / registry alone; forces ELF):
+# bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 \`\`\`
 MD
 
 echo
 echo "Staged under $OUT"
-echo "  lab_instr.bin  $(wc -c <"$OUT/lab_instr.bin" | tr -d ' ') B"
+echo "  lab_instr.bin  $(wc -c <"$OUT/lab_instr.bin" | tr -d ' ') B  (offline dump only)"
+if [[ -f "$OUT/lab_instr.elf" ]]; then
+  echo "  lab_instr.elf  $(wc -c <"$OUT/lab_instr.elf" | tr -d ' ') B  (EXEC preferred)"
+else
+  echo "  lab_instr.elf  MISSING — run: bash tools/stage_aiebu_lab_instr.sh"
+fi
 echo "  lab_ctrl.bin   $(wc -c <"$OUT/lab_ctrl.bin" | tr -d ' ') B"
 echo "  wts.bin        $(wc -c <"$OUT/wts.bin" | tr -d ' ') B  zero=$WTS_ZERO"
 echo "See $OUT/PROVENANCE_SILICON.md"
-echo "Next: bash tools/silicon_lab_preflight.sh --print-env"
+echo "Next: bash tools/silicon_lab_operator.sh check"
+echo "      bash tools/hitl_b_gt_capture.sh   # offline GT (no sudo)"
 if [[ "$WTS_ZERO" -eq 1 ]]; then
   echo "NOTE: WTS is all zeros — obtain AMD-packed weights via --wts-from before Pass attempts."
 fi

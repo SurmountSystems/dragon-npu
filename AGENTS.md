@@ -1,3 +1,489 @@
+## Standing rules (silicon / HITL) — permanent
+
+1. **Default work is offline (Track A):** research, pure tests, contract/GT, dry-run. No sudo.
+2. **Do not ask the operator to re-apply** until offline parity gained **new** evidence
+   (contract/A6 green, or a residual that cannot be tested offline). No flag ping-pong.
+3. **HITL sessions (minimize):** Milestone B = `tools/hitl_b_gt_capture.sh`;
+   **capture-instr** = optional L3 sandwich for logs (see `RESIDUAL.md` SSoT —
+   not mandatory once unpatched body exists; post-patch dump research closed
+   offline). Milestone C = `tools/hitl_c_pass_apply.sh` **only when agent
+   says ready**. **Not** unlocked by: mere `CONTRACT_OK`; mere unpatched
+   `diff rc=0` / CLASS A; registry BO alone (Transaction/cache, not proven live
+   `run_` BO); vendor miss soft-skip; soft residual class / `CLASSIFY_SOFT_OK` /
+   `app_load_checklist` matrix; `run_offline_gates` / `OFFLINE_GATES_OK`.
+   Unpatched CLASS A = body match only → **≠ C-ready**, **≠ `ran_on_npu`**.
+   Force flags are research-only.
+4. **Never** set `XDNA2_ALLOW_EXEC_CMD=1` in default tests; never claim `ran_on_npu`
+   without OFM allclose on real ioctl + ERT Completed.
+5. Prefer **aiebu ELF** EXEC; refuse silent raw `lab_instr.bin`.
+
+Latest Turn (IMPL 3a14f38d review-fix Issues 1–6 — C4 readiness hardened):
+- **Exact completed:** status exact `ok_npu_verified` and/or `ert_state=4` only
+  (no contains/starts_with); negatives `not_completed` / `ok_npu_fake` /
+  `ok_npu_error` → `status_not_pass`. Require `ofm_raw_nonzero>0` +
+  `real_ioctl=true` (missing → clear reasons). Always `not_c_ready=1
+  invent_pass=0` on PassCandidate.
+- **Shell:** path refuse/missing explicit → exit **2**; TMPDIR=/ → `/tmp` only.
+- **Docs:** ban rows C4_SKIP/C4_PASS_CANDIDATE; hitl_c2 post-C2 lists c4.
+- Unlock still **`C_UNLOCK=b17b0119`**; baseline still C4_SKIP. **No** product
+  Pass / **no** invent `ran_on_npu`. Next = operator C2.
+
+Latest Turn (IMPL 3a14f38d — Phase C4 **readiness**; no Pass snapshot):
+- **C4 offline audit:** pure `SiliconPassEvidence` / `evaluate_silicon_pass_evidence`
+  → `NotPass{reason}` / `PassCandidate{notes}`. Hard rule: `json_ran_on_npu`
+  missing/false → never PassCandidate. Product Pass still = live decide.
+- **Tools:** `examples/c4_pass_check.rs` + `tools/c4_pass_check.sh` — baseline
+  → `C4_SKIP`; `--require-pass` → exit 2; soft in `run_offline_gates`.
+- **State:** C4 ready (skip); **no** Pass; **no** `ran_on_npu`.
+
+Latest Turn (IMPL f76067f8 — Phase C3 **readiness**; no new C2 evidence):
+- **C3 pipeline:** `tools/c3_post_c2_classify.sh` — soft classify reuse + new-
+  evidence detect vs baseline fixture; default `C3_SKIP no_new_c2_evidence`
+  exit 0 on locked APP_LOAD fixture; `--require-new` → exit 2; journal_hint=
+  only (never invent FW class); always `not_c_ready=1` / `not_ran_on_npu=1`.
+- Pure TDD: `LastApplyEvidenceFingerprint` / `last_apply_is_same_fixture_fingerprint`
+  / `last_apply_matches_locked_app_load_baseline` / `journal_line_has_app_load_hint`.
+- Docs: RESIDUAL/HITL_C/hitl_c2_once post steps → `c3_post_c2_classify.sh`.
+  C3 without new last_apply ≠ silicon progress. Not wired as slow soft gate
+  every `run_offline_gates` (bash -n only).
+- Unlock still **`C_UNLOCK=b17b0119`**; live C2 still operator; `last_apply`
+  still 2026-07-16. **State:** classic EXISTS; CLASS A; C unlocked once; C2
+  awaiting operator; **C3 ready (skip)**; **no** Pass; **no** `ran_on_npu`.
+  Next = operator C2 sandwich → C3 with evidence.
+
+Latest Turn (IMPL de4d9fa4 — Phase C2 **agent prep**; live C2 **sudo-blocked**):
+- Operator helper: `tools/hitl_c2_once.sh` — soft `C_UNLOCK=` NOTE, optional
+  offline gates, preflight `--require-pass-assets`, prints **bash+fish** L3
+  sandwich + post-C2 classify/gates; **never** opens L3; `--apply-if-l3-open`
+  fail-closed exit 1 when `exec_cmd_allow=N`.
+- Unlock stamp still **`C_UNLOCK=b17b0119`** (one-shot; ≠ Pass). Live apply
+  blocked: host L3=N, sudo password required; `last_apply` still 2026-07-16.
+- Post-C2 path: `classify_last_apply_residual.sh` + `run_offline_gates.sh` →
+  agent C3/C4. Recipe/RESIDUAL/HITL_BC point at `hitl_c2_once.sh`.
+- Fail-closed demo: `hitl_c --assume-l3-already-open` → exit 1 when L3 closed.
+- **State:** classic EXISTS; CLASS A; **C unlocked once**; **C2 awaiting
+  operator**; **no** Pass; **no** `ran_on_npu`. Next = operator C2 sandwich.
+
+Latest Turn (IMPL b17b0119 review-fix Issues 1–6):
+- hitl_c: missing `silicon_contract_check.sh` **fail closed** (unless force-apply);
+  `--help` comment-only (no code spill); robust `C_UNLOCK=` parse (`grep -m1 -oE`).
+- Docs: further C needs **new agent unlock** (evidence justifies, never auto-unlocks);
+  HITL_BC / RESIDUAL mid / SILICON_PATH_LAB aligned one-shot `b17b0119`; L3 vs
+  userspace ALLOW wording; optional runner soft NOTE on stamp.
+- **State:** classic EXISTS; CLASS A; **C unlocked once**; **no** Pass; **no**
+  `ran_on_npu`. Next = operator C2.
+
+Latest Turn (IMPL b17b0119 — Phase C1 **agent unlock one C**; C2 for operator):
+- **Explicit unlock:** agent says ready for **ONE** HITL C only under stamp
+  `C_UNLOCK=b17b0119`. Recipe + RESIDUAL SSoT + HITL_BC updated.
+- Unlock = permission for **one** L3 sandwich + `hitl_c_pass_apply.sh`.
+  Unlock **≠** Pass, **≠** permanent open season, **≠** `ran_on_npu`.
+- Operator must open L3, run recipe, **restore L3=0**, share last_apply.
+- Soft NOTE in `hitl_c` when RESIDUAL greps `C_UNLOCK=` (not a hard gate).
+- Offline gates + preflight green; agent does **not** live apply / L3 / ALLOW.
+- **State:** classic EXISTS; CLASS A; **C unlocked once** (`b17b0119`);
+  **no** silicon Pass; **no** `ran_on_npu`. Next = operator C2.
+
+Latest Turn (operator C2 live 2026-07-18 — **no Pass**):
+- Operator ran `hitl_c2_once` + L3 sandwich + `hitl_c --assume-l3-already-open`.
+- Lab **rc=4** (`!ran_on_npu`); **L3 restored** `exec_cmd_allow=N`.
+- Userspace OK: real_ioctl, aiebu+rela×12, xrt3, content 1688, tiles=32, IO paddrs.
+- Residual: `ert_state=5(Error)` OFM zeros; journal **`0x3000003` APP_LOAD_PDI_FAIL**
+  + **`0x4000003` INVALID_PARAM**. Class `app_load_pdi_fail_after_aiebu`.
+- C3_SKIP (same body FP as locked baseline); C4_SKIP (`ran_on_npu=false`).
+- **C_UNLOCK=b17b0119 consumed.** Further C needs **new agent unlock** + offline delta.
+- **No** `ran_on_npu`. Next: APP_LOAD offline research (not flag spam).
+
+Latest Turn (IMPL 49de1327 review-fix Issues 9–12):
+- Runner cargo filter: pipefail-safe parse (`grep || true`); fail_hard with
+  cargo_rc + tail on missing summary / compile-fail (no early abort).
+- HOME-safe PATH; header bash -n list complete; RESIDUAL mid-file ban = SSoT.
+- CI offline-gates runner-only (no dual pure_direct step). Gates: hard_fail=0.
+- **State:** classic EXISTS; CLASS A; **no C**; **no** `ran_on_npu`.
+
+Latest Turn (IMPL 49de1327 review-fix Issues 1–8):
+- Runner: soft_ok only on soft rc=0; soft_warn separate; hard cargo filters
+  refuse 0 matched tests; `--require-assets` hard-fails soft skip/fail.
+- hitl_c always emits unlock-ban NOTE (not only vendor MISSING); classic EXISTS
+  SSoT header. Standing rule 3 + HITL_BC + recipe + RESIDUAL ban
+  `OFFLINE_GATES_OK`. PLAN Latest unlock-only (no env re-apply).
+- CI offline-gates assert ALLOW unset. Recipe clippy includes classify example.
+- Gates: bash -n; run_offline_gates hard_fail=0; fmt; clippy; silicon_contract.
+- **State:** classic EXISTS; CLASS A; **no C**; **no** `ran_on_npu`.
+
+Latest Turn (IMPL 49de1327 — offline maintain only; C **not** unlocked):
+- Full self-runnable offline suite **green** (no code regressions). APP_LOAD
+  signal matrix remains **closed** (no new last_apply/journal evidence).
+- Maintain: `tools/run_offline_gates.sh` one-shot (hard unit/style; soft
+  classify + asset scripts; `OFFLINE_GATES_OK` always `not_c_ready=1`).
+- hitl_c header/WARN: residual_class / CLASSIFY_SOFT_OK / checklist /
+  run_offline_gates / CONTRACT_OK **≠** C unlock.
+- CI: `offline-gates` job (pure_direct + silicon_contract + runner soft-assets;
+  no ALLOW/EXEC); lab-script bash -n includes runner + classify + parity.
+- Gates: fmt 0; clippy -D lib+classify; pure_direct 3; silicon_contract 44;
+  classic_1688; offline pass=4; diff CLASS A; CONTRACT_OK; CLASSIFY_SOFT_OK;
+  run_offline_gates 0; bash -n hitl_c.
+- RESIDUAL stamp 49de1327; highest-value = agent unlock one C via recipe **or**
+  maintain offline (`run_offline_gates`); no fixture re-research without evidence.
+- **State:** classic EXISTS; CLASS A; recipe prepared; **no C**; **no**
+  `ran_on_npu`. No invent vendor / L3 / ALLOW / env C.
+
+Latest Turn (IMPL aae86bb9 review-fix Issues 1–12):
+- **Sec:** `last_apply_path_is_allowed` canonicalize(parent) before root check;
+  refuse absolute missing parent; load re-checks canonicalize(file); mid-path
+  symlink unit test; classify `O_NOFOLLOW` open.
+- Checklist: no double prefix; `bo_gt_content` rename; gate userspace on
+  aiebu=true; map_offset_not_root only when Dev; `class_implies_*` not invent
+  `fw_residual=APP_LOAD_PDI_FAIL` without code; partial size print; inst_blob
+  region prefer; exact-token honesty helper.
+- Docs: HITL recipe stamp aae86bb9 + checklist ≠ unlock; RESIDUAL signal locks;
+  standing rule 3 checklist ban.
+- Gates: silicon_contract **44**; pure_direct 3; clippy classify; CLASSIFY_SOFT.
+- **State:** classic EXISTS; CLASS A; **no C**; **no** `ran_on_npu`.
+
+Latest Turn (IMPL aae86bb9 — APP_LOAD offline signal locks; C **not** unlocked):
+- Pure signals from last_apply detail: `instr_map_offset` (u64::MAX =
+  no-mmap expected on Dev), `instr_bo_type`/`ty=Dev`, `instr_xdna_addr`,
+  content/bo/start_npu sizes, `SubmitWaitNotOk`, `rela_mode`.
+- Helpers: `instr_map_offset_is_no_mmap`, `last_apply_start_npu_matches_content`,
+  `last_apply_bo_gt_content`, `format_app_load_offline_checklist` (userspace
+  OK vs FW residual matrix; always `not_c_ready=1` / `not_ran_on_npu=1`).
+- Soft classify example prints checklist + new tokens; fixture unit-locks
+  map_offset_not_app_load_root + start_npu_matches_content + ofm_all_zero.
+- Finding: residual remains **FW APP_LOAD after green userspace** — not
+  map_offset, not size triad, not raw bin. Env HITL still CLOSED.
+- Gates: fmt; clippy -D lib+classify; silicon_contract (then 41); pure_direct 3;
+  offline pass=4; CLASS A; CONTRACT_OK; CLASSIFY_SOFT_OK + checklist.
+- RESIDUAL stamp aae86bb9; highest-value = agent unlock one C via recipe **or**
+  maintain offline (checklist ≠ C-ready).
+- **State:** classic EXISTS; CLASS A; recipe prepared; **no C**; **no**
+  `ran_on_npu`. No invent vendor / L3 / ALLOW / env C.
+
+Latest Turn (IMPL 2aaf5a92 review-fix — load confinement + soft classify polish):
+- Load path reuses write roots: `last_apply_load_path_is_allowed` (temp_dir ∪
+  testdata/xdna2_cmd, `.json`, no `..`, no symlink) in example + shell.
+- Discovery uses `temp_dir()` / `${TMPDIR:-/tmp}` pid-suffixed
+  `dragon_npu_last_apply_*.json` only — **no** fixed plant basename.
+- `classify_last_apply_residual_ex` feeds schema-2 top-level `rela_count`;
+  read cap `MAX_MLADF_LAB_FILE_BYTES`; shell multi-arg refuse; fish Usage
+  (`env` / `set -gx`); tokens `CLASSIFY_SOFT_OK`.
+- HITL_C recipe unlock table: residual class / CLASSIFY_SOFT_OK ≠ unlock.
+- Gates: fmt; clippy -D lib+classify example; silicon_contract **39**;
+  pure_direct 3; offline pass=4; CLASS A; CONTRACT_OK + soft classify.
+- **State:** classic EXISTS; CLASS A; soft classify confined; recipe prepared;
+  **no C**; **no** `ran_on_npu`. No invent vendor / L3 / ALLOW / env C.
+
+Latest Turn (IMPL 2aaf5a92 — offline residual soft classify; C **not** unlocked):
+- Soft feedback loop: `examples/classify_last_apply.rs` +
+  `tools/classify_last_apply_residual.sh` (exit 0 soft; `--require` hard).
+- Fixture `last_apply.json` → `app_load_pdi_fail_after_aiebu` +
+  `not_c_ready=1` / `not_ran_on_npu=1` / `userspace_elf_rela_ok=1`.
+- Wired soft into `silicon_contract_check.sh` when fixture/env path present
+  (never hard-fail; never C unlock).
+- RESIDUAL stamp 2aaf5a92; highest-value = agent unlock one C via
+  `docs/HITL_C_APP_LOAD_RECIPE.md` **or** offline research only with new
+  evidence. Soft residual class **≠** C-ready.
+- **State:** classic EXISTS; CLASS A unpatched; pure green; soft classify;
+  recipe prepared; **no C**; **no** `ran_on_npu`. No invent vendor / L3 /
+  ALLOW / env C.
+
+Latest Turn (IMPL 5216cef3 review-fix Issues 1–6):
+- Parse: first `ert_state=` **token only** (Completed then later `(Error)` ≠ ert_error).
+- AppLoad class requires aiebu **and** (rela_count>0 or aiebu_rela_patched)
+  **and** ert_error; aiebu+error without rela → `ErtErrorUnknownBlob`.
+- Note: `userspace_elf_rela_ok` / FW `code=` only from signals; hex const
+  fixed `0x3_000_003` (= journal `0x3000003`).
+- TDD: completed-then-Error; empty detail; aiebu-no-rela; ran_on_npu exact;
+  last_apply.json fixture when present. silicon_contract **37**.
+- RESIDUAL: explicit agent unlock **sufficient** for one C; standing rule 2 =
+  no env-flag spam without new offline evidence.
+- **State:** classic EXISTS; CLASS A; **no C**; **no** `ran_on_npu`.
+
+Latest Turn (IMPL 5216cef3 — C **not** unlocked; offline only):
+- Offline gates **green:** fmt 0; clippy -D amd-xdna2; pure_direct 3;
+  silicon_contract (now 37 after review-fix); diff CLASS A rc=0; offline
+  pass=4; CONTRACT_OK; bash -n hitl_c.
+- last_apply research: `testdata/xdna2_cmd/last_apply.json` = ELF+rela +
+  layout=xrt3 + ert_state=Error + OFM0 + `ran_on_npu=false` → locked
+  **APP_LOAD_PDI_FAIL** (env trials CLOSED).
+- TDD landed (pure unit only): `SiliconResidualClass` +
+  `parse_last_apply_detail_signals` / `classify_last_apply_residual` /
+  `format_silicon_residual_class_note` — never invent Pass / C-ready.
+- RESIDUAL stamp 5216cef3 + locked residual matrix; highest-value =
+  agent/operator unlock one C via `docs/HITL_C_APP_LOAD_RECIPE.md` **or**
+  maintain offline / research only if new evidence.
+- **State:** classic EXISTS; CLASS A unpatched; recipe prepared; **no C**;
+  **no** `ran_on_npu`. No invent vendor / L3 / ALLOW / env C.
+
+Latest Turn (IMPL ff6e6e7b review-fix Issues 1–6):
+- Recipe: force **still runs** A9 and continues on red; skip **omits** A9;
+  full exit map 0–5 (5 can mask lab 4); live hitl_c uses
+  `contract_check --require-pass-assets`; fish/bash PATH dual; ban live
+  `RELA_MODE=add` until agent unlocks experiment.
+- HITL_BC / SILICON_PATH_LAB: recipe link; capture-golden demoted optional
+  (not P1); offline green **≠** agent unlock for C.
+- **State:** recipe prepared; pure green; **no C**; **no** `ran_on_npu`.
+
+Latest Turn (IMPL ff6e6e7b — offline prep only; C **not** unlocked):
+- Pure-direct gap scan: **no maintenance gaps** (pure_direct 3, silicon_contract
+  30, classic_1688, offline pass=4, diff CLASS A, CONTRACT_OK, preflight
+  require-pass green). No new TDD.
+- Canonical HITL C APP_LOAD recipe: `docs/HITL_C_APP_LOAD_RECIPE.md` (+ link
+  from HITL_BC). Offline gates + L3 sandwich + expected APP_LOAD / !ran_on_npu
+  honesty + true Pass criteria; **NOT unlocked**.
+- RESIDUAL stamp ff6e6e7b; highest-value = **agent explicitly says ready** →
+  one C with recipe (offline green **≠** unlock), else maintain offline /
+  optional APP_LOAD root-cause research offline.
+- **State:** classic EXISTS; CLASS A unpatched; pure green; recipe prepared;
+  **no C**; **no** `ran_on_npu`. No invent vendor / L3 / ALLOW / env C.
+
+Latest Turn (IMPL 4ef82a68 review-fix doc polish Issues 1–4):
+- Strip soft dual “prefer registry + parity green” C pre-req (RESIDUAL footer,
+  SILICON_PATH_LAB, operator status): **C only if agent says ready**; INSTR_BO
+  true post-patch public path **closed**; registry = cache not live `run_` BO;
+  unpatched A ≠ unlock.
+- Single highest-value table: (1) silicon APP_LOAD HITL when agent ready;
+  (2) maintain pure-direct offline; (3) optional capture logs. **4ef82a68 TDD
+  under Done/landed** (not re-listed as open offline research).
+- `format_app_load_residual_diag`: unit/API research helper, **not** live-wired.
+- `LabInstrSizeMode::Content` docs: clamp to `bo_alloc` when both set.
+- **State:** classic EXISTS; CLASS A unpatched; pure patch green; **no C**;
+  **no** `ran_on_npu`. No invent vendor / L3 / ALLOW.
+
+Latest Turn (IMPL 4ef82a68 — offline pure-direct / APP_LOAD residual):
+- **Patch TDD (landed):** multi-sym overwrite/add; negative addend wrap; staged
+  ELF pure-direct golden; CLASS A fixture body parity. Pure-direct only.
+- **START_NPU:** content vs bo (content clamps to bo_alloc); APP_LOAD diag
+  helper unit-only (`0x3000003`, not_c_ready, not_ran_on_npu).
+- **RESIDUAL:** C only agent ready; INSTR_BO closed architecture residual.
+- **State:** classic EXISTS; CLASS A; no C; no `ran_on_npu`.
+
+Latest Turn (IMPL 0eea644f review-fix Issues 1–8):
+- RESIDUAL dual-narrative mid-file → single SSoT: post-patch research **closed**;
+  residual = pure-direct / APP_LOAD; C **only agent ready** (never registry/parity).
+- `registry_get_instr_bo` wording: Transaction/cache image — **not** proven live
+  `run_` BO. Capture always logs INSTR_BO capacity-fit research note.
+- HITL_BC / SILICON_PATH_LAB / XRT_CONTRACT / PROVENANCE / operator: soften
+  INSTR_BO P0; optional capture = logs only.
+- txn test: multi[..1688] not classic profile. Gates: profile tests + diff A + offline 4.
+- **State:** classic EXISTS; CLASS A unpatched; no C; no `ran_on_npu`.
+
+Latest Turn (IMPL 0eea644f — true post-patch dump research offline):
+- **INSTR_BO_LIMIT:** DD `instruction_cache::put` —
+  `align_to_next(txn_len+8, 0x8000) > capacity_` (default capacity **0x3c00000**).
+- **get_instr_bo** = Transaction→cache only; **no** public live instr BO on
+  `mladfmatmulbias` after execute (`run_` private).
+- **Multi 32208:** classic-format wrong body (500 ops); not ELF; classic1688
+  **not** embedded — no peel / no aiebu.
+- **True post-patch path via public DD: not available** offline; residual is
+  XRT/DD architecture + separate **APP_LOAD_PDI_FAIL** silicon residual.
+- Capture logs INSTR_BO constants + multi hdr/embed; pure `txn.rs` profile tests.
+- **State:** vendor classic EXISTS; unpatched CLASS A; pure body parity green;
+  **no** true post-patch; **no C**; **no** `ran_on_npu`. Unpatched A ≠ C-ready.
+
+Latest Turn (docs honesty — C-ready ≠ unpatched diff rc=0; RESIDUAL dual-narrative):
+- Standing rule 3: C only after agent says ready **and** preferably
+  `registry_get_instr_bo`; unpatched CLASS A does **not** unlock C.
+- RESIDUAL mid-file “mandatory capture HITL / Critical-path P0 / MISSING / rc=3”
+  reworded → historical or optional; live highest-value = **INSTR_BO_LIMIT**.
+- **State now:** vendor classic body **EXISTS**; unpatched CLASS **A** (body
+  match); residual **INSTR_BO_LIMIT** true post-patch research; **no C**.
+- No invent vendor / L3 / ALLOW / ran_on_npu.
+
+Latest Turn (review-fix CLASS C work — sibling recover + RESIDUAL SSoT):
+- **Bugfix:** sibling recover only if unpatched mode OR multi-txn wrong body
+  and capture_mode ≠ registry_get_instr_bo; never replace registry post_patch.
+- Capture registry: skip oversized multi-class BO as post_patch (diag only).
+- RESIDUAL single SSoT: vendor classic EXISTS; CLASS A unpatched; highest-value
+  = INSTR_BO_LIMIT research (not mandatory re-capture); optional recapture only;
+  historical MISSING/pass=3 demoted; APP_LOAD locked kept.
+- Gates: diff A rc=0; offline pass=4; bash -n OK. No invent/L3/ALLOW/ran_on_npu.
+
+Latest Turn (HITL false CLASS_HINT C — multi-txn 32k vs classic 1688):
+- **HITL:** vendor EXISTS; post_patch was 32208 multi-txn wrong body; map sibling
+  1688 == pure raw exactly; capture_mode=txn_bin_fallback_unpatched; registry
+  INSTR_BO_LIMIT; false CLASS_HINT C from prefix of multi-txn.
+- **Capture fix:** prefer classic 1688 Transaction-map as txn_bin + unpatched
+  post_patch; oversized get_transaction_bin → instr_vendor_get_transaction_bin.bin
+  diagnostic only (never primary when classic exists).
+- **Diff fix:** unpatched mode → pure instr_raw_txn (no paddr re-patch); recover
+  sibling 1688 when post_patch multi-txn; CLASS A body match / D unpatched;
+  C only true same-class non-rela; offline case D (oversized+sibling → A/D not C).
+- **Gates:** diff rc=0 CLASS_HINT A; offline pass=4; contract CONTRACT_OK.
+- Unpatched ≠ C-ready; CONTRACT_OK ≠ C-ready; ban env C; no invent/L3/ALLOW/ran_on_npu.
+- Residual: optional re-capture classic post_patch; INSTR_BO_LIMIT true post-patch
+  research; no C apply as ready.
+
+Latest Turn (IMPL 3378dd7b review-fix Issues 1–10):
+- Skip `*_ctrl`/`*_ctrl_meta`/`*_param` for post_patch + primary txn; siblings
+  only under separate names. txn_ok only ≥1688; always Transaction map dump.
+- Shell EXIT trap → l3_open_exit_adjust all paths; capture_mode value WARN only;
+  python nonzero check. Operator capture-instr: L3 open → 5 for **any** rc.
+- Loud CAPTURE_MODE_UNPATCHED; RESIDUAL unpatched ≠ C-ready. bash -n + COMPILE_OK.
+- Still highest-value = operator re-run capture-instr. No invent/L3/ALLOW/ran_on_npu.
+
+Latest Turn (IMPL 3378dd7b — fix capture-instr after HITL fail):
+- **HITL evidence:** OFM non-zero (NPU ran); bo_addrs OK; but CAPTURE_FAILED —
+  no `instr_vendor_post_patch.bin`. L3 left open on fail (restore!).
+- **Root cause:** `get_transaction_bin` called with `inputs={ti}` only;
+  DD `fit_MKN` needs IFM+WTS (`vector::_M_range_check size=1`); registry keys
+  all miss; no Transaction map unpatched dump.
+- **Fix:** `capture_mladf_instr_vendor.cpp` — inputs_txn={ti,tw}; always
+  `Transaction::get_txn_bvec` staged+GM siblings; try get_instr_bo even if
+  instr_in_registry false; honest modes registry / txn_bin_fallback /
+  txn_container_unpatched; exit 0 only ≥1688 non-zero. Shell: L3 open → exit 5
+  even on capture fail; include txn_container.hpp; bash -n OK; **COMPILE_OK**.
+- **Offline smoke:** dump_dd_txn staged key **1688 B** (map path works).
+- **Docs:** RESIDUAL HITL fail + fix; highest-value = **operator re-run
+  capture-instr once** (close L3 if still open, then canonical sandwich).
+- **Ban env C applies**; **no** invent vendor · **no** L3 from agent ·
+  **no** ALLOW=1 · **no** C-ready · still **no** `ran_on_npu`.
+
+Latest Turn (IMPL dd160a9f — VENDOR BIN MISSING reconfirm only):
+- **Confirmed again:** `gt_capture/instr_vendor_post_patch.bin` **MISSING**;
+  `diff_vendor_instr_parity.sh` → **rc=3** PARITY_MISS (expected).
+- **Gates reconfirmed (all offline):** fmt 0 (light rustfmt dump_mladf_gt_offline);
+  clippy -D amd-xdna2 0; silicon_contract 29 ok; `--self` 0; offline parity
+  pass=3; contract_check CONTRACT_OK (soft WARN skip vendor); vendor_diff_rc=3.
+- **Docs:** RESIDUAL stamp dd160a9f + gate table; stop at HITL P0;
+  canonical capture one-liner only; CONTRACT_OK≠C-ready; ban env C applies;
+  vendor capture = critical-path HITL P0 (not offline non-blocker);
+  APP_LOAD_PDI_FAIL locked residual kept.
+- **No** pure-direct patch · **no** invent vendor · **no** L3 · **no** ALLOW=1 ·
+  **no** C-ready · still **no** `ran_on_npu`.
+
+Latest Turn (IMPL 81e050de review-fix Issues 1–11):
+- Docs/scripts align capture-instr → parity → C only if green; CONTRACT_OK≠C-ready.
+- dump_mladf_gt_offline Next/footer + regenerated gt_capture PROVENANCE.
+- SILICON_PATH_LAB Pass path; stage/PROVENANCE_SILICON C language.
+- hitl_b header matches footer; silicon_lab_operator C caveat; hitl_c WARN 0/2/3.
+- RESIDUAL: Critical-path HITL P0 top-level (not under non-critical); Strategy
+  Capture P0 → canonical one-liner.
+- HITL_BC: B + capture-instr + C budget; full XDNA2_LAB_INSTR_SIZE_MODE once.
+- AGENTS deep D3e xrt3 “Next trial” SUPERSEDED. bash -n touched scripts.
+- Still no invent vendor / L3 / ALLOW=1 / ran_on_npu.
+
+Latest Turn (IMPL 81e050de — VENDOR BIN MISSING reconfirm only):
+- **Confirmed again:** `gt_capture/instr_vendor_post_patch.bin` **MISSING**;
+  `diff_vendor_instr_parity.sh` → **rc=3** PARITY_MISS (expected).
+- **Gates reconfirmed (all offline):** fmt 0; clippy -D amd-xdna2 0;
+  silicon_contract 29 ok; `--self` 0; offline parity pass=3; contract_check
+  CONTRACT_OK (soft WARN skip vendor); vendor_diff_rc=3.
+- **Docs:** RESIDUAL stamp 81e050de + gate table; stop at HITL P0;
+  canonical capture one-liner only; CONTRACT_OK≠C-ready; ban env C applies;
+  vendor capture = critical-path HITL P0 (not offline non-blocker);
+  APP_LOAD_PDI_FAIL locked residual kept.
+- **No** pure-direct patch · **no** invent vendor · **no** L3 · **no** ALLOW=1 ·
+  **no** C-ready · still **no** `ran_on_npu`.
+
+Latest Turn (IMPL 085f25fb review-fix Issues 1–9):
+- Standing rule 3: capture-instr HITL + C only after **vendor parity green**
+  (not mere CONTRACT_OK). Older open bullets → RESIDUAL L3 sandwich.
+- RESIDUAL: vendor capture = critical-path HITL P0 (not offline non-blocker);
+  env recipe bash/fish dual notes.
+- hitl_b footer → capture-instr + parity first; silicon_contract Later Pass
+  parity caveat; hitl_c soft WARN if vendor bin missing (no hard-block).
+- ofm golden: L3 still open → exit 5 + `XDNA2_CAPTURE_ALLOW_L3_OPEN=1`;
+  instr_vendor header documents exit 5 + allow env.
+- bash -n all touched scripts. Still no invent vendor / L3 / ALLOW=1 / ran_on_npu.
+
+Latest Turn (IMPL 085f25fb — VENDOR BIN MISSING reconfirm only):
+- **Confirmed again:** `gt_capture/instr_vendor_post_patch.bin` **MISSING**;
+  `diff_vendor_instr_parity.sh` → **rc=3** PARITY_MISS (expected).
+- **Gates reconfirmed (all offline):** fmt 0; clippy -D amd-xdna2 0;
+  silicon_contract 29 ok; `--self` 0; offline parity pass=3; contract_check
+  CONTRACT_OK (soft WARN skip vendor); vendor_diff_rc=3.
+- **Docs:** RESIDUAL stamp 085f25fb + gate table; stop at HITL P0;
+  canonical capture one-liner only; CONTRACT_OK≠C-ready; ban env C applies;
+  APP_LOAD_PDI_FAIL locked residual kept.
+- **No** pure-direct patch · **no** invent vendor · **no** L3 · **no** ALLOW=1 ·
+  **no** C-ready · still **no** `ran_on_npu`.
+
+Latest Turn (PRIORITY: vendor bin MISSING — reconfirm gates only):
+- **Confirmed:** `gt_capture/instr_vendor_post_patch.bin` **MISSING**; full
+  `diff_vendor_instr_parity.sh` → **rc=3** PARITY_MISS (expected).
+- **No pure-direct patch fix** (blocked on vendor). **No C apply as ready.**
+- **Gates reconfirmed:** fmt; clippy -D amd-xdna2; silicon_contract 29; `--self` 0;
+  `test_diff_vendor_parity_offline` pass=3; `silicon_contract_check` CONTRACT_OK.
+- **RESIDUAL:** stop at HITL P0; highest-value = `capture-instr` one-liner only;
+  ban env C applies until parity; self-runnable validation listed.
+- Still **no** `ran_on_npu`. Do not invent vendor bytes / open L3 / ALLOW=1.
+
+Latest Turn (effort-5 implement: review-fix + re-review vendor capture):
+- **Fail-closed:** zero + `u64::MAX` paddrs refused (Rust `is_valid_device_paddr` + shell
+  extract/diff `ok_v`); ambient `XDNA2_GT_PADDRS_JSON` unset on synthetic dump;
+  sha256 via fork/`execlp` (no shell `popen`); L3 open after capture → exit **5**;
+  extract default OUT `vendor_paddrs_from_last_apply.json` + refuse clobber vendor;
+  present vendor + diff rc3 hard in contract; CLASS_HINT D strong vs txn sibling.
+- **Tests:** 29 silicon_contract (zero/MAX/negatives); `test_diff_vendor_parity_offline`
+  A/B/C → 0/2/3; contract soft matrix.
+- **Docs:** RESIDUAL highest-value = capture HITL only; extract does not auto re-patch.
+- Gates: fmt; clippy -D; silicon_contract 29; bash -n; --self; offline pass=3; CONTRACT_OK.
+- Re-review: prior bugs fixed; no must-fix open. Still **no** `ran_on_npu`.
+- **Still open (HITL P0):** RESIDUAL L3 sandwich once (open → `capture-instr` → close
+  → diff) → agent CLASS_HINT offline fix → one C apply only if **vendor parity green**
+  (not mere CONTRACT_OK).
+
+Latest Turn (offline CLASS_HINT / diff path tests):
+- New `tools/test_diff_vendor_parity_offline.sh`: A --self→0, B synthetic flip→2+CLASS_HINT,
+  C missing vendor→3; env -u XDNA2_GT_PADDRS_JSON; soft extract-paddrs from last_apply.
+- `silicon_contract_check.sh` soft-runs matrix (hard if XDNA2_REQUIRE_OFFLINE_PARITY_TESTS=1).
+- Gates: bash -n; --self; offline test pass=3. Still no `ran_on_npu`.
+
+Latest Turn (vendor post-patch capture → offline diff readiness):
+- Hardened `capture_mladf_instr_vendor` (always txn bin unpatched label, ctrl pkts via
+  OpInterface, more registry keys + print all, vendor_paddrs schema v1 + capture_mode,
+  OFM non-zero refuse, L3 restore messaging).
+- Pure: `parse_vendor_paddrs_json` / `parse_io_paddrs_from_detail` /
+  `vendor_paddrs_json_from_io` + unit tests; dump_mladf_gt_offline honors
+  XDNA2_GT_PADDRS_JSON for instr+ctrl+kernel_args.
+- `diff_vendor_instr_parity.sh`: 0/2/3, --self, CLASS_HINT A–E, first-1688 page-pad;
+  soft in silicon_contract_check (hard if XDNA2_REQUIRE_VENDOR_PARITY=1).
+- Operator: `capture-instr`, `extract-paddrs`; HITL_BC/RESIDUAL ban env C applies.
+- Gates: fmt; clippy -D amd-xdna2; **450+1** lib; bash -n; --self; contract green.
+- **Still open:** operator RESIDUAL L3 sandwich (`capture-instr`) HITL → agent
+  offline CLASS fix → C only if parity green. Still no `ran_on_npu`.
+
+Latest Turn (offline residual APP_LOAD_PDI_FAIL sprint):
+- Live locked: ELF+rela×12 + bo_size=4096 still `ert_state=Error` / `0x3000003`.
+- **P0** `XDNA2_LAB_INSTR_SIZE_MODE=content|bo` (default **content**); pure resolve +
+  detail `inst_size_mode=` / content / bo / start_npu sizes; BO still zero-pad page.
+- **P1** ~~xrt3 documented as next HITL one-shot~~ **SUPERSEDED:** env HITL closed (xrt3 trial failed same APP_LOAD); next HITL = capture-instr only; both layouts still green offline contract.
+- **P2** `XDNA2_LAB_RELA_MODE=overwrite|add` (RMW placeholder trial); unit tests staged ELF.
+- **P3** `parse_elf32_dynsym` + report (names all `"6"` opaque); GT + contract.
+- **P4** post-patch ClassicTxnV01 walk refuse offline (GT+contract) **and** live after rela write.
+- Review closeout: fail-closed residual env; dynsym empty ok; content clamp to BO;
+  synthetic add/validate tests; hitl_c L3 honesty + paste checklist; contract_check filters.
+- **P5** RESIDUAL rewrite; **P6** hitl_c `--skip-offline-contract` / env skip.
+- Gates: fmt; clippy -D amd-xdna2; lib tests. Still no `ran_on_npu`.
+
+Latest Turn (Track A review fix-round — 69 issues):
+- QoS clamp env0; stamp batch/last_apply all timed early exits; last_apply confined 0600.
+- Scripts: hitl_b restore exit 5; no pipefail+head; contract_check hard cargo; hitl_c
+  allowlist + hard offline gate + L3 open→5; preflight require ELF; cargo-args force `--`.
+- A6 `diff_gt_parity.sh`; prop_count real; synthetic ELF patch refuse tests.
+- Gates: **433+1** lib; contract_check green. Still no `ran_on_npu`.
+
+Latest Turn (Track A offline silicon strategy — maximize autonomy):
+- **A0:** `docs/XDNA2_XRT_CONTRACT_MLADF.md` (shim prop_count=0, aiebu ELF+rela, QoS,
+  tiles, Dev instr / Shmem I/O); HITL_BC / SILICON_PATH_LAB / RESIDUAL → B/C only.
+- **A1:** stage recipe prefers `.elf` (no silent `lab_instr.bin` EXEC export); apply
+  refuse-raw already wired.
+- **A2:** timed_matmul **always** sets non-zero QoS gops/fps (default 100/30; env
+  override; was only mladf+LAB_OFM — live "Invalid QoS gops 0" residual).
+- **A3/A7:** `silicon_contract.rs` + batch detail `tiles/qos_gops/fps/rela_count/
+  aiebu_elf/fw_status_hint`; optional `last_apply.json` (gitignored).
+- **A4:** `silicon_contract_check.sh` + operator `check` (cargo silicon_contract + GT).
+- **Gates:** fmt; clippy -D amd-xdna2; **425+1** lib; bash -n; contract_check green.
+- **Still open:** HITL C after ELF+rela still may `ert_state=Error` (FW reject) —
+  no `ran_on_npu`; residual is layout/patch/symbol vs journal, not raw-bin.
+
+Latest Turn (HITL residual env matrix CLOSED):
+- Trial1 content+count4 → APP_LOAD_PDI_FAIL 0x3000003.
+- Trial2 content+xrt3 (live layout=xrt3) → same 0x3000003 / ert_Error / OFM0.
+- **Stop env HITL.** Next: vendor post-patch ctrltext capture + byte-diff (RESIDUAL P0).
+- Userspace contract still green; no ran_on_npu.
+
 Latest Turn (HITL B/C runners + offline GT oracle — unstick ping-pong):
 - **You run:** `bash tools/hitl_b_gt_capture.sh` (B, offline±vendor) then later
   `bash tools/hitl_c_pass_apply.sh` (C, ELF-only Pass apply). Doc: `docs/HITL_BC.md`.
@@ -23,11 +509,13 @@ Latest Turn (HITL log: still raw .bin — not aiebu ELF):
 Latest Turn (D3e HITL: ert_state=Error + xrt3 layout trial):
 - **Live:** `ert_state=5(Error)` — WAIT ok but **FW rejected job** (zero OFM expected).
   status now classifies `ert_cmd_error`. map_host/align still OK.
-- **Next trial:** `XDNA2_LAB_KERNEL_ARG_LAYOUT=xrt3` (n_bos=3 IFM/WTS/OFM; ctrl pin+patch only)
-  vs default `count4` (ctrl as 4th paddr). Detail shows `layout=xrt3|count4`.
+- **~~Next trial:~~ SUPERSEDED** `XDNA2_LAB_KERNEL_ARG_LAYOUT=xrt3` trial **CLOSED**
+  (same APP_LOAD_PDI_FAIL `0x3000003`); next HITL = capture-instr only, not more env C.
+  Historical: n_bos=3 IFM/WTS/OFM; ctrl pin+patch vs default `count4`.
 - Optional FW status: dyndbg `module amdxdna +p` → journal `Response status 0x…`.
 - Gates: fmt; clippy -D amd-xdna2; pack layout tests.
-- **Still open:** layout that yields `ert_state=Completed` + non-zero OFM → `ran_on_npu`.
+- **Still open (historical):** layout that yields Completed + non-zero OFM → `ran_on_npu`
+  (env path closed; path is vendor capture → parity → one C).
 
 Latest Turn (post-D3d re-apply still zero OFM + ERT state diag):
 - **HITL after D3d:** still `ofm_verify_failed`, `raw_nonzero_bytes=0`; map_host/align OK.

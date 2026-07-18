@@ -195,16 +195,28 @@ else
     fi
     if [[ "$is_elf" -eq 1 ]]; then
       ok "instr path=$INSTR size=$isz (aiebu ELF — preferred for EXEC/rela patch)"
+      INSTR_OK=1
+    elif [[ "$REQUIRE_PASS" -eq 1 ]]; then
+      # Pass gate: raw classic txn is known-bad EXEC (APP_LOAD_PDI_FAIL).
+      sib=""
+      if [[ "$INSTR" == *.bin ]]; then
+        sib="${INSTR%.bin}.elf"
+      fi
+      if [[ -n "$sib" && -f "$sib" ]]; then
+        fail "instruction is raw non-ELF ($INSTR size=$isz) but sibling ELF exists ($sib) — use ELF for Pass"
+      fi
+      fail "instruction is not aiebu ELF magic (path=$INSTR size=$isz) — stage lab_instr.elf for --require-pass-assets"
     elif [[ -n "$EXPECT_INSTR" && "$isz" != "$EXPECT_INSTR" ]]; then
       warn "instruction size $isz != staged expect $EXPECT_INSTR (may still be valid txn)"
       ok "instr path=$INSTR size=$isz"
+      INSTR_OK=1
     else
       if [[ "$INSTR" == *.bin ]]; then
         warn "raw lab_instr.bin (no ELF) — EXEC often APP_LOAD_PDI_FAIL; stage lab_instr.elf"
       fi
       ok "instr path=$INSTR size=$isz"
+      INSTR_OK=1
     fi
-    INSTR_OK=1
   fi
 fi
 

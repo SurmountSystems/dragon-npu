@@ -19,7 +19,7 @@ recreate it by accident.
 | **API** | `exec_cmd_is_enabled()` / `submit_command` / `submit_and_wait_command` | hard error if gated |
 | **WAIT_CMD** | `wait_command` (not L1-gated; cleanup path) | finite timeout in lab helpers |
 | **Probe / timed_matmul** | Never call EXEC_CMD unless both layers allow | skip submit |
-| **Honesty** | `ran_on_npu` only for verified NPU compute; never envelope / inst-blob-without-verify Pass; `bo_roundtrip` uses `ran_on_device_path` only | enforced |
+| **Honesty** | `ran_on_npu` only for verified NPU compute; never envelope / inst-blob-without-verify Pass; `bo_roundtrip` uses `ran_on_device_path` only; offline `tools/c4_pass_check.sh` is snapshot audit only (**≠ invent Pass**) | enforced |
 | **Lab procedure** | [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) | operator single-shot only |
 
 Enabling EXEC_CMD requires **both** userspace gates (and, **if L3 is installed**, the kernel param):

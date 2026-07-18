@@ -1,10 +1,75 @@
 # DragonNPU Rust Rewrite Plan
 
-## Latest (D3d — ctrl read_add_write after EXEC OK / zero OFM)
+## Latest (IMPL 3a14f38d review-fix — C4 readiness hardened)
+- Exact completed tokens only (`ok_npu_verified` / `ert_state=4`); require
+  `ofm_raw_nonzero>0` + `real_ioctl=true`; always `not_c_ready=1 invent_pass=0`
+  on PassCandidate. Path refuse exit 2; TMPDIR=/ footgun fixed.
+- Tools/docs ban rows + post-C2 `c4_pass_check`. **Offline PassCandidate ≠ invent
+  product Pass.** Unlock `C_UNLOCK=b17b0119`; baseline C4_SKIP. Next = operator C2.
+- SSoT: `RESIDUAL.md` / `AGENTS.md` / `docs/HITL_C_APP_LOAD_RECIPE.md`.
+
+## Previous (IMPL 3a14f38d — Phase C4 **readiness**; no Pass snapshot)
+- C4 offline Pass audit: pure `SiliconPassEvidence` /
+  `evaluate_silicon_pass_evidence` → `NotPass` / `PassCandidate` (hard rule:
+  `json_ran_on_npu` missing/false never PassCandidate).
+- Tools: `examples/c4_pass_check.rs` + `tools/c4_pass_check.sh` — baseline →
+  **`C4_SKIP`**; `--require-pass` → exit 2. Soft in `run_offline_gates`.
+- Product Pass still = live `decide_ran_on_npu` — **offline C4 ≠ invent Pass**.
+
+## Previous (IMPL f76067f8 — Phase C3 **readiness**; no new C2 evidence)
+- C3 offline pipeline: `tools/c3_post_c2_classify.sh` — soft classify + **fingerprint-
+  equality** evidence. Default resolve: explicit → env → **repo baseline**
+  → newest temp **only if no baseline**. Explicit/env **never** overridden by temp.
+- Same fingerprint as locked baseline → **`C3_SKIP`** (`same_body_as_baseline`);
+  FP differs → **`C3_EVIDENCE=1`** even if residual still APP_LOAD
+  (`shape_still_locked_app_load=1`); path alone ≠ evidence. Parse errors on
+  baseline → soft skip (never invent evidence). Secure JSON: `O_NOFOLLOW` + size
+  cap; realpath fail-closed.
+- Pure TDD: fingerprint / locked baseline / **aiebu-without-rela** negative /
+  `journal_line_has_app_load_hint`. Docs RESIDUAL/HITL_C/hitl_c2 post → C3 script.
+- Unlock still **`C_UNLOCK=b17b0119`**. `last_apply` still 2026-07-16 → default
+  `C3_SKIP`; `--require-new` → exit 2. **No** Pass / **no** `ran_on_npu`.
+- **Next:** operator C2 sandwich + restore L3 → `c3_post_c2_classify.sh` with
+  new body → agent C3/C4. **Ban** env spam / invent Pass / leave L3 open /
+  re-litigate closed fixture matrix as “C3 research”.
+- SSoT: `RESIDUAL.md` / `AGENTS.md` / `docs/HITL_C_APP_LOAD_RECIPE.md`.
+
+## Previous (IMPL de4d9fa4 — Phase C2 **agent prep**; live C2 **sudo-blocked**)
+- Operator helper `tools/hitl_c2_once.sh`: soft `C_UNLOCK=` NOTE, optional
+  offline gates, preflight, prints bash+fish sandwich + post-C2 classify path;
+  never opens L3; `--apply-if-l3-open` fail-closed when L3 closed.
+- Unlock still **`C_UNLOCK=b17b0119`** (one-shot; ≠ Pass). Host L3=N; agent
+  cannot sudo. `last_apply` still 2026-07-16 — **no C2 completed this run**.
+- **Next:** operator runs C2 sandwich + restore L3 → classify + offline gates →
+  agent C3/C4. **Ban** env spam / invent Pass / leave L3 open.
+- SSoT: `RESIDUAL.md` / `AGENTS.md` / `docs/HITL_C_APP_LOAD_RECIPE.md`.
+
+## Previous (IMPL b17b0119 — Phase C1: **C unlocked once**; still no Pass)
+- Agent **unlock** for **one** operator HITL C: `C_UNLOCK=b17b0119` in
+  `RESIDUAL.md` / recipe / `HITL_BC.md` / `SILICON_PATH_LAB`. Unlock **≠** Pass /
+  **≠** permanent open season / **≠** `ran_on_npu`. L3=`exec_cmd_allow` vs
+  userspace ALLOW=`XDNA2_ALLOW_EXEC_CMD` (both closed after).
+- Soft NOTE in `hitl_c` when stamp present (not hard gate); fail-closed if
+  `silicon_contract_check.sh` missing unless force-apply; comment-only `--help`.
+- Offline gates + preflight green; agent does **not** live apply / L3 / ALLOW.
+- **Next:** operator **C2** recipe sandwich + restore L3; then agent C3/C4
+  from new last_apply. **Ban** env-flag spam. Further C needs **new agent unlock**
+  (evidence may justify unlock decision; never auto-unlocks).
+- SSoT: `RESIDUAL.md` / `AGENTS.md` / `docs/HITL_C_APP_LOAD_RECIPE.md`.
+
+## Previous (IMPL 49de1327 — offline maintain; C **not** unlocked)
+- Offline self-runnable suite green; `tools/run_offline_gates.sh` one-shot
+  (`OFFLINE_GATES_OK` ≠ C-ready ≠ `ran_on_npu`).
+- APP_LOAD signal matrix **closed** (same fixture; no new last_apply/journal).
+- **Next (superseded by b17b0119 unlock):** agent unlock one C **or** maintain
+  offline. **Ban** env-flag re-apply spam without new evidence (standing rule 2).
+
+## Previous (D3d — ctrl read_add_write after EXEC OK / zero OFM)
 - **Live:** D3c → EXEC+WAIT accepted; OFM all zeros (`ofm_verify_failed`).
 - **Root cause:** meta size=6 `read_add_write` must **add** tile offsets (OFM `0x100`, WTS `0x15400`); u64 overwrite wiped them.
 - **Code:** `apply_ctrl_patch_location` + meta apply path size-aware.
-- **Next (HITL):** re-apply → non-zero OFM + golden allclose → `ran_on_npu`.
+- **Next (historical HITL language):** re-apply was research path; **superseded** —
+  C only if agent unlocks (see Latest / RESIDUAL). No env re-apply ping-pong.
 
 ## Previous (D3c — DevHeap 64 MiB-aligned UVA for map_host)
 - **Root cause (live journal):** `MAP_HOST_BUFFER` size 64 MiB at UVA `0x7f3515400000` → FW `0x4000003`; need UVA `% 0x4000000 == 0` (XRT heap_page_size).

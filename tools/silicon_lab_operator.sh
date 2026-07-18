@@ -13,9 +13,12 @@
 #   bash tools/silicon_lab_operator.sh gt-offline     # dump patch oracle (no L3)
 #   bash tools/silicon_lab_operator.sh apply          # HITL Pass: prefer lab_instr.elf
 #   bash tools/silicon_lab_operator.sh capture-golden # vendor OFM (needs L3)
+#   bash tools/silicon_lab_operator.sh capture-instr  # vendor post-patch instr (needs L3 once)
 #   bash tools/silicon_lab_operator.sh install-golden /path/to/ofm.bin
+#   bash tools/silicon_lab_operator.sh extract-paddrs # last_apply → vendor_paddrs JSON
 #   bash tools/hitl_b_gt_capture.sh [--with-vendor]   # Milestone B (preferred)
-#   bash tools/hitl_c_pass_apply.sh                   # Milestone C (preferred)
+#   bash tools/hitl_c_pass_apply.sh                   # Milestone C only if agent says ready
+#     (C only if agent ready; unpatched CLASS A / diff rc=0 / registry alone ≠ C-ready)
 #
 # Exit: 0 ok; 2 usage / fail-closed missing assets; 3 golden zero+ALLOW style
 #       apply: same exit codes as scripts/lab_exec_once.sh (4 = !ran_on_npu common)
@@ -32,7 +35,7 @@ die() { echo "ERROR: $*" >&2; exit 2; }
 note() { echo "$*"; }
 
 usage() {
-  sed -n '1,24p' "$0" | sed 's/^# \?//'
+  sed -n '1,25p' "$0" | sed 's/^# \?//'
   exit 2
 }
 
@@ -78,17 +81,18 @@ cmd_status() {
   set -e
   if [[ "$pf_rc" -eq 0 ]]; then
     pre="Pass-candidate ready (preflight --require-pass-assets OK: instr+WTS nz+CTRL nz+golden nz)"
-  elif [[ ! -f "$DIR/lab_instr.bin" ]]; then
+  elif [[ ! -f "$DIR/lab_instr.elf" && ! -f "$DIR/lab_instr.bin" ]]; then
     pre="need stage (instr/ctrl/WTS) — preflight require-pass failed (rc=$pf_rc)"
   elif [[ ! -f "$DIR/ofm_golden.bin" ]]; then
     pre="need non-zero OFM golden — capture-golden or install-golden (preflight rc=$pf_rc)"
   else
-    pre="files present but preflight --require-pass-assets FAILED (rc=$pf_rc: zero/size/missing) — run preflight"
+    pre="files present but preflight --require-pass-assets FAILED (rc=$pf_rc: zero/size/missing/raw) — run preflight"
   fi
   note "readiness: $pre"
   note ""
+  note "Exit codes: 0 ok; 2 missing/refused; 3 zero-golden ALLOW; apply 4=!ran_on_npu; 5 L3 restore fail"
   note "Next:"
-  if [[ ! -f "$DIR/lab_instr.bin" ]]; then
+  if [[ ! -f "$DIR/lab_instr.elf" && ! -f "$DIR/lab_instr.bin" ]]; then
     note "  1) bash tools/silicon_lab_operator.sh stage"
   elif [[ ! -f "$DIR/ofm_golden.bin" ]]; then
     note "  1) stage OK — capture OFM golden (Option A, vendor NPU):"
@@ -99,35 +103,54 @@ cmd_status() {
   elif [[ "$pf_rc" -ne 0 ]]; then
     note "  1) bash tools/silicon_lab_operator.sh preflight   # fix zero/size assets"
   else
-    note "  1) bash tools/silicon_lab_operator.sh check          # offline contract"
-    note "  2) bash tools/hitl_b_gt_capture.sh                   # Milestone B (no sudo)"
-    note "     bash tools/hitl_b_gt_capture.sh --with-vendor     # optional golden re-lock"
-    note "  3) bash tools/hitl_c_pass_apply.sh --assume-l3-already-open  # Milestone C"
+    note "  1) bash tools/silicon_lab_operator.sh check          # offline contract (≠ C-ready)"
+    if [[ ! -f "$ROOT/testdata/xdna2_cmd/gt_capture/instr_vendor_post_patch.bin" ]]; then
+      note "  2) optional capture if classic body missing (one L3 window — ban env C):"
+      note "     sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+      note "     bash tools/silicon_lab_operator.sh capture-instr"
+      note "     sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+      note "     bash tools/diff_vendor_instr_parity.sh"
+    else
+      note "  2) vendor instr present — bash tools/diff_vendor_instr_parity.sh"
+      note "     (unpatched CLASS A / mere rc=0 = body match only ≠ C-ready)"
+      note "  3) offline: maintain pure-direct tests/contract (TDD landed); APP_LOAD is silicon residual"
+      note "  4) hitl_c_pass_apply ONLY if agent says ready"
+      note "     (not unpatched A / CONTRACT_OK / registry cache / parity green;"
+      note "      INSTR_BO true post-patch public path closed — registry ≠ live run_ BO)"
+    fi
   fi
 }
 
 cmd_apply() {
   note "=== HITL apply (explicit wedge risk; no password storage) ==="
-  note "Prefer: bash tools/hitl_c_pass_apply.sh  (forces aiebu ELF + diagnostics)"
-  note "Wraps: lab_exec_once.sh --silicon-mladf --require-pass-assets --apply --i-accept-wedge-risk"
-  note "After apply: verify exec_cmd_allow is N/0 (script restores if it opened L3)."
+  note "Prefer: bash tools/hitl_c_pass_apply.sh  (forces aiebu ELF + offline gate)"
+  note "Delegates to hitl_c (A9: refuses unless offline contract green unless --force-apply)."
+  note "After apply: verify exec_cmd_allow is N/0."
   note "Optional BO diag: export XDNA2_LAB_BO_DIAG=1"
   note ""
-  # Prefer aiebu ELF — raw lab_instr.bin causes APP_LOAD_PDI_FAIL / ert Error.
-  local blob=""
-  if [[ -f "$DIR/lab_instr.elf" ]]; then
-    blob="$DIR/lab_instr.elf"
-  elif [[ -f "$DIR/lab_instr.bin" ]]; then
-    note "WARN: no lab_instr.elf — staging aiebu from .bin …"
-    bash "$ROOT/tools/stage_aiebu_lab_instr.sh" || die "stage_aiebu_lab_instr failed"
-    blob="$DIR/lab_instr.elf"
-  fi
-  [[ -n "$blob" && -f "$blob" ]] || die "missing lab_instr.elf — run stage + stage_aiebu_lab_instr"
-  note "BLOB: $blob ($(wc -c <"$blob" | tr -d ' ') B)"
+  # Only forward allowlisted flags (no arbitrary --blob / cargo-args).
+  local fwd=()
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --assume-l3-already-open|--assume-l3-open|--no-bo-diag|--no-build|--force-apply-despite-offline-red|--force-apply)
+        fwd+=("$a")
+        ;;
+      --timeout-s=*)
+        fwd+=("$a")
+        ;;
+      -h|--help)
+        bash "$ROOT/tools/hitl_c_pass_apply.sh" --help
+        return 2
+        ;;
+      *)
+        die "operator apply refuses unknown arg: $a (use hitl_c allowlist)"
+        ;;
+    esac
+  done
   local rc=0
   set +e
-  bash "$ROOT/scripts/lab_exec_once.sh" --silicon-mladf --require-pass-assets \
-    --apply --i-accept-wedge-risk --blob "$blob" "$@"
+  bash "$ROOT/tools/hitl_c_pass_apply.sh" "${fwd[@]}"
   rc=$?
   set -e
   note ""
@@ -142,10 +165,9 @@ cmd_apply() {
     *)
       note "CRITICAL: exec_cmd_allow still open ($allow_post) — restore manually:" >&2
       note "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
-      # Prefer restore-failed class over silent success.
-      if [[ "$rc" -eq 0 ]]; then
-        rc=5
-      fi
+      # Always restore-failed class when L3 still open (never mask prior rc).
+      # hitl_c does the same; defense-in-depth if wrapper is the outer exit.
+      rc=5
       ;;
   esac
   return "$rc"
@@ -167,21 +189,87 @@ cmd_capture_golden() {
   if [[ ! -f "$DIR/lab_instr.bin" ]]; then
     note "WARN: silicon_lab not staged yet — capturing golden anyway; stage before preflight."
   fi
+  local rc=0
+  set +e
   # Always install into silicon_lab when capture succeeds.
   bash "$ROOT/tools/capture_mladf_ofm_golden.sh" --install
+  rc=$?
+  set -e
   note ""
   local allow_post
   allow_post="$(read_exec_cmd_allow)"
-  note "POST capture: exec_cmd_allow=$allow_post"
+  note "POST capture-golden: exec_cmd_allow=$allow_post"
   case "$allow_post" in
     0|N|n)
       note "L3 already closed (good)."
       ;;
     *)
-      note "WARN: exec_cmd_allow=$allow_post still open — restore NOW:"
-      note "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+      note "CRITICAL: exec_cmd_allow=$allow_post still open — restore NOW:" >&2
+      note "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+      # Match capture-instr: L3 open → rc=5 for ANY base rc (success or fail),
+      # unless research override XDNA2_CAPTURE_ALLOW_L3_OPEN=1.
+      if [[ "${XDNA2_CAPTURE_ALLOW_L3_OPEN:-0}" == "1" ]]; then
+        note "WARN: XDNA2_CAPTURE_ALLOW_L3_OPEN=1 — not elevating to exit 5 (base rc=$rc)" >&2
+      else
+        note "CRITICAL: L3 still open after capture-golden → exit 5 (base was $rc)" >&2
+        rc=5
+      fi
       ;;
   esac
+  return "$rc"
+}
+
+cmd_capture_instr() {
+  note "=== Optional vendor instruction capture (one L3 window) ==="
+  note "Optional logs only; residual highest-value = pure-direct / APP_LOAD"
+  note "pure-direct / APP_LOAD residual (no more KERNEL_ARG / INSTR_SIZE env C applies)."
+  note "Uses tools/capture_mladf_instr_vendor.sh — vendor DD NPU execute + instr dump."
+  note "This helper does NOT own L3 restore — operator must close exec_cmd_allow after."
+  note ""
+  note "One-liner (you run if needed):"
+  note "  sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+  note "  bash tools/silicon_lab_operator.sh capture-instr"
+  note "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+  note "  bash tools/diff_vendor_instr_parity.sh   # unpatched A ≠ C-ready"
+  note ""
+  local rc=0
+  set +e
+  bash "$ROOT/tools/capture_mladf_instr_vendor.sh" --install
+  rc=$?
+  set -e
+  note ""
+  local allow_post
+  allow_post="$(read_exec_cmd_allow)"
+  note "POST capture-instr: exec_cmd_allow=$allow_post"
+  case "$allow_post" in
+    0|N|n)
+      note "L3 already closed (good)."
+      ;;
+    *)
+      note "CRITICAL: exec_cmd_allow=$allow_post still open — restore NOW:" >&2
+      note "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+      # Issue 6: elevate L3 open → 5 for ANY base rc (success or fail),
+      # unless research override (matches capture_mladf_instr_vendor.sh).
+      if [[ "${XDNA2_CAPTURE_ALLOW_L3_OPEN:-0}" == "1" ]]; then
+        note "WARN: XDNA2_CAPTURE_ALLOW_L3_OPEN=1 — not elevating to exit 5 (base rc=$rc)" >&2
+      else
+        note "CRITICAL: L3 still open after capture-instr → exit 5 (base was $rc)" >&2
+        rc=5
+      fi
+      ;;
+  esac
+  note ""
+  note "Offline next (no sudo):"
+  note "  bash tools/diff_vendor_instr_parity.sh"
+  note "Ban: env C applies; unpatched CLASS A / mere diff rc=0 ≠ C-ready"
+  note "Honesty: CAPTURE_MODE_UNPATCHED ≠ live run_ BO; registry=Transaction/cache only; C only if agent ready"
+  note "C only if agent says ready (not unlocked by body match alone)"
+  return "$rc"
+}
+
+cmd_extract_paddrs() {
+  note "=== extract io_paddrs from last_apply.json → vendor_paddrs JSON ==="
+  bash "$ROOT/tools/extract_paddrs_from_last_apply.sh" "$@"
 }
 
 cmd_stage() {
@@ -288,8 +376,10 @@ case "$CMD" in
   gt-offline) cmd_gt_offline ;;
   apply) cmd_apply "$@" ;;
   capture-golden) cmd_capture_golden ;;
+  capture-instr) cmd_capture_instr ;;
+  extract-paddrs) cmd_extract_paddrs "$@" ;;
   install-golden) cmd_install_golden "${1:-}" ;;
   golden-help) cmd_golden_help ;;
   -h|--help) usage ;;
-  *) die "unknown command: $CMD (try status|stage|check|gt-offline|capture-golden|preflight|dry-run|apply|install-golden|golden-help)" ;;
+  *) die "unknown command: $CMD (try status|stage|check|gt-offline|capture-golden|capture-instr|extract-paddrs|preflight|dry-run|apply|install-golden|golden-help)" ;;
 esac
