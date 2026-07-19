@@ -2,10 +2,16 @@
 # Operator C2 one-shot helper — prep + exact sandwich + optional apply.
 #
 # IMPL de4d9fa4: C2 live blocked on operator sudo when L3 closed.
-# Unlock SSoT remains C_UNLOCK=… from RESIDUAL.md (one-shot; ≠ Pass / ≠ ran_on_npu).
+# Unlock SSoT: C_UNLOCK=… from RESIDUAL.md (soft NOTE only — never hard-blocks
+# prep/print/apply). IMPL b17b0119: C_UNLOCK=b17b0119 one-shot **CONSUMED**
+# (operator C2 2026-07-18). Soft NOTE must say CONSUMED when RESIDUAL marks it —
+# not active open season. When CONSUMED, printed sandwich L3/apply lines are
+# comment-only HISTORICAL record (non-executable); further C needs a **new**
+# agent unlock + offline delta. Never invent a stamp. CONSUMED never hard-blocks
+# --apply-if-l3-open (standing soft-NOTE policy; operator still owns L3).
 #
 # What this does (default = safe offline prep, NO L3 open, NO EXEC):
-#   1) Soft NOTE if RESIDUAL has C_UNLOCK=
+#   1) Soft NOTE if RESIDUAL has C_UNLOCK= (active vs CONSUMED)
 #   2) Unlock-ban soft NOTE (false unlocks ≠ Pass)
 #   3) Optional offline gates (soft; ≠ C-ready)
 #   4) Preflight --require-pass-assets (assets only)
@@ -109,15 +115,36 @@ echo "NOTE: XDNA2_ALLOW_EXEC_CMD unset at entry (userspace gate; never set here)
 
 # Soft unlock stamp from RESIDUAL SSoT (NOTE only — never hard-blocks prep).
 # Tolerate markdown: **C_UNLOCK=…**, `C_UNLOCK=…`, indent, mid-line.
+# Detect CONSUMED so historical b17b0119 does not print as active one-shot.
 _c_unlock_tok=""
+_c_unlock_consumed=0
 if [[ -f "$ROOT/RESIDUAL.md" ]]; then
+  _c_unlock_line="$(
+    { grep -m1 -E 'C_UNLOCK=[A-Za-z0-9_]+' "$ROOT/RESIDUAL.md" || true; } | head -n1
+  )"
   _c_unlock_tok="$(
-    { grep -m1 -oE 'C_UNLOCK=[A-Za-z0-9_]+' "$ROOT/RESIDUAL.md" || true; } \
+    { grep -oE 'C_UNLOCK=[A-Za-z0-9_]+' <<<"${_c_unlock_line}" || true; } \
       | head -n1 | tr -d '`"*' | tr -d '[:space:]'
   )"
+  if [[ -n "${_c_unlock_tok}" ]]; then
+    _c_unlock_stamp="${_c_unlock_tok#C_UNLOCK=}"
+    if grep -qiE 'CONSUMED' <<<"${_c_unlock_line}"; then
+      _c_unlock_consumed=1
+    elif grep -E "C_UNLOCK=${_c_unlock_stamp}" "$ROOT/RESIDUAL.md" \
+      | grep -qiE 'CONSUMED'; then
+      _c_unlock_consumed=1
+    elif grep -qiE "${_c_unlock_stamp}[^A-Za-z0-9_].*CONSUMED|CONSUMED[^A-Za-z0-9_].*${_c_unlock_stamp}" \
+      "$ROOT/RESIDUAL.md"; then
+      _c_unlock_consumed=1
+    fi
+  fi
 fi
-if [[ -n "${_c_unlock_tok}" ]]; then
-  echo "NOTE: ${_c_unlock_tok} one-shot; restore L3 (exec_cmd_allow=0); ≠ ran_on_npu until Pass" >&2
+if [[ -n "${_c_unlock_tok}" && "${_c_unlock_consumed}" -eq 1 ]]; then
+  echo "NOTE: ${_c_unlock_tok} is **CONSUMED** (historical one-shot; not active)." >&2
+  echo "NOTE: further C needs a **new** agent unlock + offline delta; restore L3; ≠ Pass / ≠ ran_on_npu." >&2
+  echo "NOTE: unlock ≠ Pass ≠ permanent open season. L3=exec_cmd_allow; userspace ALLOW=XDNA2_ALLOW_EXEC_CMD (leave both closed after)." >&2
+elif [[ -n "${_c_unlock_tok}" ]]; then
+  echo "NOTE: ${_c_unlock_tok} one-shot (active); restore L3 (exec_cmd_allow=0); ≠ ran_on_npu until Pass" >&2
   echo "NOTE: unlock ≠ Pass ≠ permanent open season. L3=exec_cmd_allow; userspace ALLOW=XDNA2_ALLOW_EXEC_CMD (leave both closed after)." >&2
 else
   echo "NOTE: no C_UNLOCK= stamp in RESIDUAL.md (soft; prep still allowed)." >&2
@@ -136,39 +163,80 @@ allow_now="$(read_allow)"
 echo "driver: exec_cmd_allow=$allow_now (sample at start; re-read before apply)"
 
 # Soft C_UNLOCK comment line for sandwich (parsed token or placeholder).
-_c_unlock_comment="${_c_unlock_tok:-C_UNLOCK=<see RESIDUAL.md>}"
+if [[ -n "${_c_unlock_tok}" && "${_c_unlock_consumed}" -eq 1 ]]; then
+  _c_unlock_comment="${_c_unlock_tok} CONSUMED — further C needs NEW agent unlock (not active)"
+elif [[ -n "${_c_unlock_tok}" ]]; then
+  _c_unlock_comment="${_c_unlock_tok} one-shot (active)"
+else
+  _c_unlock_comment="C_UNLOCK=<see RESIDUAL.md>"
+fi
 
 print_sandwich() {
   echo ""
-  echo "======== OPERATOR C2 SANDWICH (you run; agent does not) ========"
-  echo ""
-  echo "--- bash ---"
-  cat <<EOF
+  if [[ "${_c_unlock_consumed}" -eq 1 ]]; then
+    echo "======== OPERATOR C2 SANDWICH — HISTORICAL / CONSUMED (record only) ========"
+    echo "NOTE: stamp consumed — L3/apply lines below are commented (non-executable)."
+    echo "NOTE: further live C needs a NEW agent unlock + offline delta first."
+    echo "NOTE: CONSUMED is soft-NOTE only (never hard-blocks --apply-if-l3-open)."
+    echo ""
+    echo "--- bash (HISTORICAL / CONSUMED; do not paste-run L3 under old stamp) ---"
+    cat <<EOF
 cd ${ROOT}
 export PATH="/usr/bin:\${HOME}/.local/bin:\${PATH}"
 # optional: export XDNA2_LAB_BO_DIAG=1
 # never leave sticky: unset XDNA2_ALLOW_EXEC_CMD
 
-# ${_c_unlock_comment} one-shot; restore L3; ≠ ran_on_npu until Pass
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
+# ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
+# (record only) sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# (record only) bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+# (record only) sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# (record only) cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 EOF
-  echo ""
-  echo "--- fish ---"
-  cat <<EOF
+    echo ""
+    echo "--- fish (HISTORICAL / CONSUMED; do not paste-run L3 under old stamp) ---"
+    cat <<EOF
 cd ${ROOT}
 set -gx PATH /usr/bin \$HOME/.local/bin \$PATH
 # optional: set -gx XDNA2_LAB_BO_DIAG 1
 # never leave sticky: set -e XDNA2_ALLOW_EXEC_CMD
 
-# ${_c_unlock_comment} one-shot; restore L3; ≠ ran_on_npu until Pass
+# ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
+# (record only) sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# (record only) bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+# (record only) sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# (record only) cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
+EOF
+  else
+    echo "======== OPERATOR C2 SANDWICH (you run; agent does not) ========"
+    echo ""
+    echo "--- bash ---"
+    cat <<EOF
+cd ${ROOT}
+export PATH="/usr/bin:\${HOME}/.local/bin:\${PATH}"
+# optional: export XDNA2_LAB_BO_DIAG=1
+# never leave sticky: unset XDNA2_ALLOW_EXEC_CMD
+
+# ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
 sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 EOF
+    echo ""
+    echo "--- fish ---"
+    cat <<EOF
+cd ${ROOT}
+set -gx PATH /usr/bin \$HOME/.local/bin \$PATH
+# optional: set -gx XDNA2_LAB_BO_DIAG 1
+# never leave sticky: set -e XDNA2_ALLOW_EXEC_CMD
+
+# ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
+sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
+EOF
+  fi
   echo ""
   echo "If L3 left open after any failure:"
   echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
@@ -263,21 +331,39 @@ if [[ "$APPLY_IF_L3" -eq 0 ]]; then
   # Fresh sample for operator messaging (not used for apply).
   allow_now="$(read_allow)"
   echo ""
-  echo "C2_PREP_OK: sandwich printed. Operator must open L3 (sudo), run hitl_c, restore L3."
-  case "$allow_now" in
-    1|Y|y)
-      echo "NOTE: L3 is already open (exec_cmd_allow=$allow_now)."
-      echo "  Prefer: bash tools/hitl_c2_once.sh --apply-if-l3-open"
-      echo "  Then restore: sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
-      echo "  (default prep does not apply — avoids surprise EXEC)."
-      ;;
-    *)
-      echo "NOTE: L3 closed (exec_cmd_allow=$allow_now). Agent cannot complete C2 without operator sudo."
-      echo "Fail-closed check (expect exit 1 when L3 closed):"
-      echo "  bash tools/hitl_c_pass_apply.sh --assume-l3-already-open"
-      echo "  bash tools/hitl_c2_once.sh --apply-if-l3-open"
-      ;;
-  esac
+  if [[ "${_c_unlock_consumed}" -eq 1 ]]; then
+    echo "C2_PREP_OK: HISTORICAL/CONSUMED sandwich printed (L3/apply lines non-executable)."
+    echo "NOTE: do **not** open L3 under consumed unlock (${_c_unlock_tok:-C_UNLOCK})."
+    echo "NOTE: further live C needs a **NEW** agent unlock + offline delta first."
+    echo "NOTE: CONSUMED is soft-NOTE only (never hard-blocks --apply-if-l3-open)."
+    case "$allow_now" in
+      1|Y|y)
+        echo "NOTE: L3 is already open (exec_cmd_allow=$allow_now) — restore promptly:"
+        echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+        echo "  (consumed stamp — do not treat open L3 as permission to re-apply under old unlock)."
+        ;;
+      *)
+        echo "NOTE: L3 closed (exec_cmd_allow=$allow_now) — correct while stamp is CONSUMED."
+        echo "Offline next: bash tools/c3_post_c2_classify.sh ; bash tools/run_offline_gates.sh"
+        ;;
+    esac
+  else
+    echo "C2_PREP_OK: sandwich printed. Operator must open L3 (sudo), run hitl_c, restore L3."
+    case "$allow_now" in
+      1|Y|y)
+        echo "NOTE: L3 is already open (exec_cmd_allow=$allow_now)."
+        echo "  Prefer: bash tools/hitl_c2_once.sh --apply-if-l3-open"
+        echo "  Then restore: sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'"
+        echo "  (default prep does not apply — avoids surprise EXEC)."
+        ;;
+      *)
+        echo "NOTE: L3 closed (exec_cmd_allow=$allow_now). Agent cannot complete C2 without operator sudo."
+        echo "Fail-closed check (expect exit 1 when L3 closed):"
+        echo "  bash tools/hitl_c_pass_apply.sh --assume-l3-already-open"
+        echo "  bash tools/hitl_c2_once.sh --apply-if-l3-open"
+        ;;
+    esac
+  fi
   exit 0
 fi
 
@@ -313,14 +399,20 @@ case "$allow_now" in
   *)
     echo "" >&2
     echo "ERROR: --apply-if-l3-open but exec_cmd_allow=$allow_now (L3 closed)." >&2
-    echo "This is NOT an NPU/FW failure — operator must open L3 with sudo first." >&2
+    echo "This is NOT an NPU/FW failure — L3 is closed (fail-closed)." >&2
     echo "This script never sets exec_cmd_allow (no passwordless L3 from agent)." >&2
-    echo "" >&2
-    echo "Open L3, then either:" >&2
-    echo "  sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
-    echo "  bash tools/hitl_c2_once.sh --apply-if-l3-open" >&2
-    echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
-    echo "or run the printed sandwich commands above." >&2
+    if [[ "${_c_unlock_consumed}" -eq 1 ]]; then
+      echo "NOTE: unlock is **CONSUMED** — do **not** open L3 under ${_c_unlock_tok:-old stamp}." >&2
+      echo "NOTE: further live C needs a **NEW** agent unlock + offline delta first." >&2
+      echo "NOTE: CONSUMED is soft-NOTE only (this refuse is L3-closed, not a hard CONSUMED gate)." >&2
+      echo "Offline next: bash tools/c3_post_c2_classify.sh ; bash tools/run_offline_gates.sh" >&2
+    else
+      echo "Open L3, then either:" >&2
+      echo "  sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+      echo "  bash tools/hitl_c2_once.sh --apply-if-l3-open" >&2
+      echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
+      echo "or run the printed sandwich commands above." >&2
+    fi
     exit 1
     ;;
 esac

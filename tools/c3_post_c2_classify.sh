@@ -51,8 +51,24 @@ unset XDNA2_ALLOW_EXEC_CMD || true
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# TMPDIR=/ (or empty after strip) must not become "" and match every absolute path.
+# Resolve symlink-to-/ via realpath when possible; fail-closed if realpath fails or
+# path remains a symlink (never keep unresolved rootlink as allow-root).
+# Soft smoke: bash tools/smoke_tmpdir_root_clamp.sh
 TMP_ROOT="${TMPDIR:-/tmp}"
 TMP_ROOT="${TMP_ROOT%/}"
+if [[ -z "$TMP_ROOT" || "$TMP_ROOT" == "/" ]]; then
+  TMP_ROOT="/tmp"
+fi
+if [[ -d "$TMP_ROOT" ]]; then
+  resolved="$(realpath -m "$TMP_ROOT" 2>/dev/null || true)"
+  if [[ -n "$resolved" ]]; then
+    TMP_ROOT="$resolved"
+  fi
+fi
+if [[ -z "$TMP_ROOT" || "$TMP_ROOT" == "/" || -L "$TMP_ROOT" ]]; then
+  TMP_ROOT="/tmp"
+fi
 
 # Match Rust MAX_MLADF_LAB_FILE_BYTES for last_apply reads.
 MAX_LAST_APPLY_BYTES=$((64 * 1024 * 1024))
@@ -481,7 +497,7 @@ fi
 if [[ "$EVIDENCE" -eq 0 ]]; then
   echo "C3_SKIP no_new_c2_evidence reason=$REASON not_c_ready=1 not_ran_on_npu=1"
   echo "NOTE: Offline APP_LOAD signal matrix CLOSED for same fixture — not new research."
-  echo "NOTE: Highest-value next = operator C2 (hitl_c2_once) then re-run this script."
+  echo "NOTE: C2 one-shot consumed; further C needs new agent unlock + offline delta (see RESIDUAL)."
   if [[ "$NO_CLASSIFY" -eq 0 ]]; then
     echo "--- soft classify (feedback only; ≠ C-ready) ---"
     set +e
@@ -513,17 +529,60 @@ if [[ "$NO_CLASSIFY" -eq 0 ]]; then
 fi
 
 # Optional journal hints only (never invent residual class).
+# Soft dual-pair parse mirrors pure JournalFwStatusPair / parse_journal_fw_status_pair
+# (Failed cmd + Status). Keep token shape in sync with format_soft_note (incl invent_pass=0).
+# Longer-term: call cargo classify example instead of this Python twin.
 if [[ "$SKIP_JOURNAL" -eq 0 ]]; then
   if command -v journalctl >/dev/null 2>&1; then
     echo "--- journal hints (read-only; journal_hint= only) ---"
     set +e
-    j_out="$(journalctl -k -n 200 --no-pager 2>/dev/null | grep -iE '0x3000003|APP_LOAD|Failed cmd' || true)"
+    j_out="$(journalctl -k -n 200 --no-pager 2>/dev/null | grep -iE '0x3000003|0x4000003|APP_LOAD|Failed cmd|Status 0x' || true)"
     set -e
     if [[ -n "${j_out//[[:space:]]/}" ]]; then
       while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         echo "journal_hint=${line}"
       done <<<"$j_out"
+      # Soft dual-status pair (research only; never invents residual class / Pass).
+      # Mirrors pure JournalFwStatusPair; stdin = journal lines (heredoc is -c script).
+      if command -v python3 >/dev/null 2>&1; then
+        set +e
+        pair_note="$(printf '%s\n' "$j_out" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+failed = chain = None
+for line in text.splitlines():
+    ll = line.lower()
+    if failed is None and ("failed cmd" in ll or "failed_cmd" in ll):
+        m = re.search(r"0x([0-9a-fA-F]+)", line)
+        if m:
+            failed = int(m.group(1), 16) & 0xFFFFFFFF
+    if chain is None and "status 0x" in ll and "failed cmd" not in ll and "failed_cmd" not in ll:
+        m = re.search(r"0x([0-9a-fA-F]+)", line)
+        if m:
+            chain = int(m.group(1), 16) & 0xFFFFFFFF
+parts = ["journal_fw_pair", "not_c_ready=1", "not_ran_on_npu=1", "invent_pass=0"]
+if failed is None:
+    parts.append("failed_cmd=absent")
+else:
+    parts.append("failed_cmd=0x%x" % failed)
+    if failed == 0x3000003:
+        parts.append("failed_cmd_name=APP_LOAD_PDI_FAIL")
+if chain is None:
+    parts.append("chain_status=absent")
+else:
+    parts.append("chain_status=0x%x" % chain)
+    if chain == 0x4000003:
+        parts.append("chain_name=AIE2_STATUS_INVALID_PARAM")
+if failed == 0x3000003 and chain == 0x4000003:
+    parts.append("c2_app_load_pair=1")
+print(" ".join(parts))
+')"
+        set -e
+        if [[ -n "${pair_note//[[:space:]]/}" ]]; then
+          echo "journal_fw_pair_soft=${pair_note}"
+        fi
+      fi
     else
       echo "journal_hint=none (no matching lines in last 200 kernel msgs)"
     fi

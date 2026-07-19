@@ -4,7 +4,7 @@
 2. **Do not ask the operator to re-apply** until offline parity gained **new** evidence
    (contract/A6 green, or a residual that cannot be tested offline). No flag ping-pong.
 3. **HITL sessions (minimize):** Milestone B = `tools/hitl_b_gt_capture.sh`;
-   **capture-instr** = optional L3 sandwich for logs (see `RESIDUAL.md` SSoT —
+   **capture-instr** = optional L3 sandwich for logs (see `RESIDUAL.md` single source of truth —
    not mandatory once unpatched body exists; post-patch dump research closed
    offline). Milestone C = `tools/hitl_c_pass_apply.sh` **only when agent
    says ready**. **Not** unlocked by: mere `CONTRACT_OK`; mere unpatched
@@ -16,6 +16,282 @@
 4. **Never** set `XDNA2_ALLOW_EXEC_CMD=1` in default tests; never claim `ran_on_npu`
    without OFM allclose on real ioctl + ERT Completed.
 5. Prefer **aiebu ELF** EXEC; refuse silent raw `lab_instr.bin`.
+
+Latest Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`b6a66dee`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`dd35ae15`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`2eeb5265`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`acaf47e3`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`e20f9d48`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`4d26a1ad`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`5692781f`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`76474e2d`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`9335d13e`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`7a7ef744`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`194c716c`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`8f432e65`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`50db8bcf`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`a4dc17e1`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`55af70b3`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`b8477e60`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`00847df4`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`943498d1`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`8291083a`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`675d42bc`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`e21dd1e1`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`5474de95`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`9282a077`):
+
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`ed014081`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`0e4f10ae`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`46783eea`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`90c17ab9`):
+
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`e3a96bee`):
+
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`c702b0de`):
+
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`45b30bae`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`4d15b9b2`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`ed2e4e43`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`7c5c4c4f`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
+
+Prior Turn (offline APP_LOAD **gate-only** maintain reconfirm — A–O still closed — **no** 2nd unlock / **no** Track P bag) (`7ab1c6ec`):
+- **Gate-only:** `run_offline_gates` hard_fail=0 soft_warn=0; L3=`N`; ALLOW unset;
+- Soft **always** `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`. Dual residual: userspace ELF+rela OK vs FW APP_LOAD; checklist splits unchanged.
+- hitl_c2 `--print-only`: `C_UNLOCK=b17b0119` **CONSUMED** (not active one-shot).
+- hitl_c L3-closed refuse: `hitl_c_rc=1` / `exit=1` (offline-only under CONSUMED).
+- Gates footer: `hard_ok=15 hard_fail=0 soft_ok=6 soft_warn=0 soft_skip=0`.
+- **No second C unlock.** Residual still FW APP_LOAD; no new external public evidence.
 
 Latest Turn (IMPL 3a14f38d review-fix Issues 1–6 — C4 readiness hardened):
 - **Exact completed:** status exact `ok_npu_verified` and/or `ert_state=4` only

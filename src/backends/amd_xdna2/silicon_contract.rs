@@ -12,7 +12,8 @@
 //! Note: `0x106` in [`aie2_fw_status_name`] is a **MSG_OP** (map_host), not APP status.
 
 use super::direct::{
-    TimedOpResult, build_ert_start_npu_cmd_bo, build_ert_start_npu_cmd_bo_with_kernel_args,
+    MAX_INSTRUCTION_BLOB_BYTES, TimedOpResult, build_ert_start_npu_cmd_bo,
+    build_ert_start_npu_cmd_bo_with_kernel_args,
 };
 use super::lab_io::{LabKernelArgLayout, pack_start_npu_kernel_args_with_ctrl_layout};
 use super::txn::{
@@ -174,8 +175,9 @@ pub fn format_instr_size_detail(
 ///
 /// **Not** auto-wired into live timed `detail` / `last_apply` paths — call sites
 /// may adopt later. Pure string only; never claims Pass, C-ready, or
-/// `ran_on_npu`. Encodes locked residual `0x3000003` / `APP_LOAD_PDI_FAIL` plus
-/// START_NPU size dual-mode fields. Env layout/size trials are **CLOSED**.
+/// `ran_on_npu`. Encodes locked residual [`AIE2_FW_APP_LOAD_PDI_FAIL`] /
+/// `APP_LOAD_PDI_FAIL` plus START_NPU size dual-mode fields. Env layout/size
+/// trials are **CLOSED**.
 #[must_use]
 pub fn format_app_load_residual_diag(
     aiebu_elf: bool,
@@ -190,10 +192,11 @@ pub fn format_app_load_residual_diag(
     let size = format_instr_size_detail(size_mode, content_len, bo_alloc, start);
     let layout = if layout.is_empty() { "na" } else { layout };
     format!(
-        "app_load_residual code=0x3000003 name={} aiebu_elf={} rela_count={} \
+        "app_load_residual code=0x{:x} name={} aiebu_elf={} rela_count={} \
          rela_mode={} layout={layout}; {size}; env_hitl_closed=1 \
          content_and_xrt3_closed=1 not_c_ready=1 not_ran_on_npu=1",
-        aie2_fw_status_name(0x3_000_003),
+        AIE2_FW_APP_LOAD_PDI_FAIL,
+        aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL),
         u8::from(aiebu_elf),
         rela_count,
         rela_mode.as_str(),
@@ -459,9 +462,2318 @@ pub fn last_apply_matches_locked_app_load_baseline(
 pub fn journal_line_has_app_load_hint(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
     l.contains("0x3000003")
+        || l.contains("0x4000003")
         || l.contains("app_load")
         || l.contains("failed cmd")
         || l.contains("status 0x3000003")
+        || l.contains("status 0x4000003")
+}
+
+/// Live C2 journal dual-status pair (research only; never invents product Pass).
+///
+/// Operator C2 (2026-07-18): `Failed cmd … 0x3000003` + nearby `Status 0x4000003`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JournalFwStatusPair {
+    /// From `Failed cmd … status 0x…` when present.
+    pub failed_cmd_status: Option<u32>,
+    /// From a standalone `Status 0x…` line (completion-chain) when present.
+    pub chain_status: Option<u32>,
+}
+
+impl JournalFwStatusPair {
+    /// True when the locked live pair is present (APP_LOAD fail + INVALID_PARAM chain).
+    #[must_use]
+    pub fn is_c2_app_load_pair(&self) -> bool {
+        self.failed_cmd_status == Some(AIE2_FW_APP_LOAD_PDI_FAIL)
+            && self.chain_status == Some(AIE2_FW_INVALID_PARAM)
+    }
+
+    /// Soft report tokens (never claims Pass / C-ready).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "journal_fw_pair".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+        ];
+        match self.failed_cmd_status {
+            Some(c) => {
+                parts.push(format!("failed_cmd=0x{c:x}"));
+                parts.push(format!("failed_cmd_name={}", aie2_fw_status_name(c)));
+            }
+            None => parts.push("failed_cmd=absent".into()),
+        }
+        match self.chain_status {
+            Some(c) => {
+                parts.push(format!("chain_status=0x{c:x}"));
+                parts.push(format!("chain_name={}", aie2_fw_status_name(c)));
+            }
+            None => parts.push("chain_status=absent".into()),
+        }
+        if self.is_c2_app_load_pair() {
+            parts.push("c2_app_load_pair=1".into());
+        }
+        parts.join(" ")
+    }
+}
+
+/// Parse journal (or multi-line) text for Failed-cmd + Status hex codes.
+///
+/// **Never** invents codes: only literal `0x…` after known prefixes.
+#[must_use]
+pub fn parse_journal_fw_status_pair(text: &str) -> JournalFwStatusPair {
+    let mut out = JournalFwStatusPair::default();
+    for line in text.lines() {
+        let l = line.trim();
+        let ll = l.to_ascii_lowercase();
+        if out.failed_cmd_status.is_none()
+            && (ll.contains("failed cmd") || ll.contains("failed_cmd"))
+        {
+            if let Some(c) = first_hex_status_token(l) {
+                out.failed_cmd_status = Some(c);
+            }
+        }
+        // Standalone Status 0x… (not the Failed cmd line's "status 0x")
+        if out.chain_status.is_none()
+            && ll.contains("status 0x")
+            && !ll.contains("failed cmd")
+            && !ll.contains("failed_cmd")
+        {
+            if let Some(c) = first_hex_status_token(l) {
+                out.chain_status = Some(c);
+            }
+        }
+    }
+    out
+}
+
+/// First `0x` / `0X` hex u32-ish token on a line (truncates to low 32 bits if longer).
+#[must_use]
+fn first_hex_status_token(line: &str) -> Option<u32> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end > start {
+                let hex = &line[start..end];
+                // Accept up to 16 hex digits; use low 32 bits of the parse.
+                if let Ok(v) = u64::from_str_radix(hex, 16) {
+                    return u32::try_from(v & 0xffff_ffff).ok();
+                }
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Max hex words accepted from a fixture/list (research dumps are tiny).
+pub const PARSE_U32_HEX_WORD_LIST_MAX: usize = 256;
+
+/// Parse LE u32 word list from a research fixture (one hex word per line; `#` comments).
+///
+/// Refuses empty input and lists longer than [`PARSE_U32_HEX_WORD_LIST_MAX`].
+///
+/// # Errors
+///
+/// Invalid hex token, empty after strip, or too many words.
+pub fn parse_u32_hex_word_list(text: &str) -> Result<Vec<u32>, String> {
+    let mut out = Vec::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if out.len() >= PARSE_U32_HEX_WORD_LIST_MAX {
+            return Err(format!(
+                "too many hex words (max {PARSE_U32_HEX_WORD_LIST_MAX})"
+            ));
+        }
+        let hex = line
+            .strip_prefix("0x")
+            .or_else(|| line.strip_prefix("0X"))
+            .unwrap_or(line);
+        let w = u32::from_str_radix(hex, 16)
+            .map_err(|e| format!("line {}: bad hex {line:?}: {e}", lineno + 1))?;
+        out.push(w);
+    }
+    if out.is_empty() {
+        return Err("no hex words".into());
+    }
+    Ok(out)
+}
+
+/// Decode a pure START_NPU Cmd BO (header + payload) into fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartNpuCmdDecode {
+    /// Unpacked header state nibble.
+    pub state: u32,
+    /// Unpacked header count (data dwords).
+    pub count: u32,
+    /// Unpacked header opcode.
+    pub opcode: u32,
+    /// CU mask dword.
+    pub cu_mask: u32,
+    /// Instruction buffer device address.
+    pub inst_addr: u64,
+    /// START_NPU size field.
+    pub inst_size: u32,
+    /// Property count field (shim I/O uses 0).
+    pub prop_count: u32,
+    /// Flexible-array dwords after prop_count.
+    pub flexible_args: Vec<u32>,
+}
+
+/// Decode START_NPU Cmd BO built by [`build_ert_start_npu_cmd_bo_ex`] family.
+///
+/// # Errors
+///
+/// Truncated buffer or count mismatch.
+pub fn decode_start_npu_cmd_bo(bytes: &[u8]) -> Result<StartNpuCmdDecode, String> {
+    use super::direct::{ErtCmdOpcode, parse_amdxdna_cmd_header_from_bytes};
+    let h = parse_amdxdna_cmd_header_from_bytes(bytes).map_err(|e| e.to_string())?;
+    if h.opcode != ErtCmdOpcode::StartNpu as u32 {
+        return Err(format!("opcode {} not START_NPU", h.opcode));
+    }
+    let need = 4usize.saturating_add((h.count as usize).saturating_mul(4));
+    if bytes.len() < need {
+        return Err(format!(
+            "cmd bo short: have {} need {need} (count={})",
+            bytes.len(),
+            h.count
+        ));
+    }
+    if h.count < 5 {
+        return Err(format!("count {} < 5 (cu+buf+size+prop)", h.count));
+    }
+    let mut dwords = Vec::with_capacity(h.count as usize);
+    for i in 0..h.count as usize {
+        let o = 4 + i * 4;
+        dwords.push(u32::from_le_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+        ]));
+    }
+    let cu_mask = dwords[0];
+    let inst_addr = u64::from(dwords[1]) | (u64::from(dwords[2]) << 32);
+    let inst_size = dwords[3];
+    let prop_count = dwords[4];
+    let flexible_args = dwords[5..].to_vec();
+    Ok(StartNpuCmdDecode {
+        state: h.state,
+        count: h.count,
+        opcode: h.opcode,
+        cu_mask,
+        inst_addr,
+        inst_size,
+        prop_count,
+        flexible_args,
+    })
+}
+
+/// Rebuild pure START_NPU for C2 live paddrs (xrt3, content size 1688, prop_count=0).
+///
+/// Research helper — does **not** submit.
+///
+/// # Errors
+///
+/// Builder refuse (should not happen for valid paddrs).
+pub fn rebuild_c2_live_start_npu_cmd_bo(
+    inst_addr: u64,
+    inst_size: u32,
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    cu_mask: u32,
+) -> Result<Vec<u8>, String> {
+    let kargs =
+        pack_start_npu_kernel_args_with_ctrl_layout(ifm, wts, ofm, None, LabKernelArgLayout::Xrt3);
+    build_ert_start_npu_cmd_bo_with_kernel_args(inst_addr, inst_size, &kargs, cu_mask)
+        .map_err(|e| e.to_string())
+}
+
+/// Word-level diff summary (research).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct U32WordDiff {
+    /// Length of left slice.
+    pub left_len: usize,
+    /// Length of right slice.
+    pub right_len: usize,
+    /// First index where words differ (or min len if prefix-equal but lens differ).
+    pub first_mismatch: Option<usize>,
+    /// Count of differing positions in shared prefix.
+    pub mismatch_count: usize,
+}
+
+/// Diff two u32 word lists.
+#[must_use]
+pub fn diff_u32_word_lists(left: &[u32], right: &[u32]) -> U32WordDiff {
+    let n = left.len().min(right.len());
+    let mut mismatch_count = 0usize;
+    let mut first = None;
+    for i in 0..n {
+        if left[i] != right[i] {
+            mismatch_count += 1;
+            if first.is_none() {
+                first = Some(i);
+            }
+        }
+    }
+    if first.is_none() && left.len() != right.len() {
+        first = Some(n);
+    }
+    U32WordDiff {
+        left_len: left.len(),
+        right_len: right.len(),
+        first_mismatch: first,
+        mismatch_count,
+    }
+}
+
+/// Live C2 journal cmdbuf words (28 × u32) from operator dmesg 2026-07-18.
+///
+/// Embedded for offline tests without depending on gitignored path layout.
+#[must_use]
+pub fn c2_live_cmdbuf_words_embedded() -> &'static [u32] {
+    &[
+        0x0000_0002,
+        0x0402_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0698,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_000f,
+        0x0000_0003,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x3b83_5000,
+        0x0000_7fda,
+        0x3b66_b000,
+        0x0000_7fda,
+        0x3b83_4000,
+        0x0000_7fda,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+    ]
+}
+
+/// Soft research note comparing pure START_NPU rebuild to live C2 cmdbuf words.
+///
+/// Always includes `not_c_ready=1 not_ran_on_npu=1 invent_pass=0`.
+#[must_use]
+pub fn format_c2_cmdbuf_research_note(pure_bo: &[u8], live_words: &[u32]) -> String {
+    let pure_words: Vec<u32> = pure_bo
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let d = diff_u32_word_lists(&pure_words, live_words);
+    let mut parts = vec![
+        "c2_cmdbuf_research".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "invent_pass=0".into(),
+        format!("pure_words={}", pure_words.len()),
+        format!("live_words={}", live_words.len()),
+    ];
+    if let Ok(dec) = decode_start_npu_cmd_bo(pure_bo) {
+        parts.push(format!("pure_prop_count={}", dec.prop_count));
+        parts.push(format!("pure_inst_size={}", dec.inst_size));
+        parts.push(format!("pure_cu_mask={:#x}", dec.cu_mask));
+        parts.push(format!("pure_count={}", dec.count));
+    }
+    // Live markers without full decode (dump framing may differ from pure BO).
+    let live_has_size = live_words.contains(&0x698);
+    let live_has_n_bos3 =
+        live_words.windows(2).any(|w| w[0] == 0xf && w[1] == 3) || live_words.contains(&3);
+    parts.push(format!("live_has_size_0x698={}", u8::from(live_has_size)));
+    parts.push(format!(
+        "live_word12_is_0xf={}",
+        u8::from(live_words.get(12) == Some(&0xf))
+    ));
+    parts.push(format!(
+        "live_has_n_bos3_token={}",
+        u8::from(live_has_n_bos3)
+    ));
+    if let Some(i) = d.first_mismatch {
+        parts.push(format!("first_mismatch_idx={i}"));
+        parts.push(format!("mismatch_count={}", d.mismatch_count));
+        parts.push("envelope_exact_match=0".into());
+    } else {
+        parts.push("envelope_exact_match=1".into());
+    }
+    // Hypothesis tokens (research, not Pass).
+    if live_words.get(12) == Some(&0xf) {
+        parts.push("hypothesis_live_prop_count_15_or_framing=1".into());
+    }
+    if pure_words.len() != live_words.len() {
+        parts.push("hypothesis_live_dump_longer_or_padded=1".into());
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Track F/G — live C2 cmdbuf semantic map + cmdlist msg constants (research)
+// ---------------------------------------------------------------------------
+
+/// Live C2 cmdlist slot message size field (`0x70` = 112 B) — matches 28-word cmdbuf.
+///
+/// Public kernel/driver research constant only; **not** a packing root-cause claim.
+pub const C2_LIVE_CMDLIST_MSG_SIZE_BYTES: u32 = 0x70;
+
+/// Expected live C2 cmdbuf dword count (112 B / 4).
+pub const C2_LIVE_CMDBUF_WORD_COUNT: usize = 28;
+
+/// Pure shim START_NPU dword count for xrt3 + content 1688 (header + 20 data).
+pub const C2_PURE_START_NPU_WORD_COUNT: usize = 21;
+
+/// Word index of instr buffer lo in the locked live C2 cmdbuf dump (research).
+pub const C2_LIVE_INSTR_LO_WORD_IDX: usize = 1;
+/// Word index of instruction size (`0x698`) in the locked live dump.
+pub const C2_LIVE_INSTR_SIZE_WORD_IDX: usize = 7;
+/// Word index of research marker `0xf` (≠ invent live `prop_count=15`).
+pub const C2_LIVE_WORD12_MARKER_IDX: usize = 12;
+/// Word index of n_bos-like token `3` immediately after word12 marker.
+pub const C2_LIVE_N_BOS_WORD_IDX: usize = 13;
+/// Word index of IFM paddr lo in the locked live dump.
+pub const C2_LIVE_IFM_LO_WORD_IDX: usize = 18;
+
+/// Live C2 cmdlist slot message words (6 × u32) from operator dmesg 2026-07-18.
+///
+/// Embedded for offline tests. Research only — never EXEC / never invent fill_slot body.
+#[must_use]
+pub fn c2_live_cmdlist_msg_words_embedded() -> &'static [u32] {
+    &[
+        0x0000_0000,
+        0x0000_0000,
+        0x0400_0000,
+        0x0000_0000,
+        0x0000_0070, // size = 0x70 = 112 B (cmdbuf length)
+        0x0000_0001,
+    ]
+}
+
+/// Semantic map of the live 28-word C2 cmdbuf dump (research, not Pass).
+///
+/// Field indices are **unit-locked** against `c2_live_cmdbuf_words_embedded` and
+/// the operator fixture. Framing differs from pure START_NPU (21 words): this is
+/// a **cmdlist-slot view**, not proof that pure `prop_count` should change.
+///
+/// **Ctrl paddr** (`c2_live_io_paddrs_locked` fifth value) is **not** in the
+/// live dump (words 24–27 are zero on locked C2) — only instr + IFM/WTS/OFM.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct C2LiveCmdbufMap {
+    /// Dword count of the live dump.
+    pub live_word_count: usize,
+    /// Length delta vs pure START_NPU rebuild (live − pure words). **Not**
+    /// proven prefix layout — extra dwords may be suffix/interleave/cmdlist.
+    pub suspected_framing_extra_words: usize,
+    /// Instruction buffer device address when lo/hi pair present **and** valid.
+    pub instr_addr: Option<u64>,
+    /// START_NPU / instr size at locked index 7 only (`0x698` == 1688 content).
+    pub instr_size: Option<u32>,
+    /// Word12 research marker value when present (`0xf` on locked C2 dump).
+    pub word12_marker: Option<u32>,
+    /// n_bos-like token after word12 (`3` on locked C2 = IFM/WTS/OFM).
+    pub n_bos_token: Option<u32>,
+    /// IFM host/device paddr when present at locked indices **and** valid.
+    pub ifm_paddr: Option<u64>,
+    /// WTS paddr when present and valid.
+    pub wts_paddr: Option<u64>,
+    /// OFM paddr when present and valid.
+    pub ofm_paddr: Option<u64>,
+    /// True only when **all four** expect fields are `Some` + valid, live paddrs
+    /// match them, and instr size is content 1688 (`0x698`). Partial expects
+    /// never set this (fail-closed full logical match). Soft note also prints
+    /// legacy alias `logical_paddrs_match_pure=` with the same 0/1 value.
+    pub logical_paddrs_match_expect: bool,
+    /// Envelope byte/word exact match pure vs live (`false` on locked C2).
+    pub envelope_exact_match: bool,
+    /// True when `pure_bo` was provided but `len % 4 != 0` (envelope forced false).
+    pub pure_bo_unaligned: bool,
+}
+
+impl C2LiveCmdbufMap {
+    /// Soft research note (always honesty tokens; never Pass / C-ready).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "c2_live_cmdbuf_map".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!(
+                "envelope_exact_match={}",
+                u8::from(self.envelope_exact_match)
+            ),
+            format!("live_words={}", self.live_word_count),
+            format!(
+                "suspected_framing_extra_words={}",
+                self.suspected_framing_extra_words
+            ),
+            // Framing length delta alias (docs may still say "framing +N words").
+            format!("framing_len_delta={}", self.suspected_framing_extra_words),
+            format!(
+                "logical_paddrs_match_expect={}",
+                u8::from(self.logical_paddrs_match_expect)
+            ),
+            // Legacy alias — same bit as `logical_paddrs_match_expect`.
+            format!(
+                "logical_paddrs_match_pure={}",
+                u8::from(self.logical_paddrs_match_expect)
+            ),
+        ];
+        if self.pure_bo_unaligned {
+            parts.push("pure_bo_unaligned=1".into());
+        }
+        if let Some(a) = self.instr_addr {
+            parts.push(format!("instr_addr=0x{a:x}"));
+        } else {
+            parts.push("instr_addr=absent".into());
+        }
+        if let Some(sz) = self.instr_size {
+            parts.push(format!("instr_size=0x{sz:x}"));
+            parts.push(format!("instr_size_dec={sz}"));
+        } else {
+            parts.push("instr_size=absent".into());
+        }
+        if let Some(m) = self.word12_marker {
+            parts.push(format!("word12_marker=0x{m:x}"));
+            if m == 0xf {
+                parts.push("word12_is_0xf=1".into());
+                // Research-only marker name (not invent live prop_count=15).
+                parts.push("word12_marker_0xf_research=1".into());
+                parts.push("hypothesis_live_prop_count_15_or_framing=1".into());
+                parts.push("do_not_invent_prop_count_15=1".into());
+            }
+        }
+        if let Some(n) = self.n_bos_token {
+            parts.push(format!("n_bos_token={n}"));
+        }
+        if let Some(p) = self.ifm_paddr {
+            parts.push(format!("ifm=0x{p:x}"));
+        }
+        if let Some(p) = self.wts_paddr {
+            parts.push(format!("wts=0x{p:x}"));
+        }
+        if let Some(p) = self.ofm_paddr {
+            parts.push(format!("ofm=0x{p:x}"));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Read LE u64 at word index `lo` (lo + hi dwords) from a u32 word list.
+#[must_use]
+fn u64_at_words(words: &[u32], lo_idx: usize) -> Option<u64> {
+    let lo = *words.get(lo_idx)?;
+    let hi = *words.get(lo_idx + 1)?;
+    Some(u64::from(lo) | (u64::from(hi) << 32))
+}
+
+/// Optional expected IO paddrs for [`decode_c2_live_cmdbuf_research`] logical match.
+///
+/// Full logical match (`logical_paddrs_match_expect`) requires **all four**
+/// fields `Some` and valid device paddrs. Partial expects never claim full match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct C2ExpectPaddrs {
+    /// Instruction buffer device address.
+    pub instr: Option<u64>,
+    /// IFM buffer paddr.
+    pub ifm: Option<u64>,
+    /// WTS buffer paddr.
+    pub wts: Option<u64>,
+    /// OFM buffer paddr.
+    pub ofm: Option<u64>,
+}
+
+impl C2ExpectPaddrs {
+    /// All four known C2 live values (instr + IFM/WTS/OFM). Ctrl is **not** in
+    /// the live cmdbuf dump (words 24–27 zero) — use `c2_live_io_paddrs_locked`.
+    #[must_use]
+    pub const fn from_c2_locked_io() -> Self {
+        let (instr, ifm, wts, ofm, _ctrl) = c2_live_io_paddrs_locked();
+        Self {
+            instr: Some(instr),
+            ifm: Some(ifm),
+            wts: Some(wts),
+            ofm: Some(ofm),
+        }
+    }
+
+    /// True when any field is `Some` (does **not** imply full logical match).
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.instr.is_some() || self.ifm.is_some() || self.wts.is_some() || self.ofm.is_some()
+    }
+
+    /// True when all four fields are `Some`.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.instr.is_some() && self.ifm.is_some() && self.wts.is_some() && self.ofm.is_some()
+    }
+
+    /// True when complete and every present value is a valid device paddr.
+    #[must_use]
+    pub const fn is_complete_and_valid(self) -> bool {
+        match (self.instr, self.ifm, self.wts, self.ofm) {
+            (Some(i), Some(a), Some(b), Some(c)) => {
+                is_valid_device_paddr(i)
+                    && is_valid_device_paddr(a)
+                    && is_valid_device_paddr(b)
+                    && is_valid_device_paddr(c)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Exact paddr equality only when both sides are `Some` (no None="match anything").
+#[must_use]
+fn opt_paddr_eq(expect: Option<u64>, got: Option<u64>) -> bool {
+    match (expect, got) {
+        (Some(e), Some(g)) => e == g,
+        _ => false,
+    }
+}
+
+/// Content instr size locked on C2 dump word7 (`0x698` == 1688 decimal).
+const C2_LIVE_INSTR_SIZE_CONTENT: u32 = 0x698; // == 1688 content bytes
+
+/// Decode live C2 cmdbuf words into a semantic research map.
+///
+/// [`C2ExpectPaddrs`] gates `logical_paddrs_match_expect` only when **all four**
+/// expects are present + valid and live paddrs (also validated) match + size
+/// is content 1688. Never invents paddrs when absent from dump.
+///
+/// `pure_bo` when provided sets `envelope_exact_match` via word diff; unaligned
+/// BO (`len % 4 != 0`) forces `envelope_exact_match=false` + `pure_bo_unaligned`.
+#[must_use]
+pub fn decode_c2_live_cmdbuf_research(
+    live_words: &[u32],
+    pure_bo: Option<&[u8]>,
+    expect: C2ExpectPaddrs,
+) -> C2LiveCmdbufMap {
+    let mut m = C2LiveCmdbufMap {
+        live_word_count: live_words.len(),
+        suspected_framing_extra_words: live_words
+            .len()
+            .saturating_sub(C2_PURE_START_NPU_WORD_COUNT),
+        ..C2LiveCmdbufMap::default()
+    };
+
+    // Locked indices from C2 fixture only (short dump → fields stay None).
+    if live_words.len() >= C2_LIVE_CMDBUF_WORD_COUNT {
+        m.instr_addr =
+            u64_at_words(live_words, C2_LIVE_INSTR_LO_WORD_IDX).and_then(some_valid_device_paddr);
+        if let Some(&sz) = live_words.get(C2_LIVE_INSTR_SIZE_WORD_IDX) {
+            m.instr_size = Some(sz);
+        }
+        m.word12_marker = live_words.get(C2_LIVE_WORD12_MARKER_IDX).copied();
+        m.n_bos_token = live_words.get(C2_LIVE_N_BOS_WORD_IDX).copied();
+        m.ifm_paddr =
+            u64_at_words(live_words, C2_LIVE_IFM_LO_WORD_IDX).and_then(some_valid_device_paddr);
+        m.wts_paddr =
+            u64_at_words(live_words, C2_LIVE_IFM_LO_WORD_IDX + 2).and_then(some_valid_device_paddr);
+        m.ofm_paddr =
+            u64_at_words(live_words, C2_LIVE_IFM_LO_WORD_IDX + 4).and_then(some_valid_device_paddr);
+    }
+    // No bare `contains(0x698)` short-dump size invent — size only at locked idx.
+
+    // size_ok: content 1688 only (`0x698 == 1688`).
+    let size_ok = m.instr_size == Some(C2_LIVE_INSTR_SIZE_CONTENT);
+    m.logical_paddrs_match_expect = expect.is_complete_and_valid()
+        && opt_paddr_eq(expect.instr, m.instr_addr)
+        && opt_paddr_eq(expect.ifm, m.ifm_paddr)
+        && opt_paddr_eq(expect.wts, m.wts_paddr)
+        && opt_paddr_eq(expect.ofm, m.ofm_paddr)
+        && size_ok;
+
+    if let Some(bo) = pure_bo {
+        if bo.len() % 4 != 0 {
+            m.pure_bo_unaligned = true;
+            m.envelope_exact_match = false;
+            m.suspected_framing_extra_words = live_words.len().saturating_sub(bo.len() / 4);
+        } else {
+            let pure_words: Vec<u32> = bo
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let d = diff_u32_word_lists(&pure_words, live_words);
+            m.envelope_exact_match = d.first_mismatch.is_none() && d.left_len == d.right_len;
+            m.suspected_framing_extra_words = live_words.len().saturating_sub(pure_words.len());
+        }
+    } else {
+        m.envelope_exact_match = false;
+    }
+    m
+}
+
+/// Convenience: map locked embedded live dump vs pure rebuild for C2 paddrs.
+///
+/// Research helper — does **not** submit. Always soft; never Pass.
+#[must_use]
+pub fn decode_c2_live_cmdbuf_vs_pure_rebuild(
+    pure_bo: &[u8],
+    expect: C2ExpectPaddrs,
+) -> C2LiveCmdbufMap {
+    decode_c2_live_cmdbuf_research(c2_live_cmdbuf_words_embedded(), Some(pure_bo), expect)
+}
+
+/// Soft note for cmdlist msg fixture (size field + honesty).
+///
+/// `msg_size_matches_expected` compares word[4] to [`C2_LIVE_CMDLIST_MSG_SIZE_BYTES`]
+/// (`0x70`). Legacy alias `msg_size_matches_cmdbuf=` prints the same bit (the
+/// constant equals locked 28×4 live cmdbuf bytes — not a measured live slice).
+#[must_use]
+pub fn format_c2_cmdlist_msg_research_note(msg_words: &[u32]) -> String {
+    let mut parts = vec![
+        "c2_cmdlist_msg_research".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "invent_pass=0".into(),
+        format!("msg_words={}", msg_words.len()),
+    ];
+    // Size field at index 4 in locked fixture.
+    if let Some(&sz) = msg_words.get(4) {
+        let matches = sz == C2_LIVE_CMDLIST_MSG_SIZE_BYTES;
+        parts.push(format!("msg_size_field=0x{sz:x}"));
+        parts.push(format!("msg_size_matches_expected={}", u8::from(matches)));
+        // Legacy alias (same bit as matches_expected).
+        parts.push(format!("msg_size_matches_cmdbuf={}", u8::from(matches)));
+        parts.push(format!("cmdbuf_bytes_from_msg={sz}"));
+    } else {
+        parts.push("msg_size_field=absent".into());
+    }
+    parts.push(format!(
+        "expected_cmdlist_msg_size=0x{C2_LIVE_CMDLIST_MSG_SIZE_BYTES:x}"
+    ));
+    // Cross-check constant vs locked embed length (research lock).
+    parts.push(format!(
+        "cmdbuf_embed_bytes={}",
+        c2_live_cmdbuf_words_embedded().len() * 4
+    ));
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Track H — offline aiebu rela / ctrltext audit with known live paddrs
+// ---------------------------------------------------------------------------
+
+/// Offline rela+ctrltext audit report (userspace patch path only).
+///
+/// **Never** claims Pass / `ran_on_npu` / C-ready. Soft skip when ELF missing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct C2RelaPaddrAudit {
+    /// True when ELF bytes were provided and looked like aiebu.
+    pub elf_present: bool,
+    /// `parse_elf32_rela_dyn` count when parsed.
+    pub rela_count: Option<usize>,
+    /// Patch+classic walk succeeded (overwrite mode).
+    pub patched_ctrltext_walk_ok: bool,
+    /// Patched ctrltext length when walk ran.
+    pub patched_ctrltext_len: Option<usize>,
+    /// Patched ctrltext bytes when patch succeeded (even if classic walk failed).
+    /// Enables single-patch profile (Track K) without a second rela write.
+    pub patched_ctrltext: Option<Vec<u8>>,
+    /// Detail / error token (never empty when not ok and elf present).
+    pub detail: String,
+}
+
+impl C2RelaPaddrAudit {
+    /// Soft research note.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "c2_rela_paddr_audit".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!("elf_present={}", u8::from(self.elf_present)),
+            format!(
+                "patched_ctrltext_walk_ok={}",
+                u8::from(self.patched_ctrltext_walk_ok)
+            ),
+        ];
+        if let Some(n) = self.rela_count {
+            parts.push(format!("rela_count={n}"));
+            if n > 0 {
+                // Prefer checklist vocabulary; keep short alias for greppers.
+                parts.push("userspace_elf_rela_ok=1".into());
+                parts.push("userspace_rela_ok=1".into());
+            }
+        } else {
+            parts.push("rela_count=absent".into());
+        }
+        if let Some(len) = self.patched_ctrltext_len {
+            parts.push(format!("patched_ctrltext_len={len}"));
+        }
+        if self.patched_ctrltext_walk_ok {
+            parts.push("userspace_patch_ok_fw_load_still_open=1".into());
+        }
+        if !self.detail.is_empty() {
+            // Sanitize detail for soft-token integrity (no whitespace / `=` / newline).
+            let safe: String = self
+                .detail
+                .chars()
+                .map(|c| match c {
+                    ' ' | '\t' | '\n' | '\r' | '=' | ';' | '[' | ']' => '_',
+                    c if c.is_ascii_graphic() => c,
+                    _ => '_',
+                })
+                .collect();
+            parts.push(format!("detail={safe}"));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Patch staged aiebu ELF with known live IO paddrs and validate classic ctrltext.
+///
+/// Offline only. Empty `elf` → soft `elf_present=0` (CI without staged asset).
+/// Invalid paddrs (`0` / `u64::MAX`) → refuse patch (`invalid_live_paddr`).
+/// Does **not** invent paddrs; caller supplies C2-known values.
+#[must_use]
+pub fn audit_aiebu_rela_with_live_paddrs(
+    elf: &[u8],
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    ctrl: u64,
+) -> C2RelaPaddrAudit {
+    if elf.is_empty() {
+        return C2RelaPaddrAudit {
+            elf_present: false,
+            detail: "elf_empty_skip".into(),
+            ..C2RelaPaddrAudit::default()
+        };
+    }
+    if !is_aiebu_elf_ctrltext(elf) {
+        return C2RelaPaddrAudit {
+            elf_present: true,
+            detail: "not_aiebu_elf_ctrltext".into(),
+            ..C2RelaPaddrAudit::default()
+        };
+    }
+    // Refuse invalid device paddrs before patch (classic walk does not check addrs).
+    if !is_valid_device_paddr(ifm)
+        || !is_valid_device_paddr(wts)
+        || !is_valid_device_paddr(ofm)
+        || !is_valid_device_paddr(ctrl)
+    {
+        let rela_count = parse_elf32_rela_dyn(elf).ok().map(|r| r.len());
+        return C2RelaPaddrAudit {
+            elf_present: true,
+            rela_count,
+            patched_ctrltext_walk_ok: false,
+            detail: "invalid_live_paddr".into(),
+            ..C2RelaPaddrAudit::default()
+        };
+    }
+    let rela_count = parse_elf32_rela_dyn(elf).ok().map(|r| r.len());
+    let patched = match patch_aiebu_elf_ctrltext_with_bos_ex(
+        elf,
+        ifm,
+        wts,
+        ofm,
+        ctrl,
+        LabRelaMode::Overwrite,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return C2RelaPaddrAudit {
+                elf_present: true,
+                rela_count,
+                patched_ctrltext_walk_ok: false,
+                detail: format!("patch_failed:{e}"),
+                ..C2RelaPaddrAudit::default()
+            };
+        }
+    };
+    let expect_staged = patched.len() == 1688;
+    let plen = patched.len();
+    match validate_patched_ctrltext_classic(&patched, expect_staged) {
+        Ok(_) => C2RelaPaddrAudit {
+            elf_present: true,
+            rela_count,
+            patched_ctrltext_walk_ok: true,
+            patched_ctrltext_len: Some(plen),
+            patched_ctrltext: Some(patched),
+            detail: "classic_walk_ok".into(),
+        },
+        Err(e) => C2RelaPaddrAudit {
+            elf_present: true,
+            rela_count,
+            patched_ctrltext_walk_ok: false,
+            patched_ctrltext_len: Some(plen),
+            patched_ctrltext: Some(patched),
+            detail: format!("walk_failed:{e}"),
+        },
+    }
+}
+
+/// C2 live IO paddrs from operator last_apply 2026-07-18 (unit-locked research).
+///
+/// Order: `(instr_xdna, ifm, wts, ofm, ctrl)`.
+#[must_use]
+pub const fn c2_live_io_paddrs_locked() -> (u64, u64, u64, u64, u64) {
+    (
+        0x402_0000,
+        0x7fda_3b83_5000,
+        0x7fda_3b66_b000,
+        0x7fda_3b83_4000,
+        0x7fda_3b82_c000,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Track K — instr/PDI content residual (FW-visible load payload after rela)
+// ---------------------------------------------------------------------------
+
+/// Pure SHA-256 of `data` as lowercase hex (64 chars). No extra crate dep.
+///
+/// Research digests only — **not** a Pass token and **not** FW PDI decode.
+/// Empty string when [`sha256_digest`] refuses (oversized input).
+#[must_use]
+pub fn sha256_hex_lower(data: &[u8]) -> String {
+    let Some(d) = sha256_digest(data) else {
+        return String::new();
+    };
+    let mut s = String::with_capacity(64);
+    for b in d {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Pure SHA-256 digest (32 bytes). Public for unit locks; prefer [`sha256_hex_lower`].
+///
+/// Returns `None` when `data` exceeds [`MAX_INSTRUCTION_BLOB_BYTES`] (64 MiB lab
+/// ceiling) so callers cannot force multi-GiB clones at this boundary.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::needless_range_loop
+)]
+pub fn sha256_digest(data: &[u8]) -> Option<[u8; 32]> {
+    // Minimal FIPS-180-4 SHA-256 (offline research digests; no ring/sha2 dep).
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    if (data.len() as u64) > MAX_INSTRUCTION_BLOB_BYTES {
+        return None;
+    }
+    let mut h: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    // wrapping_mul: length already capped at MAX_INSTRUCTION_BLOB_BYTES (<< 2^61).
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    debug_assert_eq!(msg.len() % 64, 0);
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0_u32; 64];
+        for i in 0..16 {
+            let j = i * 4;
+            w[i] = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0_u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+    }
+    Some(out)
+}
+
+/// Classic v0.1 opcode histogram (research profile; not FW private decode).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TxnOpOpcodeProfile {
+    /// Count of `XAIE_IO_WRITE` (0).
+    pub write: u32,
+    /// Count of `XAIE_IO_BLOCKWRITE` (1).
+    pub block_write: u32,
+    /// Count of `XAIE_IO_BLOCKSET` (2).
+    pub block_set: u32,
+    /// Count of `XAIE_IO_MASKWRITE` (3).
+    pub mask_write: u32,
+    /// Count of `XAIE_IO_MASKPOLL` (4).
+    pub mask_poll: u32,
+    /// Count of `XAIE_IO_NOOP` (5).
+    pub noop: u32,
+    /// Count of `XAIE_IO_PREEMPT` (6).
+    pub preempt: u32,
+    /// Count of `XAIE_IO_MASKPOLL_BUSY` (7).
+    pub mask_poll_busy: u32,
+    /// Count of opcodes **not** in classic `0..=7` (includes custom `>=128` and gaps 8..=127).
+    pub custom_or_other: u32,
+    /// Total ops counted.
+    pub total: u32,
+}
+
+impl TxnOpOpcodeProfile {
+    /// Build histogram from walked classic ops.
+    #[must_use]
+    pub fn from_ops(ops: &[super::txn::XaieTxnOp]) -> Self {
+        let mut p = Self::default();
+        for op in ops {
+            p.total = p.total.saturating_add(1);
+            match op.opcode {
+                0 => p.write = p.write.saturating_add(1),
+                1 => p.block_write = p.block_write.saturating_add(1),
+                2 => p.block_set = p.block_set.saturating_add(1),
+                3 => p.mask_write = p.mask_write.saturating_add(1),
+                4 => p.mask_poll = p.mask_poll.saturating_add(1),
+                5 => p.noop = p.noop.saturating_add(1),
+                6 => p.preempt = p.preempt.saturating_add(1),
+                7 => p.mask_poll_busy = p.mask_poll_busy.saturating_add(1),
+                _ => p.custom_or_other = p.custom_or_other.saturating_add(1),
+            }
+        }
+        p
+    }
+
+    /// Compact soft tokens (`op_write=N …`).
+    #[must_use]
+    pub fn format_soft_tokens(&self) -> String {
+        format!(
+            "op_total={} op_write={} op_block_write={} op_block_set={} op_mask_write={} op_mask_poll={} op_noop={} op_preempt={} op_mask_poll_busy={} op_custom_or_other={}",
+            self.total,
+            self.write,
+            self.block_write,
+            self.block_set,
+            self.mask_write,
+            self.mask_poll,
+            self.noop,
+            self.preempt,
+            self.mask_poll_busy,
+            self.custom_or_other
+        )
+    }
+}
+
+/// Profile of FW-visible instruction payload bytes (ctrltext / classic txn).
+///
+/// Built only from public classic walk + SHA-256 of payload bytes. **Never**
+/// invents vendor post-patch or private PDI fields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstrPayloadProfile {
+    /// Payload byte length (ctrltext or raw txn).
+    pub payload_len: usize,
+    /// Lowercase SHA-256 hex of payload bytes (empty payload → empty string).
+    pub payload_sha256_hex: String,
+    /// Blob kind token (`classic_txn_v01` / `txn_header_only` / `unknown_raw` / …).
+    pub blob_kind: String,
+    /// Classic walk succeeded.
+    pub classic_walk_ok: bool,
+    /// Header `num_ops` when classic or header-only.
+    pub txn_num_ops: Option<u32>,
+    /// Header `txn_size` when classic or header-only.
+    pub txn_size: Option<u32>,
+    /// Header `dev_gen` when present.
+    pub txn_dev_gen: Option<u8>,
+    /// Header cols when present.
+    pub txn_num_cols: Option<u8>,
+    /// Header rows when present.
+    pub txn_num_rows: Option<u8>,
+    /// Opcode histogram when classic walk OK.
+    pub op_profile: Option<TxnOpOpcodeProfile>,
+    /// Staged mladf classic profile (1688 B / 40 ops).
+    pub staged_mladf_classic_profile: bool,
+}
+
+impl InstrPayloadProfile {
+    /// Soft research note (always honesty tokens).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "instr_payload_profile".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!("payload_len={}", self.payload_len),
+            format!("blob_kind={}", self.blob_kind),
+            format!("classic_walk_ok={}", u8::from(self.classic_walk_ok)),
+            format!(
+                "staged_mladf_classic_profile={}",
+                u8::from(self.staged_mladf_classic_profile)
+            ),
+        ];
+        if self.payload_sha256_hex.is_empty() {
+            parts.push("payload_sha256=absent".into());
+        } else {
+            parts.push(format!("payload_sha256={}", self.payload_sha256_hex));
+        }
+        if let Some(n) = self.txn_num_ops {
+            parts.push(format!("txn_num_ops={n}"));
+        }
+        if let Some(sz) = self.txn_size {
+            parts.push(format!("txn_size={sz}"));
+        }
+        if let Some(g) = self.txn_dev_gen {
+            parts.push(format!("txn_dev_gen={g}"));
+        }
+        if let Some(c) = self.txn_num_cols {
+            parts.push(format!("txn_num_cols={c}"));
+        }
+        if let Some(r) = self.txn_num_rows {
+            parts.push(format!("txn_num_rows={r}"));
+        }
+        if let Some(ref op) = self.op_profile {
+            parts.push(op.format_soft_tokens());
+        }
+        // Public in-tree headers do not expose PDI image decode for APP_LOAD.
+        parts.push(format!("pdi_marker_public={PUBLIC_PDI_MARKER_TOKEN}"));
+        parts.join(" ")
+    }
+}
+
+/// Profile raw instruction payload bytes (already peeled ctrltext or classic txn).
+///
+/// Empty → zeroed profile with `blob_kind=empty`. Does **not** patch ELF.
+#[must_use]
+pub fn profile_instr_payload_bytes(payload: &[u8]) -> InstrPayloadProfile {
+    if payload.is_empty() {
+        return InstrPayloadProfile {
+            blob_kind: "empty".into(),
+            ..InstrPayloadProfile::default()
+        };
+    }
+    if (payload.len() as u64) > MAX_INSTRUCTION_BLOB_BYTES {
+        return InstrPayloadProfile {
+            payload_len: payload.len(),
+            blob_kind: "oversized_refused".into(),
+            ..InstrPayloadProfile::default()
+        };
+    }
+    let kind = classify_instruction_blob(payload);
+    let mut p = InstrPayloadProfile {
+        payload_len: payload.len(),
+        payload_sha256_hex: sha256_hex_lower(payload),
+        ..InstrPayloadProfile::default()
+    };
+    match kind {
+        InstructionBlobKind::ClassicTxnV01 { header, ops } => {
+            p.blob_kind = "classic_txn_v01".into();
+            p.classic_walk_ok = true;
+            p.txn_num_ops = Some(header.num_ops);
+            p.txn_size = Some(header.txn_size);
+            p.txn_dev_gen = Some(header.dev_gen);
+            p.txn_num_cols = Some(header.num_cols);
+            p.txn_num_rows = Some(header.num_rows);
+            p.staged_mladf_classic_profile = header.is_staged_mladf_classic_profile()
+                && payload.len() == super::txn::STAGED_MLADF_CLASSIC_INSTR_BYTES;
+            p.op_profile = Some(TxnOpOpcodeProfile::from_ops(&ops));
+        }
+        InstructionBlobKind::TxnHeaderOnly { header, .. } => {
+            p.blob_kind = "txn_header_only".into();
+            p.classic_walk_ok = false;
+            p.txn_num_ops = Some(header.num_ops);
+            p.txn_size = Some(header.txn_size);
+            p.txn_dev_gen = Some(header.dev_gen);
+            p.txn_num_cols = Some(header.num_cols);
+            p.txn_num_rows = Some(header.num_rows);
+            // Mirror classic arm: header profile + payload length (header.validate
+            // already ties txn_size to buffer len when classification reached here).
+            p.staged_mladf_classic_profile = header.is_staged_mladf_classic_profile()
+                && payload.len() == super::txn::STAGED_MLADF_CLASSIC_INSTR_BYTES;
+        }
+        InstructionBlobKind::Aie2ElfCtrltext { .. } => {
+            // Caller should peel; still classify honestly if raw ELF slipped in.
+            p.blob_kind = "aie2_elf_ctrltext_unpeeled".into();
+            p.classic_walk_ok = false;
+        }
+        InstructionBlobKind::UnknownRaw { len } => {
+            p.blob_kind = "unknown_raw".into();
+            p.payload_len = len;
+            p.classic_walk_ok = false;
+        }
+    }
+    p
+}
+
+/// Full offline research report: what FW load path sees after rela×N + live paddrs.
+///
+/// Combines [`audit_aiebu_rela_with_live_paddrs`] with payload profile of the
+/// **patched** ctrltext. Always soft; never Pass / C-ready / invent vendor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstrPdiLoadResearch {
+    /// Underlying rela/patch audit.
+    pub rela_audit: C2RelaPaddrAudit,
+    /// Profile of patched ctrltext when patch+walk produced bytes.
+    pub payload: Option<InstrPayloadProfile>,
+    /// True when userspace ELF+rela+classic walk OK (FW load residual still open).
+    pub userspace_ok_fw_load_open: bool,
+    /// Stable detail token.
+    pub detail: String,
+}
+
+impl InstrPdiLoadResearch {
+    /// Soft research note (always honesty + `userspace_ok_fw_load_open=`).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "instr_pdi_load_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!(
+                "userspace_ok_fw_load_open={}",
+                u8::from(self.userspace_ok_fw_load_open)
+            ),
+        ];
+        // Embed rela audit key bits without double-prefix spam.
+        // Track H token `userspace_patch_ok_fw_load_still_open` = walk_ok alone
+        // (stricter `userspace_ok_fw_load_open` also needs rela>0 + classic profile).
+        parts.push(format!(
+            "elf_present={}",
+            u8::from(self.rela_audit.elf_present)
+        ));
+        parts.push(format!(
+            "patched_ctrltext_walk_ok={}",
+            u8::from(self.rela_audit.patched_ctrltext_walk_ok)
+        ));
+        if self.rela_audit.patched_ctrltext_walk_ok {
+            parts.push("userspace_patch_ok_fw_load_still_open=1".into());
+        } else {
+            parts.push("userspace_patch_ok_fw_load_still_open=0".into());
+        }
+        if let Some(n) = self.rela_audit.rela_count {
+            parts.push(format!("rela_count={n}"));
+            if n > 0 {
+                parts.push("userspace_elf_rela_ok=1".into());
+            }
+        }
+        if let Some(len) = self.rela_audit.patched_ctrltext_len {
+            parts.push(format!("patched_ctrltext_len={len}"));
+        }
+        if let Some(ref pay) = self.payload {
+            parts.push(format!("payload_len={}", pay.payload_len));
+            parts.push(format!("blob_kind={}", pay.blob_kind));
+            parts.push(format!("classic_walk_ok={}", u8::from(pay.classic_walk_ok)));
+            if !pay.payload_sha256_hex.is_empty() {
+                parts.push(format!("payload_sha256={}", pay.payload_sha256_hex));
+            }
+            if let Some(n) = pay.txn_num_ops {
+                parts.push(format!("txn_num_ops={n}"));
+            }
+            if let Some(sz) = pay.txn_size {
+                parts.push(format!("txn_size={sz}"));
+            }
+            parts.push(format!(
+                "staged_mladf_classic_profile={}",
+                u8::from(pay.staged_mladf_classic_profile)
+            ));
+            if let Some(ref op) = pay.op_profile {
+                parts.push(op.format_soft_tokens());
+            }
+        } else {
+            parts.push("payload=absent".into());
+        }
+        parts.push(format!("pdi_marker_public={PUBLIC_PDI_MARKER_TOKEN}"));
+        if !self.detail.is_empty() {
+            let safe: String = self
+                .detail
+                .chars()
+                .map(|c| match c {
+                    ' ' | '\t' | '\n' | '\r' | '=' | ';' | '[' | ']' => '_',
+                    c if c.is_ascii_graphic() => c,
+                    _ => '_',
+                })
+                .collect();
+            parts.push(format!("detail={safe}"));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Patch aiebu ELF with live IO paddrs and profile the FW-visible ctrltext payload.
+///
+/// Offline only. Single patch via [`audit_aiebu_rela_with_live_paddrs`] (Overwrite);
+/// staged size is inferred inside the audit from patched length. Profiles the
+/// **same** patched bytes (no second rela write). Empty ELF → soft skip.
+/// Invalid paddrs refuse. Always soft; never Pass / C-ready.
+#[must_use]
+pub fn profile_instr_payload_after_rela(
+    elf: &[u8],
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    ctrl: u64,
+) -> InstrPdiLoadResearch {
+    let rela_audit = audit_aiebu_rela_with_live_paddrs(elf, ifm, wts, ofm, ctrl);
+    let payload = rela_audit
+        .patched_ctrltext
+        .as_deref()
+        .map(profile_instr_payload_bytes);
+    let userspace_ok = rela_audit.patched_ctrltext_walk_ok
+        && rela_audit.rela_count.is_some_and(|n| n > 0)
+        && payload.as_ref().is_some_and(|p| p.classic_walk_ok);
+    let detail = if elf.is_empty() {
+        "elf_empty_skip".into()
+    } else if userspace_ok {
+        "userspace_ok_fw_load_open".into()
+    } else if rela_audit.patched_ctrltext_walk_ok {
+        "walk_ok_but_no_rela_or_profile".into()
+    } else {
+        rela_audit.detail.clone()
+    };
+    InstrPdiLoadResearch {
+        userspace_ok_fw_load_open: userspace_ok,
+        detail,
+        rela_audit,
+        payload,
+    }
+}
+
+/// Convenience: profile with locked C2 live IO paddrs (instr BO not needed for rela).
+///
+/// Uses [`c2_live_io_paddrs_locked`] IFM/WTS/OFM/ctrl. Research only.
+#[must_use]
+pub fn profile_instr_payload_after_rela_c2_locked(elf: &[u8]) -> InstrPdiLoadResearch {
+    let (_instr, ifm, wts, ofm, ctrl) = c2_live_io_paddrs_locked();
+    profile_instr_payload_after_rela(elf, ifm, wts, ofm, ctrl)
+}
+
+// ---------------------------------------------------------------------------
+// Track L — public FW APP_LOAD / PDI / partition load surface (no private PDI)
+// ---------------------------------------------------------------------------
+
+/// Journal / mailbox code for Failed-cmd APP_LOAD PDI fail (`0x3000003`).
+///
+/// [`aie2_fw_status_name`] returns **`APP_LOAD_PDI_FAIL`** (public status label).
+/// Does **not** decode a PDI image layout.
+pub const AIE2_FW_APP_LOAD_PDI_FAIL: u32 = 0x3_000_003;
+
+/// Journal / mailbox code: chain `Status 0x4000003`.
+///
+/// [`aie2_fw_status_name`] returns **`AIE2_STATUS_INVALID_PARAM`**.
+pub const AIE2_FW_INVALID_PARAM: u32 = 0x4_000_003;
+
+/// Public in-tree PDI image marker token — always absent (no decoder).
+///
+/// SSoT for Track K + Track L soft notes (`pdi_marker_public=`).
+pub const PUBLIC_PDI_MARKER_TOKEN: &str = "marker_absent_public";
+
+/// Public partition/PDI load surface depth available offline without private blobs.
+///
+/// `status_name_only` = FW status **names** + hex codes from journal/docs only.
+pub const PUBLIC_PARTITION_SURFACE_TOKEN: &str = "status_name_only";
+
+/// Cap for journal paste fed to [`research_app_load_pdi_partition_from_journal`].
+///
+/// Matches classify env `XDNA2_LAB_JOURNAL_TEXT` ceiling (256 KiB). Oversized
+/// text is treated as **absent** (no invent codes) — same honesty as empty.
+pub const MAX_APP_LOAD_JOURNAL_TEXT_BYTES: usize = 256 * 1024;
+
+/// Offline research: what public headers/docs/journal say about FW APP_LOAD PDI /
+/// partition load — **beyond** staged classic 1688/40 content profile (Track K).
+///
+/// Honesty:
+/// - No private PDI binary layout decode.
+/// - No invent vendor post-patch / prop_count=15 / Pass / C-ready.
+/// - Userspace content green ≠ FW partition load OK ≠ C-ready.
+///
+/// **Construction:** prefer [`research_app_load_pdi_partition`] /
+/// [`research_app_load_pdi_partition_from_journal`] /
+/// [`research_app_load_pdi_partition_c2_locked`]. Those always set surface tokens
+/// to [`PUBLIC_PARTITION_SURFACE_TOKEN`] / [`PUBLIC_PDI_MARKER_TOKEN`].
+/// [`Default`] is honesty-safe (same surface tokens; all residual flags false).
+/// Field `pub` is for soft-note / unit access — do not overwrite surface tokens
+/// with empty strings in product paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; not a state machine
+pub struct AppLoadPdiPartitionResearch {
+    /// Failed-cmd status when journal/detail provided a literal hex.
+    pub failed_cmd_status: Option<u32>,
+    /// Chain/completion status when journal provided a literal hex.
+    pub chain_status: Option<u32>,
+    /// Locked live C2 dual pair (`0x3000003` + `0x4000003`).
+    pub c2_app_load_pair: bool,
+    /// Residual class is [`SiliconResidualClass::AppLoadPdiFailAfterAiebu`].
+    pub class_app_load_after_aiebu: bool,
+    /// Caller-supplied userspace content green (ELF+rela+classic walk).
+    /// Research only — never invents Pass.
+    pub userspace_content_ok: bool,
+    /// True when userspace content is green **and** FW APP_LOAD residual still open
+    /// (class and/or C2 journal pair). Dual residual honesty lock.
+    ///
+    /// Research/PRINT only — checklist Track L tokens are **class-gated** and do
+    /// **not** open on journal pair alone (see RESIDUAL / CMD_PAYLOAD).
+    pub fw_residual_open_after_userspace: bool,
+    /// Always [`PUBLIC_PARTITION_SURFACE_TOKEN`] from constructors / Default.
+    pub partition_surface_public: &'static str,
+    /// Always [`PUBLIC_PDI_MARKER_TOKEN`] from constructors / Default.
+    pub pdi_marker_public: &'static str,
+}
+
+impl Default for AppLoadPdiPartitionResearch {
+    fn default() -> Self {
+        Self {
+            failed_cmd_status: None,
+            chain_status: None,
+            c2_app_load_pair: false,
+            class_app_load_after_aiebu: false,
+            userspace_content_ok: false,
+            fw_residual_open_after_userspace: false,
+            partition_surface_public: PUBLIC_PARTITION_SURFACE_TOKEN,
+            pdi_marker_public: PUBLIC_PDI_MARKER_TOKEN,
+        }
+    }
+}
+
+impl AppLoadPdiPartitionResearch {
+    /// Soft research note (always honesty trio + public surface tokens).
+    ///
+    /// Emits constructor surface values; prefer research_* builders so tokens
+    /// stay locked to [`PUBLIC_PARTITION_SURFACE_TOKEN`] /
+    /// [`PUBLIC_PDI_MARKER_TOKEN`].
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "app_load_pdi_partition_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            format!("partition_surface_public={}", self.partition_surface_public),
+            format!("pdi_marker_public={}", self.pdi_marker_public),
+            format!(
+                "class_app_load_after_aiebu={}",
+                u8::from(self.class_app_load_after_aiebu)
+            ),
+            format!(
+                "userspace_content_ok={}",
+                u8::from(self.userspace_content_ok)
+            ),
+            format!(
+                "fw_residual_open_after_userspace={}",
+                u8::from(self.fw_residual_open_after_userspace)
+            ),
+            format!("c2_app_load_pair={}", u8::from(self.c2_app_load_pair)),
+        ];
+        match self.failed_cmd_status {
+            Some(c) => {
+                parts.push(format!("failed_cmd=0x{c:x}"));
+                parts.push(format!("failed_cmd_name={}", aie2_fw_status_name(c)));
+            }
+            None => parts.push("failed_cmd=absent".into()),
+        }
+        match self.chain_status {
+            Some(c) => {
+                parts.push(format!("chain_status=0x{c:x}"));
+                parts.push(format!("chain_name={}", aie2_fw_status_name(c)));
+            }
+            None => parts.push("chain_status=absent".into()),
+        }
+        // Public name surface: APP_LOAD_PDI_FAIL implies partition/PDI load step
+        // rejected the app — status **name** only, not an image field map.
+        if self.failed_cmd_status == Some(AIE2_FW_APP_LOAD_PDI_FAIL)
+            || self.class_app_load_after_aiebu
+        {
+            parts.push("public_fw_name_implies_pdi_load=1".into());
+        } else {
+            parts.push("public_fw_name_implies_pdi_load=0".into());
+        }
+        parts.join(" ")
+    }
+}
+
+/// Build Track L research from residual class + optional journal pair + userspace flag.
+///
+/// - Never invents journal codes when `journal` is `None` or fields absent.
+/// - `userspace_content_ok` is caller-supplied (e.g. Track K research bit) — not
+///   inferred from residual class alone.
+/// - `fw_residual_open_after_userspace` = `userspace_content_ok && (class || pair)`.
+/// - Always sets surface tokens to [`PUBLIC_PARTITION_SURFACE_TOKEN`] /
+///   [`PUBLIC_PDI_MARKER_TOKEN`].
+/// - Always soft; never Pass / C-ready.
+#[must_use]
+pub fn research_app_load_pdi_partition(
+    class: SiliconResidualClass,
+    journal: Option<&JournalFwStatusPair>,
+    userspace_content_ok: bool,
+) -> AppLoadPdiPartitionResearch {
+    let class_app = class.is_locked_app_load_after_aiebu();
+    let (failed, chain, pair) = journal.map_or((None, None, false), |j| {
+        (j.failed_cmd_status, j.chain_status, j.is_c2_app_load_pair())
+    });
+    let fw_open = userspace_content_ok && (class_app || pair);
+    AppLoadPdiPartitionResearch {
+        failed_cmd_status: failed,
+        chain_status: chain,
+        c2_app_load_pair: pair,
+        class_app_load_after_aiebu: class_app,
+        userspace_content_ok,
+        fw_residual_open_after_userspace: fw_open,
+        partition_surface_public: PUBLIC_PARTITION_SURFACE_TOKEN,
+        pdi_marker_public: PUBLIC_PDI_MARKER_TOKEN,
+    }
+}
+
+/// Parse optional journal/multi-line text then run [`research_app_load_pdi_partition`].
+///
+/// - Empty/whitespace journal → treated as absent (no invent).
+/// - Text longer than [`MAX_APP_LOAD_JOURNAL_TEXT_BYTES`] → treated as absent
+///   (`journal_text_oversized` path: no codes invented). Callers that need a
+///   loud refuse (classify env) still cap at the env boundary.
+#[must_use]
+pub fn research_app_load_pdi_partition_from_journal(
+    class: SiliconResidualClass,
+    journal_text: Option<&str>,
+    userspace_content_ok: bool,
+) -> AppLoadPdiPartitionResearch {
+    let pair = journal_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| s.len() <= MAX_APP_LOAD_JOURNAL_TEXT_BYTES)
+        .map(parse_journal_fw_status_pair);
+    research_app_load_pdi_partition(class, pair.as_ref(), userspace_content_ok)
+}
+
+/// Locked C2 journal paste used by unit tests (Failed-cmd + chain Status).
+///
+/// Research fixture text only — not a live journal read.
+#[must_use]
+pub fn c2_locked_app_load_journal_text() -> &'static str {
+    "amdxdna: Failed cmd idx 0, status 0x3000003\n\
+     amdxdna: Status 0x4000003\n"
+}
+
+/// Convenience: Track L research for locked APP_LOAD class + locked C2 journal pair.
+///
+/// `userspace_content_ok` defaults the dual-residual path (content green, FW open).
+#[must_use]
+pub fn research_app_load_pdi_partition_c2_locked(
+    userspace_content_ok: bool,
+) -> AppLoadPdiPartitionResearch {
+    research_app_load_pdi_partition_from_journal(
+        SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+        Some(c2_locked_app_load_journal_text()),
+        userspace_content_ok,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Track M — public PDI/partition evidence scan (maintain / closed lock)
+// ---------------------------------------------------------------------------
+
+/// Public offline evidence depth for PDI/partition load beyond status names.
+///
+/// Always [`PUBLIC_PARTITION_SURFACE_TOKEN`] (`status_name_only`) until in-tree
+/// public headers/docs expose decodeable PDI image fields or load ioctls beyond
+/// named FW status codes. **Do not** invent a stronger depth.
+pub const PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN: &str = PUBLIC_PARTITION_SURFACE_TOKEN;
+
+/// Count of **new** public PDI image / partition-load fields found beyond Track L.
+///
+/// Locked `0` from the **human offline research conclusion** (Track M maintain):
+/// in-tree `docs/` / `kernel/patches/` / `kernel/dkms/` / RESIDUAL notes had no
+/// decodeable PDI layout beyond status names. This constant encodes that audit —
+/// it is **not** produced by a runtime filesystem walk.
+///
+/// Runtime pure path ([`scan_public_pdi_partition_evidence`]) only re-checks
+/// [`aie2_fw_status_name`] + emits this locked bag. Bump only with real public
+/// evidence — never invent layout fields. Does **not** claim external XRT
+/// exhaustiveness.
+pub const PUBLIC_PDI_NEW_FIELDS_CLOSED: u8 = 0;
+
+/// Soft-note key for derived closed-scan bit (`scan_closed_no_new_public_fields=`).
+///
+/// Value is **derived** from fields in [`PublicPdiEvidenceScan::format_soft_note`]
+/// — never hard-coded `=1` when the bag is non-closed.
+pub const PUBLIC_PDI_SCAN_CLOSED_TOKEN_KEY: &str = "scan_closed_no_new_public_fields";
+
+/// Offline scan conclusion: public PDI/partition evidence beyond Track L.
+///
+/// Honesty:
+/// - No private PDI binary layout decode.
+/// - No invent vendor post-patch / prop_count=15 / Pass / C-ready / second unlock.
+/// - Closed scan (`new_public_pdi_fields=0`) **≠** FW load OK ≠ C-ready.
+///
+/// **Construction:** prefer [`scan_public_pdi_partition_evidence`] /
+/// [`scan_public_pdi_partition_evidence_closed`]. [`Default`] **delegates** to
+/// the same scan path (name-map re-check via [`aie2_fw_status_name`]).
+///
+/// Runtime pure API does **not** walk `docs/` or kernel trees — those were
+/// human-audited offline; this type locks the closed conclusion + status names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; not a state machine
+pub struct PublicPdiEvidenceScan {
+    /// Always [`PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN`] / [`PUBLIC_PARTITION_SURFACE_TOKEN`].
+    pub public_pdi_evidence_depth: &'static str,
+    /// New public fields beyond Track L status-name surface (`0` when closed).
+    pub new_public_pdi_fields: u8,
+    /// Always true from constructors / Default (`do_not_invent_pdi_layout=1`).
+    pub do_not_invent_pdi_layout: bool,
+    /// Always false — public image decode remains closed (Track L + M).
+    pub public_pdi_image_decode: bool,
+    /// Echo of Track L surface token (same value as depth when closed).
+    pub partition_surface_public: &'static str,
+    /// Echo of Track L marker token ([`PUBLIC_PDI_MARKER_TOKEN`]).
+    pub pdi_marker_public: &'static str,
+    /// Named APP_LOAD code still maps via [`aie2_fw_status_name`] only.
+    pub app_load_code_name_ok: bool,
+    /// Named INVALID_PARAM code still maps via [`aie2_fw_status_name`] only.
+    pub invalid_param_code_name_ok: bool,
+}
+
+impl Default for PublicPdiEvidenceScan {
+    fn default() -> Self {
+        // Same production path as scan — name_ok via aie2_fw_status_name.
+        scan_public_pdi_partition_evidence()
+    }
+}
+
+impl PublicPdiEvidenceScan {
+    /// True when this bag is the closed public-evidence conclusion (Track M).
+    ///
+    /// Used to derive `scan_closed_no_new_public_fields=` so a hostile hand-built
+    /// bag cannot emit closed=1 alongside non-zero new fields / decode.
+    ///
+    /// **Not** gated on `app_load_code_name_ok` / `invalid_param_code_name_ok` —
+    /// those are **diagnostic-only** status-name labels (always printed in the
+    /// soft note). Closed = no new public fields / no invent layout / no image
+    /// decode.
+    ///
+    /// **Depth intentionally omitted** (narrower than Track N/O): M closed does
+    /// **not** require `public_pdi_evidence_depth == status_name_only`. Track O
+    /// maintain reconfirm and Track N external closed **do** gate on depth —
+    /// O's depth check is authoritative for A–N maintain. Do not tighten M alone
+    /// without an explicit parity decision.
+    #[must_use]
+    pub fn is_scan_closed_no_new_public_fields(&self) -> bool {
+        self.new_public_pdi_fields == 0
+            && !self.public_pdi_image_decode
+            && self.do_not_invent_pdi_layout
+    }
+
+    /// Soft research note (always honesty trio; closed bit **derived** from fields).
+    ///
+    /// String field values are passed through [`sanitize_soft_note_field_value`]
+    /// so hostile hand-built bags cannot inject extra whitespace tokens.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let closed = u8::from(self.is_scan_closed_no_new_public_fields());
+        let mut parts = vec![
+            "public_pdi_evidence_scan".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!(
+                "public_pdi_evidence_depth={}",
+                sanitize_soft_note_field_value(self.public_pdi_evidence_depth)
+            ),
+            format!("new_public_pdi_fields={}", self.new_public_pdi_fields),
+            format!(
+                "do_not_invent_pdi_layout={}",
+                u8::from(self.do_not_invent_pdi_layout)
+            ),
+            format!(
+                "public_pdi_image_decode={}",
+                u8::from(self.public_pdi_image_decode)
+            ),
+            format!(
+                "partition_surface_public={}",
+                sanitize_soft_note_field_value(self.partition_surface_public)
+            ),
+            format!(
+                "pdi_marker_public={}",
+                sanitize_soft_note_field_value(self.pdi_marker_public)
+            ),
+            format!(
+                "app_load_code_name_ok={}",
+                u8::from(self.app_load_code_name_ok)
+            ),
+            format!(
+                "invalid_param_code_name_ok={}",
+                u8::from(self.invalid_param_code_name_ok)
+            ),
+            // Derived from fields — not a hard-coded =1 (hostile bag → =0).
+            format!("{PUBLIC_PDI_SCAN_CLOSED_TOKEN_KEY}={closed}"),
+        ];
+        // Anchor named codes without inventing a layout.
+        parts.push(format!("locked_app_load=0x{AIE2_FW_APP_LOAD_PDI_FAIL:x}"));
+        parts.push(format!("locked_invalid_param=0x{AIE2_FW_INVALID_PARAM:x}"));
+        parts.join(" ")
+    }
+}
+
+/// Pure public-evidence scan for PDI/partition load (Track M).
+///
+/// Returns the **closed** conclusion locked by the human offline research
+/// stamp ([`PUBLIC_PDI_NEW_FIELDS_CLOSED`] / status-name depth): no new public
+/// PDI fields beyond Track L. Runtime only re-checks locked FW codes via
+/// [`aie2_fw_status_name`] (label only).
+///
+/// Does **not** read the filesystem, walk `docs/`/`kernel/`, open L3, or decode
+/// private blobs. Always soft; never Pass / C-ready / second unlock.
+#[must_use]
+pub fn scan_public_pdi_partition_evidence() -> PublicPdiEvidenceScan {
+    let app_ok = aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL) == "APP_LOAD_PDI_FAIL";
+    let inv_ok = aie2_fw_status_name(AIE2_FW_INVALID_PARAM) == "AIE2_STATUS_INVALID_PARAM";
+    PublicPdiEvidenceScan {
+        public_pdi_evidence_depth: PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN,
+        new_public_pdi_fields: PUBLIC_PDI_NEW_FIELDS_CLOSED,
+        do_not_invent_pdi_layout: true,
+        public_pdi_image_decode: false,
+        partition_surface_public: PUBLIC_PARTITION_SURFACE_TOKEN,
+        pdi_marker_public: PUBLIC_PDI_MARKER_TOKEN,
+        app_load_code_name_ok: app_ok,
+        invalid_param_code_name_ok: inv_ok,
+    }
+}
+
+/// Alias: explicit closed-scan constructor (same as [`scan_public_pdi_partition_evidence`]).
+#[must_use]
+pub fn scan_public_pdi_partition_evidence_closed() -> PublicPdiEvidenceScan {
+    scan_public_pdi_partition_evidence()
+}
+
+// ---------------------------------------------------------------------------
+// Track N — external public PDI evidence (beyond in-tree Track M; maintain)
+// ---------------------------------------------------------------------------
+
+/// Soft-note token value: external public kernel/XRT evidence beyond status names
+/// remains closed (no new layout fields found offline this turn).
+///
+/// Encodes the **human offline research conclusion** for Track N — not a live
+/// network/XRT tree walk. Bump only with real external public evidence.
+pub const EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN: &str = "closed_no_new";
+
+/// Count of new external public kernel/XRT fields beyond Track M status-name depth.
+///
+/// Locked `0` — no external public layout/ioctl surface found beyond named FW
+/// status codes already locked in Tracks L/M.
+///
+/// Does **not** claim exhaustive internet / full XRT source audit; only that
+/// this maintain turn found **no new** external public evidence to encode.
+pub const EXTERNAL_KERNEL_XRT_BEYOND_STATUS_NAME: u8 = 0;
+
+/// Soft-note key for derived external-closed bit
+/// (`external_scan_closed_no_new=`).
+///
+/// Value is **derived** from fields in
+/// [`ExternalPublicPdiEvidenceScan::format_soft_note`] — never hard-coded `=1`
+/// when the bag is non-closed.
+pub const EXTERNAL_PUBLIC_PDI_SCAN_CLOSED_TOKEN_KEY: &str = "external_scan_closed_no_new";
+
+/// Offline scan conclusion: external public PDI/partition evidence beyond Track M.
+///
+/// Honesty:
+/// - No private PDI binary layout decode / no invent prop_count=15.
+/// - No invent vendor post-patch / Pass / C-ready / second unlock.
+/// - Closed external scan **≠** FW load OK ≠ C-ready ≠ second C unlock.
+/// - Depth remains [`PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN`] (`status_name_only`).
+///
+/// **Construction:** prefer [`scan_external_public_pdi_evidence`] /
+/// [`scan_external_public_pdi_evidence_closed`]. [`Default`] **delegates** to
+/// the same scan path (status-name re-check via [`aie2_fw_status_name`]).
+///
+/// Runtime pure API does **not** fetch external XRT trees or walk the network —
+/// those were not present as new public evidence this turn; this type locks the
+/// closed conclusion + status names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; not a state machine
+pub struct ExternalPublicPdiEvidenceScan {
+    /// Always [`EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN`] (`closed_no_new`) when closed.
+    pub external_public_pdi_evidence: &'static str,
+    /// New external kernel/XRT fields beyond status-name (`0` when closed).
+    pub external_kernel_xrt_beyond_status_name: u8,
+    /// Echo of Track M depth — still `status_name_only` (no stronger depth).
+    pub public_pdi_evidence_depth: &'static str,
+    /// Always true from constructors / Default (`do_not_invent_pdi_layout=1`).
+    pub do_not_invent_pdi_layout: bool,
+    /// Always false — public image decode remains closed (Tracks L/M/N).
+    pub public_pdi_image_decode: bool,
+    /// Named APP_LOAD code still maps via [`aie2_fw_status_name`] only.
+    /// Diagnostic soft-note field — **not** part of
+    /// [`Self::is_external_scan_closed_no_new`].
+    pub app_load_code_name_ok: bool,
+    /// Named INVALID_PARAM code still maps via [`aie2_fw_status_name`] only.
+    /// Diagnostic soft-note field — **not** part of
+    /// [`Self::is_external_scan_closed_no_new`].
+    pub invalid_param_code_name_ok: bool,
+}
+
+impl Default for ExternalPublicPdiEvidenceScan {
+    fn default() -> Self {
+        // Same production path as scan — name_ok via aie2_fw_status_name.
+        scan_external_public_pdi_evidence()
+    }
+}
+
+impl ExternalPublicPdiEvidenceScan {
+    /// True when this bag is the closed external public-evidence conclusion (Track N).
+    ///
+    /// Used to derive `external_scan_closed_no_new=` so a hostile hand-built bag
+    /// cannot emit closed=1 alongside non-zero external fields / decode / wrong
+    /// depth / non-`closed_no_new` token.
+    ///
+    /// **Not** gated on `app_load_code_name_ok` / `invalid_param_code_name_ok` —
+    /// those are **diagnostic-only** status-name labels (always printed in the
+    /// soft note). Closed = external count 0 + `closed_no_new` token +
+    /// status-name depth + no invent layout + no image decode.
+    ///
+    /// **Depth vs Track M:** N (and O) **require**
+    /// `public_pdi_evidence_depth == status_name_only`. Track M's
+    /// [`PublicPdiEvidenceScan::is_scan_closed_no_new_public_fields`] is
+    /// intentionally **narrower** (fields/decode/layout only — no depth gate).
+    /// Shared with M: non-zero fields / decode / invent-layout clear closed;
+    /// diagnostic `name_ok` flags do not. This is **not** full M closed parity
+    /// on depth.
+    #[must_use]
+    pub fn is_external_scan_closed_no_new(&self) -> bool {
+        self.external_kernel_xrt_beyond_status_name == 0
+            && self.external_public_pdi_evidence == EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN
+            && !self.public_pdi_image_decode
+            && self.do_not_invent_pdi_layout
+            && self.public_pdi_evidence_depth == PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN
+    }
+
+    /// Soft research note (always honesty trio; closed bit **derived** from fields).
+    ///
+    /// String field values are passed through [`sanitize_soft_note_field_value`]
+    /// so hostile hand-built bags cannot inject extra whitespace tokens.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let closed = u8::from(self.is_external_scan_closed_no_new());
+        let mut parts = vec![
+            "external_public_pdi_evidence_scan".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!(
+                "external_public_pdi_evidence={}",
+                sanitize_soft_note_field_value(self.external_public_pdi_evidence)
+            ),
+            format!(
+                "external_kernel_xrt_beyond_status_name={}",
+                self.external_kernel_xrt_beyond_status_name
+            ),
+            format!(
+                "public_pdi_evidence_depth={}",
+                sanitize_soft_note_field_value(self.public_pdi_evidence_depth)
+            ),
+            format!(
+                "do_not_invent_pdi_layout={}",
+                u8::from(self.do_not_invent_pdi_layout)
+            ),
+            format!(
+                "public_pdi_image_decode={}",
+                u8::from(self.public_pdi_image_decode)
+            ),
+            format!(
+                "app_load_code_name_ok={}",
+                u8::from(self.app_load_code_name_ok)
+            ),
+            format!(
+                "invalid_param_code_name_ok={}",
+                u8::from(self.invalid_param_code_name_ok)
+            ),
+            // Derived from fields — not a hard-coded =1 (hostile bag → =0).
+            format!("{EXTERNAL_PUBLIC_PDI_SCAN_CLOSED_TOKEN_KEY}={closed}"),
+        ];
+        // Anchor named codes without inventing a layout.
+        parts.push(format!("locked_app_load=0x{AIE2_FW_APP_LOAD_PDI_FAIL:x}"));
+        parts.push(format!("locked_invalid_param=0x{AIE2_FW_INVALID_PARAM:x}"));
+        parts.join(" ")
+    }
+}
+
+/// Pure external public-evidence scan for PDI/partition load (Track N).
+///
+/// Returns the **closed** conclusion locked by the human offline research
+/// stamp ([`EXTERNAL_KERNEL_XRT_BEYOND_STATUS_NAME`] / `closed_no_new`): no new
+/// external public kernel/XRT fields beyond Track M status-name depth. Runtime
+/// only re-checks locked FW codes via [`aie2_fw_status_name`] (label only).
+///
+/// Does **not** fetch external XRT trees, walk the network, open L3, or decode
+/// private blobs. Always soft; never Pass / C-ready / second unlock.
+#[must_use]
+pub fn scan_external_public_pdi_evidence() -> ExternalPublicPdiEvidenceScan {
+    let app_ok = aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL) == "APP_LOAD_PDI_FAIL";
+    let inv_ok = aie2_fw_status_name(AIE2_FW_INVALID_PARAM) == "AIE2_STATUS_INVALID_PARAM";
+    ExternalPublicPdiEvidenceScan {
+        external_public_pdi_evidence: EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN,
+        external_kernel_xrt_beyond_status_name: EXTERNAL_KERNEL_XRT_BEYOND_STATUS_NAME,
+        public_pdi_evidence_depth: PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN,
+        do_not_invent_pdi_layout: true,
+        public_pdi_image_decode: false,
+        app_load_code_name_ok: app_ok,
+        invalid_param_code_name_ok: inv_ok,
+    }
+}
+
+/// Alias: explicit closed-scan constructor (same as [`scan_external_public_pdi_evidence`]).
+#[must_use]
+pub fn scan_external_public_pdi_evidence_closed() -> ExternalPublicPdiEvidenceScan {
+    scan_external_public_pdi_evidence()
+}
+
+// ---------------------------------------------------------------------------
+// Track O — maintain reconfirm (A–N still closed; no new external evidence)
+// ---------------------------------------------------------------------------
+
+/// Soft-note token value: Tracks A–N public APP_LOAD evidence remains closed
+/// under this maintain turn (no new in-tree or external public fields).
+///
+/// Encodes the **human offline maintain conclusion** for Track O — not a new
+/// evidence track and not a live FS/network/XRT walk. Distinct from Track N's
+/// [`EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN`] (`closed_no_new`) so bags do not bleed.
+pub const APP_LOAD_MAINTAIN_RECONFIRM_TOKEN: &str = "a_n_closed_no_new";
+
+/// Soft-note token when composed Track M and/or N is **not** closed.
+///
+/// Production [`reconfirm_app_load_tracks_a_n_closed`] emits this instead of
+/// [`APP_LOAD_MAINTAIN_RECONFIRM_TOKEN`] so the soft-note token matches openness
+/// (not a stale `a_n_closed_no_new` when M/N open).
+pub const APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN: &str = "not_closed";
+
+/// Soft-note key for derived maintain-reconfirm closed bit
+/// (`maintain_reconfirm_a_n_closed=`).
+///
+/// Value is **derived** from fields in
+/// [`AppLoadMaintainReconfirm::format_soft_note`] — never hard-coded `=1` when
+/// the bag is non-closed.
+pub const APP_LOAD_MAINTAIN_RECONFIRM_CLOSED_TOKEN_KEY: &str = "maintain_reconfirm_a_n_closed";
+
+/// Offline maintain reconfirm: Tracks A–N public APP_LOAD evidence still closed.
+///
+/// Honesty:
+/// - **Not** a new silicon-progress / evidence-depth track.
+/// - No private PDI decode / no invent prop_count=15 / Pass / C-ready / second unlock.
+/// - Composes Track M + N closed conclusions; does **not** claim new external
+///   public fields or full internet/XRT exhaustiveness.
+/// - Soft bag name `app_load_maintain_reconfirm=` is **distinct** from
+///   `public_pdi_evidence_scan=` (M) and `external_public_pdi_evidence_scan=` (N).
+///
+/// **Construction:** prefer [`reconfirm_app_load_tracks_a_n_closed`] /
+/// [`reconfirm_app_load_tracks_a_n_closed_maintain`]. [`Default`] **delegates**
+/// to the same path (M+N scan composition + status-name re-check).
+///
+/// **Depth vs Track M:** O (and N) gate closed on
+/// `public_pdi_evidence_depth == status_name_only`. Track M's
+/// [`PublicPdiEvidenceScan::is_scan_closed_no_new_public_fields`] is intentionally
+/// **narrower** (fields/decode/layout only) — O's depth check is authoritative
+/// for maintain reconfirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; not a state machine
+pub struct AppLoadMaintainReconfirm {
+    /// [`APP_LOAD_MAINTAIN_RECONFIRM_TOKEN`] when M+N closed; else
+    /// [`APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN`] from production constructors.
+    pub maintain_reconfirm: &'static str,
+    /// Track M closed bit (from [`PublicPdiEvidenceScan::is_scan_closed_no_new_public_fields`]).
+    pub in_tree_m_closed: bool,
+    /// Track N closed bit (from [`ExternalPublicPdiEvidenceScan::is_external_scan_closed_no_new`]).
+    pub external_n_closed: bool,
+    /// Echo of composed M/N depth — `status_name_only` when both match closed depth.
+    pub public_pdi_evidence_depth: &'static str,
+    /// Echo of M∧N `do_not_invent_pdi_layout` (production closed → true).
+    pub do_not_invent_pdi_layout: bool,
+    /// Echo of M∨N `public_pdi_image_decode` (production closed → false).
+    pub public_pdi_image_decode: bool,
+    /// Echo of Track M new-fields count (`0` when closed).
+    pub new_public_pdi_fields: u8,
+    /// Echo of Track N external beyond-status-name count (`0` when closed).
+    pub external_kernel_xrt_beyond_status_name: u8,
+    /// Named APP_LOAD code still maps via [`aie2_fw_status_name`] only.
+    /// Diagnostic soft-note field — **not** part of
+    /// [`Self::is_maintain_reconfirm_a_n_closed`].
+    pub app_load_code_name_ok: bool,
+    /// Named INVALID_PARAM code still maps via [`aie2_fw_status_name`] only.
+    /// Diagnostic soft-note field — **not** part of
+    /// [`Self::is_maintain_reconfirm_a_n_closed`].
+    pub invalid_param_code_name_ok: bool,
+}
+
+impl Default for AppLoadMaintainReconfirm {
+    fn default() -> Self {
+        reconfirm_app_load_tracks_a_n_closed()
+    }
+}
+
+impl AppLoadMaintainReconfirm {
+    /// True when this bag is the closed maintain-reconfirm conclusion (Track O).
+    ///
+    /// Used to derive `maintain_reconfirm_a_n_closed=` so a hostile hand-built
+    /// bag cannot emit closed=1 alongside non-closed M/N / non-zero counts /
+    /// decode / wrong depth / non-`a_n_closed_no_new` token.
+    ///
+    /// **Not** gated on `app_load_code_name_ok` / `invalid_param_code_name_ok` —
+    /// those are **diagnostic-only** status-name labels (always printed in the
+    /// soft note). Closed = M closed + N closed + maintain token + status-name
+    /// depth + no invent layout + no image decode + zero new-field counts.
+    #[must_use]
+    pub fn is_maintain_reconfirm_a_n_closed(&self) -> bool {
+        self.maintain_reconfirm == APP_LOAD_MAINTAIN_RECONFIRM_TOKEN
+            && self.in_tree_m_closed
+            && self.external_n_closed
+            && self.new_public_pdi_fields == 0
+            && self.external_kernel_xrt_beyond_status_name == 0
+            && !self.public_pdi_image_decode
+            && self.do_not_invent_pdi_layout
+            && self.public_pdi_evidence_depth == PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN
+    }
+
+    /// Soft research note (always honesty trio; closed bit **derived** from fields).
+    ///
+    /// String field values are passed through [`sanitize_soft_note_field_value`]
+    /// so hostile hand-built bags cannot inject extra whitespace tokens.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let closed = u8::from(self.is_maintain_reconfirm_a_n_closed());
+        let mut parts = vec![
+            "app_load_maintain_reconfirm".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!(
+                "maintain_reconfirm={}",
+                sanitize_soft_note_field_value(self.maintain_reconfirm)
+            ),
+            format!("in_tree_m_closed={}", u8::from(self.in_tree_m_closed)),
+            format!("external_n_closed={}", u8::from(self.external_n_closed)),
+            format!(
+                "public_pdi_evidence_depth={}",
+                sanitize_soft_note_field_value(self.public_pdi_evidence_depth)
+            ),
+            format!(
+                "do_not_invent_pdi_layout={}",
+                u8::from(self.do_not_invent_pdi_layout)
+            ),
+            format!(
+                "public_pdi_image_decode={}",
+                u8::from(self.public_pdi_image_decode)
+            ),
+            format!("new_public_pdi_fields={}", self.new_public_pdi_fields),
+            format!(
+                "external_kernel_xrt_beyond_status_name={}",
+                self.external_kernel_xrt_beyond_status_name
+            ),
+            format!(
+                "app_load_code_name_ok={}",
+                u8::from(self.app_load_code_name_ok)
+            ),
+            format!(
+                "invalid_param_code_name_ok={}",
+                u8::from(self.invalid_param_code_name_ok)
+            ),
+            // Derived from fields — not a hard-coded =1 (hostile bag → =0).
+            format!("{APP_LOAD_MAINTAIN_RECONFIRM_CLOSED_TOKEN_KEY}={closed}"),
+        ];
+        // Anchor named codes without inventing a layout.
+        parts.push(format!("locked_app_load=0x{AIE2_FW_APP_LOAD_PDI_FAIL:x}"));
+        parts.push(format!("locked_invalid_param=0x{AIE2_FW_INVALID_PARAM:x}"));
+        parts.join(" ")
+    }
+}
+
+/// Pure maintain reconfirm that Tracks A–N public APP_LOAD evidence is still closed.
+///
+/// Composes [`scan_public_pdi_partition_evidence`] (Track M) +
+/// [`scan_external_public_pdi_evidence`] (Track N). Runtime only re-checks locked
+/// FW codes via those scans' [`aie2_fw_status_name`] labels — **no** FS walk,
+/// **no** network/XRT tree walk, **no** private PDI decode.
+///
+/// Field values (**depth / layout / decode / counts**) are **echoed** from M+N
+/// (not hard-coded closed constants). Maintain token is
+/// [`APP_LOAD_MAINTAIN_RECONFIRM_TOKEN`] only when both M and N closed bits hold;
+/// otherwise [`APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN`].
+///
+/// Always soft; never Pass / C-ready / second unlock. Does **not** invent new
+/// external public evidence (this turn found none).
+#[must_use]
+pub fn reconfirm_app_load_tracks_a_n_closed() -> AppLoadMaintainReconfirm {
+    let m = scan_public_pdi_partition_evidence();
+    let n = scan_external_public_pdi_evidence();
+    let m_closed = m.is_scan_closed_no_new_public_fields();
+    let n_closed = n.is_external_scan_closed_no_new();
+    // Echo depth: both match → that value; disagree → explicit mismatch (closed fails).
+    let depth = if m.public_pdi_evidence_depth == n.public_pdi_evidence_depth {
+        m.public_pdi_evidence_depth
+    } else {
+        "m_n_depth_mismatch"
+    };
+    AppLoadMaintainReconfirm {
+        maintain_reconfirm: if m_closed && n_closed {
+            APP_LOAD_MAINTAIN_RECONFIRM_TOKEN
+        } else {
+            APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN
+        },
+        in_tree_m_closed: m_closed,
+        external_n_closed: n_closed,
+        public_pdi_evidence_depth: depth,
+        do_not_invent_pdi_layout: m.do_not_invent_pdi_layout && n.do_not_invent_pdi_layout,
+        public_pdi_image_decode: m.public_pdi_image_decode || n.public_pdi_image_decode,
+        new_public_pdi_fields: m.new_public_pdi_fields,
+        external_kernel_xrt_beyond_status_name: n.external_kernel_xrt_beyond_status_name,
+        app_load_code_name_ok: m.app_load_code_name_ok && n.app_load_code_name_ok,
+        invalid_param_code_name_ok: m.invalid_param_code_name_ok && n.invalid_param_code_name_ok,
+    }
+}
+
+/// Alias: explicit maintain constructor (same as [`reconfirm_app_load_tracks_a_n_closed`]).
+#[must_use]
+pub fn reconfirm_app_load_tracks_a_n_closed_maintain() -> AppLoadMaintainReconfirm {
+    reconfirm_app_load_tracks_a_n_closed()
+}
+
+/// Public-kernel cmdlist fill cross-check (Track G depth; no private fill body).
+///
+/// Maps locked 112 B live dump + cmdlist msg `0x70` to START_NPU fill_slot
+/// expectations already unit-locked in Tracks F–G. **Does not** invent fill_slot
+/// post-copy body beyond public size/logical field map.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; not a state machine
+pub struct C2CmdlistFillCrossCheck {
+    /// Live cmdbuf byte length (words × 4).
+    pub live_cmdbuf_bytes: usize,
+    /// Cmdlist msg size field (`0x70` expected).
+    pub cmdlist_msg_size_field: Option<u32>,
+    /// True when msg size == live cmdbuf bytes == [`C2_LIVE_CMDLIST_MSG_SIZE_BYTES`].
+    pub msg_size_matches_live_cmdbuf: bool,
+    /// Pure START_NPU BO byte length when provided.
+    pub pure_start_npu_bytes: Option<usize>,
+    /// True when pure BO is 21 words (84 B) — locked xrt3 content path.
+    pub pure_is_21w_start_npu: bool,
+    /// Live dump carries content instr size `0x698`.
+    pub live_instr_size_content_1688: bool,
+    /// Logical paddrs match locked C2 expect (via research map).
+    pub logical_paddrs_match_expect: bool,
+    /// Envelope exact pure vs live (false on locked C2).
+    pub envelope_exact_match: bool,
+}
+
+impl C2CmdlistFillCrossCheck {
+    /// Soft research note.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "c2_cmdlist_fill_cross_check".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!("live_cmdbuf_bytes={}", self.live_cmdbuf_bytes),
+            format!(
+                "msg_size_matches_live_cmdbuf={}",
+                u8::from(self.msg_size_matches_live_cmdbuf)
+            ),
+            format!(
+                "pure_is_21w_start_npu={}",
+                u8::from(self.pure_is_21w_start_npu)
+            ),
+            format!(
+                "live_instr_size_content_1688={}",
+                u8::from(self.live_instr_size_content_1688)
+            ),
+            format!(
+                "logical_paddrs_match_expect={}",
+                u8::from(self.logical_paddrs_match_expect)
+            ),
+            format!(
+                "envelope_exact_match={}",
+                u8::from(self.envelope_exact_match)
+            ),
+            format!("expected_cmdlist_msg_size=0x{C2_LIVE_CMDLIST_MSG_SIZE_BYTES:x}"),
+            // Public fill_slot expectation: slot message size tracks cmdbuf dump.
+            "fill_slot_public_expect=msg_size_eq_cmdbuf_dump".into(),
+            "fill_slot_body_invent=0".into(),
+            "do_not_invent_prop_count_15=1".into(),
+        ];
+        if let Some(sz) = self.cmdlist_msg_size_field {
+            parts.push(format!("cmdlist_msg_size_field=0x{sz:x}"));
+        } else {
+            parts.push("cmdlist_msg_size_field=absent".into());
+        }
+        if let Some(b) = self.pure_start_npu_bytes {
+            parts.push(format!("pure_start_npu_bytes={b}"));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Cross-check locked live cmdlist/cmdbuf vs pure START_NPU (public kernel docs only).
+///
+/// `pure_bo` optional — when present, drives envelope / 21w flags. Never EXEC.
+#[must_use]
+pub fn cross_check_c2_cmdlist_fill_public(
+    live_words: &[u32],
+    msg_words: &[u32],
+    pure_bo: Option<&[u8]>,
+) -> C2CmdlistFillCrossCheck {
+    let live_bytes = live_words.len().saturating_mul(4);
+    let msg_sz = msg_words.get(4).copied();
+    let msg_match = msg_sz == Some(C2_LIVE_CMDLIST_MSG_SIZE_BYTES)
+        && live_bytes == C2_LIVE_CMDLIST_MSG_SIZE_BYTES as usize
+        && live_words.len() == C2_LIVE_CMDBUF_WORD_COUNT;
+    let expect = C2ExpectPaddrs::from_c2_locked_io();
+    let map = decode_c2_live_cmdbuf_research(live_words, pure_bo, expect);
+    let pure_len = pure_bo.map(<[u8]>::len);
+    // Length 84 alone is not enough — require decodable START_NPU with prop_count=0.
+    let pure_21 = pure_bo.is_some_and(|b| {
+        b.len() == C2_PURE_START_NPU_WORD_COUNT.saturating_mul(4)
+            && decode_start_npu_cmd_bo(b).is_ok_and(|d| d.prop_count == 0)
+    });
+    C2CmdlistFillCrossCheck {
+        live_cmdbuf_bytes: live_bytes,
+        cmdlist_msg_size_field: msg_sz,
+        msg_size_matches_live_cmdbuf: msg_match,
+        pure_start_npu_bytes: pure_len,
+        pure_is_21w_start_npu: pure_21,
+        live_instr_size_content_1688: map.instr_size == Some(C2_LIVE_INSTR_SIZE_CONTENT),
+        logical_paddrs_match_expect: map.logical_paddrs_match_expect,
+        envelope_exact_match: map.envelope_exact_match,
+    }
+}
+
+/// Locked C2 embed convenience for [`cross_check_c2_cmdlist_fill_public`].
+#[must_use]
+pub fn cross_check_c2_cmdlist_fill_locked(pure_bo: Option<&[u8]>) -> C2CmdlistFillCrossCheck {
+    cross_check_c2_cmdlist_fill_public(
+        c2_live_cmdbuf_words_embedded(),
+        c2_live_cmdlist_msg_words_embedded(),
+        pure_bo,
+    )
 }
 
 /// Pure offline Pass-evidence fields from a `last_apply.json` snapshot (C4 audit).
@@ -718,6 +3030,39 @@ pub fn residual_note_has_exact_token(note: &str, token: &str) -> bool {
     note.split_whitespace().any(|t| t == token)
 }
 
+/// Sanitize a soft-note **field value** before `key=value` emission.
+///
+/// Maps whitespace, `=`, and control characters to `_` so a hostile hand-built
+/// bag cannot inject extra exact tokens (e.g. `invent_pass=1` / `ran_on_npu=1`)
+/// via interpolated `&str` fields. Production constructors only use consts
+/// (already safe); this hardens M/N/O research notes against bag mutation.
+///
+/// Does **not** alter hard-coded honesty trio tokens (`invent_pass=0` etc.).
+#[must_use]
+pub fn sanitize_soft_note_field_value(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_whitespace() || c == '=' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// True when env value is an explicit enable (`1` / `true`, case-insensitive).
+///
+/// Presence alone is **not** enough — `0` / `false` / empty must stay off.
+/// Matches classify example `env_flag_truthy` (PRINT / research hard-opt-ins).
+#[must_use]
+pub fn env_flag_truthy_os(key: &str) -> bool {
+    std::env::var(key).ok().is_some_and(|v| {
+        let t = v.trim();
+        t == "1" || t.eq_ignore_ascii_case("true")
+    })
+}
+
 /// Prefer the `inst_blob`… region for instr BO tokens (until `bo_diag` / `ofm_stats`).
 ///
 /// Falls back to full `detail` when `inst_blob` is absent.
@@ -922,16 +3267,37 @@ fn parse_last_apply_app_load_tokens(detail: &str, s: &mut LastApplyDetailSignals
 /// zeros, missing journal hex). **Never** invents Pass / C-ready / `ran_on_npu`.
 ///
 /// Print this string **as-is** (already starts with `app_load_checklist=1`).
+///
+/// For optional journal dual-status (`0x3000003` / `0x4000003`), use
+/// [`format_app_load_offline_checklist_ex`].
 #[must_use]
 pub fn format_app_load_offline_checklist(
     class: SiliconResidualClass,
     sig: &LastApplyDetailSignals,
+) -> String {
+    format_app_load_offline_checklist_ex(class, sig, None)
+}
+
+/// Same as [`format_app_load_offline_checklist`] with optional journal / multi-line
+/// text for dual FW status codes.
+///
+/// - When `journal_text` is `None` or empty/whitespace: always emits
+///   `journal_text_absent=1` (plus `fw_code_absent_in_detail=1` if detail lacks hex).
+/// - When present: parses via [`parse_journal_fw_status_pair`] and emits named
+///   codes **only** when literals parse — never invents `0x3000003` / pair.
+/// - Always ends honesty with `invent_pass=0` (research checklist ≠ product Pass).
+#[must_use]
+pub fn format_app_load_offline_checklist_ex(
+    class: SiliconResidualClass,
+    sig: &LastApplyDetailSignals,
+    journal_text: Option<&str>,
 ) -> String {
     let mut parts = vec![
         "app_load_checklist=1".to_string(),
         format!("residual={}", class.as_str()),
         "not_c_ready=1".to_string(),
         "not_ran_on_npu=1".to_string(),
+        "invent_pass=0".to_string(),
     ];
     // Userspace OK only with explicit aiebu=true + rela evidence (not aiebu unknown).
     if sig.aiebu_elf == Some(true) && last_apply_has_rela_evidence(sig) {
@@ -942,13 +3308,7 @@ pub fn format_app_load_offline_checklist(
             parts.push("aiebu_unknown=1".to_string());
         }
     }
-    if sig.instr_bo_type.as_deref() == Some("Dev") {
-        parts.push("instr_ty_dev=1".to_string());
-    } else if let Some(ref t) = sig.instr_bo_type {
-        parts.push(format!("instr_ty={t}"));
-    } else {
-        parts.push("instr_ty_unknown=1".to_string());
-    }
+    append_checklist_instr_ty_token(&mut parts, sig.instr_bo_type.as_deref());
     match sig.instr_map_offset {
         Some(off) if instr_map_offset_is_no_mmap(off) => {
             parts.push("instr_map_offset_no_mmap=1".to_string());
@@ -985,15 +3345,24 @@ pub fn format_app_load_offline_checklist(
     if let Some(st) = sig.start_npu_size_b {
         parts.push(format!("start_npu_size={st}B"));
     }
-    if let Some(ref mode) = sig.inst_size_mode {
-        parts.push(format!("inst_size_mode={mode}"));
-    }
-    if let Some(ref mode) = sig.rela_mode {
-        parts.push(format!("rela_mode={mode}"));
-    }
-    if let Some(ref lay) = sig.layout {
-        parts.push(format!("layout={lay}"));
-    }
+    append_checklist_allowlisted_mode(
+        &mut parts,
+        "inst_size_mode",
+        sig.inst_size_mode.as_deref(),
+        &["content", "bo"],
+    );
+    append_checklist_allowlisted_mode(
+        &mut parts,
+        "rela_mode",
+        sig.rela_mode.as_deref(),
+        &["overwrite", "add"],
+    );
+    append_checklist_allowlisted_mode(
+        &mut parts,
+        "layout",
+        sig.layout.as_deref(),
+        &["count4", "xrt3"],
+    );
     // Submit / OFM layer (userspace saw FW reject, not ioctl hang)
     if sig.submit_wait_not_ok {
         parts.push("submit_wait_not_ok=1".to_string());
@@ -1011,12 +3380,88 @@ pub fn format_app_load_offline_checklist(
         parts.push("fw_code_absent_in_detail=1".to_string());
         parts.push("fw_code=unknown_check_journal".to_string());
     }
+    // Optional journal dual-status (Track I): never invent codes when absent.
+    append_journal_dual_checklist_tokens(&mut parts, journal_text);
     if class.is_locked_app_load_after_aiebu() {
         // Class label already in residual=; do not invent journal code narrative.
         parts.push("class_implies_app_load_after_aiebu=1".to_string());
         parts.push("env_hitl_closed=1".to_string());
+        // Track K: userspace ELF+rela green but FW APP_LOAD residual still open.
+        // Only when checklist already marked userspace_elf_rela_ok (aiebu+rela).
+        if sig.aiebu_elf == Some(true) && last_apply_has_rela_evidence(sig) {
+            // Distinct from research `userspace_ok_fw_load_open` (which also needs
+            // classic walk of patched ctrltext). Checklist has last_apply signals only.
+            parts.push("checklist_userspace_elf_rela_app_load=1".to_string());
+        }
+        // Track L: public PDI/partition surface is status-name only (no image decode).
+        // Distinct from research `partition_surface_public=` / `pdi_marker_public=`
+        // on `AppLoadPdiPartitionResearch` (same values; checklist prefix avoids merge).
+        parts.push(format!(
+            "checklist_partition_surface_public={PUBLIC_PARTITION_SURFACE_TOKEN}"
+        ));
+        parts.push(format!(
+            "checklist_pdi_marker_public={PUBLIC_PDI_MARKER_TOKEN}"
+        ));
+        parts.push("checklist_public_pdi_image_decode=0".to_string());
     }
     parts.join(" ")
+}
+
+/// Allowlist instr BO type tokens (token integrity; unknown → `other`).
+fn append_checklist_instr_ty_token(parts: &mut Vec<String>, ty: Option<&str>) {
+    match ty {
+        Some("Dev") => parts.push("instr_ty_dev=1".into()),
+        Some(t @ ("Shmem" | "Cmd" | "ExecBuf" | "DevHeap")) => {
+            parts.push(format!("instr_ty={t}"));
+        }
+        Some(_) => parts.push("instr_ty=other".into()),
+        None => parts.push("instr_ty_unknown=1".into()),
+    }
+}
+
+/// Emit `key=value` only for allowlisted values (else `key=other`); skip if None.
+fn append_checklist_allowlisted_mode(
+    parts: &mut Vec<String>,
+    key: &str,
+    value: Option<&str>,
+    allow: &[&str],
+) {
+    let Some(v) = value else {
+        return;
+    };
+    let out = if allow.contains(&v) { v } else { "other" };
+    parts.push(format!("{key}={out}"));
+}
+
+/// Append journal dual-status tokens for the APP_LOAD checklist (never invents).
+fn append_journal_dual_checklist_tokens(parts: &mut Vec<String>, journal_text: Option<&str>) {
+    let Some(jt) = journal_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        parts.push("journal_text_absent=1".into());
+        return;
+    };
+    let pair = parse_journal_fw_status_pair(jt);
+    match pair.failed_cmd_status {
+        Some(c) => {
+            parts.push(format!("journal_failed_cmd=0x{c:x}"));
+            parts.push(format!(
+                "journal_failed_cmd_name={}",
+                aie2_fw_status_name(c)
+            ));
+        }
+        None => parts.push("journal_failed_cmd=absent".into()),
+    }
+    match pair.chain_status {
+        Some(c) => {
+            parts.push(format!("journal_chain_status=0x{c:x}"));
+            parts.push(format!("journal_chain_name={}", aie2_fw_status_name(c)));
+        }
+        None => parts.push("journal_chain_status=absent".into()),
+    }
+    if pair.is_c2_app_load_pair() {
+        parts.push("journal_c2_app_load_pair=1".into());
+    } else {
+        parts.push("journal_c2_app_load_pair=0".into());
+    }
 }
 
 /// Classify residual from optional structured last_apply fields + detail text.
@@ -1203,12 +3648,14 @@ pub fn lab_qos_gops_fps_from_env() -> (u32, u32) {
 
 /// Known AIE2 firmware / mailbox codes seen on this lab host (from journal).
 ///
-/// Includes APP status (`0x3000003`, `0x4000003`) and MSG_OP `0x106` (map_host).
+/// Includes APP status ([`AIE2_FW_APP_LOAD_PDI_FAIL`], [`AIE2_FW_INVALID_PARAM`])
+/// and MSG_OP `0x106` (map_host). Names are **public status labels only** — not
+/// a PDI/partition binary layout decoder (Track L).
 #[must_use]
 pub fn aie2_fw_status_name(code: u32) -> &'static str {
     match code {
-        0x3_000_003 => "APP_LOAD_PDI_FAIL",
-        0x4_000_003 => "AIE2_STATUS_INVALID_PARAM",
+        AIE2_FW_APP_LOAD_PDI_FAIL => "APP_LOAD_PDI_FAIL",
+        AIE2_FW_INVALID_PARAM => "AIE2_STATUS_INVALID_PARAM",
         0x106 => "MSG_OP_MAP_HOST_BUFFER",
         _ => "unknown_fw_status",
     }
@@ -1685,12 +4132,44 @@ pub fn last_apply_load_path_is_allowed(path: &std::path::Path) -> bool {
     true
 }
 
+/// True when `p` is empty or filesystem root only (`/` / RootDir components).
+fn path_is_filesystem_root(p: &std::path::Path) -> bool {
+    p.as_os_str().is_empty()
+        || p == std::path::Path::new("/")
+        || p.components()
+            .all(|c| matches!(c, std::path::Component::RootDir))
+}
+
+/// Temp root used for last_apply path confinement (Unix `TMPDIR` / `temp_dir`).
+///
+/// **Security:** `TMPDIR=/` makes `std::env::temp_dir() == "/"` and
+/// `Path::starts_with("/")` true for **every** absolute path. Also: if
+/// `TMPDIR` is a **symlink to `/`**, lexical path is not RootDir-only but
+/// canonicalize resolves to `/` — same bypass. Clamp empty and filesystem-root
+/// (lexical **and** after canonicalize) to `/tmp` (same policy as
+/// `tools/c4_pass_check.sh` and classify/c3 shell helpers).
+#[must_use]
+pub fn last_apply_temp_root() -> std::path::PathBuf {
+    let temp = std::env::temp_dir();
+    let clamped = if path_is_filesystem_root(&temp) {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        temp
+    };
+    // Resolve symlinks (e.g. TMPDIR → symlink-to-/); re-clamp if still root.
+    let mut root = std::fs::canonicalize(&clamped).unwrap_or(clamped);
+    if path_is_filesystem_root(&root) {
+        root = std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    }
+    root
+}
+
 fn path_under_allowed_roots(path: &std::path::Path) -> bool {
     // Component-aware: refuse `/tmp_evil/...` when temp is `/tmp` (string prefix footgun).
-    let temp = std::env::temp_dir();
+    // Never treat filesystem root as the temp allow-root (TMPDIR=/ clamp).
+    let temp_root = last_apply_temp_root();
     let lab = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd");
-    // Prefer resolved form of roots when available (symlink temp_dir).
-    let temp_root = std::fs::canonicalize(&temp).unwrap_or(temp);
+    // Prefer resolved form of lab root when available.
     let lab_root = std::fs::canonicalize(&lab).unwrap_or(lab);
     let under = path.starts_with(&temp_root) || path.starts_with(&lab_root);
     under
@@ -1718,7 +4197,8 @@ pub fn default_last_apply_path() -> std::path::PathBuf {
         return lab;
     }
     // Private per-user temp name (avoid fixed world-writable /tmp symlink plant).
-    std::env::temp_dir().join(format!("dragon_npu_last_apply_{}.json", std::process::id()))
+    // Use clamped temp root so TMPDIR=/ does not plant under filesystem root.
+    last_apply_temp_root().join(format!("dragon_npu_last_apply_{}.json", std::process::id()))
 }
 
 /// True when `a` is a usable device paddr (not 0 / not `u64::MAX`).
@@ -1998,10 +4478,11 @@ pub fn write_last_apply_to_path(
         "total_s": result.total_s,
     });
     // Only create parent if it is the known lab or temp dir (not arbitrary depth).
+    // Use clamped temp root so TMPDIR=/ does not allow create_dir_all everywhere.
     if let Some(parent) = owned.parent() {
         if parent.is_dir()
             || parent.ends_with("xdna2_cmd")
-            || parent.starts_with(std::env::temp_dir())
+            || parent.starts_with(last_apply_temp_root())
         {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -2107,6 +4588,46 @@ mod tests {
         build_strix_research_noop_txn, patch_aiebu_elf_ctrltext_with_bos,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that mutate process `TMPDIR` (env is global).
+    fn tmpdir_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII restore of `TMPDIR` after test mutation (panic-safe).
+    struct TmpdirEnvGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TmpdirEnvGuard {
+        #[allow(unsafe_code)] // test-only env isolation
+        fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let _lock = tmpdir_env_lock();
+            let prev = std::env::var_os("TMPDIR");
+            // SAFETY: exclusive under tmpdir_env_lock; Drop restores.
+            unsafe {
+                std::env::set_var("TMPDIR", value);
+            }
+            Self { prev, _lock }
+        }
+    }
+
+    impl Drop for TmpdirEnvGuard {
+        #[allow(unsafe_code)] // test-only env isolation
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("TMPDIR", v),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn resolve_lab_qos_defaults_and_clamp_zero() {
@@ -2591,7 +5112,7 @@ mod tests {
 
     #[test]
     fn last_apply_load_path_refuses_symlink_when_present() {
-        let dir = std::env::temp_dir();
+        let dir = last_apply_temp_root();
         let target = dir.join(format!("dragon_npu_la_target_{}.json", std::process::id()));
         let link = dir.join(format!("dragon_npu_la_link_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&target);
@@ -3085,7 +5606,8 @@ mod tests {
 
     #[test]
     fn last_apply_path_refuses_intermediate_dir_symlink() {
-        let temp = std::env::temp_dir();
+        // Clamped temp root (safe if another test briefly sets TMPDIR=/).
+        let temp = last_apply_temp_root();
         let pid = std::process::id();
         let temp_root = std::fs::canonicalize(&temp).unwrap_or_else(|_| temp.clone());
         let lab = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd");
@@ -3131,7 +5653,7 @@ mod tests {
             return;
         }
         let attack = mid.join("secret.json");
-        // Lexical: under temp_dir; resolved parent: outside → must refuse.
+        // Lexical: under temp root; resolved parent: outside → must refuse.
         assert!(
             !last_apply_path_is_allowed(&attack),
             "mid-path dir symlink must refuse write path: {}",
@@ -3266,7 +5788,8 @@ mod tests {
 
     #[test]
     fn last_apply_path_allowed_confinement() {
-        let tmp = std::env::temp_dir().join("dragon_npu_la_test.json");
+        // Use clamped temp root (not raw temp_dir) so TMPDIR=/ or symlink→/ is safe.
+        let tmp = last_apply_temp_root().join("dragon_npu_la_test.json");
         assert!(last_apply_path_is_allowed(&tmp));
         assert!(!last_apply_path_is_allowed(Path::new("/etc/passwd")));
         assert!(!last_apply_path_is_allowed(Path::new("../../etc/passwd")));
@@ -3276,8 +5799,9 @@ mod tests {
             !path_under_allowed_roots(Path::new("/tmp_evil/last_apply.json")),
             "sibling prefix of temp_dir must be refused"
         );
-        // When temp is /tmp, /tmp_evil must also fail last_apply_path_is_allowed.
-        if std::env::temp_dir() == Path::new("/tmp") {
+        // When clamped temp is /tmp (or ends with tmp), /tmp_evil must also fail.
+        let tr = last_apply_temp_root();
+        if tr == Path::new("/tmp") || tr.ends_with("tmp") {
             assert!(!last_apply_path_is_allowed(Path::new(
                 "/tmp_evil/last_apply.json"
             )));
@@ -3303,8 +5827,8 @@ mod tests {
 
     #[test]
     fn write_last_apply_best_effort_tmp() {
-        let dir =
-            std::env::temp_dir().join(format!("dragon_npu_last_apply_test_{}", std::process::id()));
+        let dir = last_apply_temp_root()
+            .join(format!("dragon_npu_last_apply_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("last_apply.json");
         let r = TimedOpResult {
@@ -3823,5 +6347,2566 @@ mod tests {
                 reason: "status_not_pass"
             }
         );
+    }
+
+    #[test]
+    fn journal_fw_status_pair_c2_live_shape() {
+        let j = "\
+amdxdna: Status 0x4000003\n\
+amdxdna: Failed cmd idx 0, status 0x3000003\n\
+amdxdna: wait finished\n";
+        let p = parse_journal_fw_status_pair(j);
+        assert_eq!(p.failed_cmd_status, Some(0x3_000_003));
+        assert_eq!(p.chain_status, Some(0x4_000_003));
+        assert!(p.is_c2_app_load_pair());
+        let note = p.format_soft_note();
+        assert!(note.contains("failed_cmd=0x3000003"));
+        assert!(note.contains("failed_cmd_name=APP_LOAD_PDI_FAIL"));
+        assert!(note.contains("chain_status=0x4000003"));
+        assert!(note.contains("chain_name=AIE2_STATUS_INVALID_PARAM"));
+        assert!(note.contains("c2_app_load_pair=1"));
+        assert!(note.contains("not_c_ready=1"));
+        assert!(note.contains("not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        // no invent when absent
+        let empty = parse_journal_fw_status_pair("hello\n");
+        assert!(empty.failed_cmd_status.is_none());
+        assert!(empty.chain_status.is_none());
+        assert!(!empty.is_c2_app_load_pair());
+        assert!(journal_line_has_app_load_hint(
+            "Failed cmd idx 0, status 0x3000003"
+        ));
+        assert!(journal_line_has_app_load_hint("Status 0x4000003"));
+        // One-sided journal never invents full pair.
+        let only_fail = parse_journal_fw_status_pair("Failed cmd idx 0, status 0x3000003\n");
+        assert_eq!(only_fail.failed_cmd_status, Some(0x3_000_003));
+        assert!(only_fail.chain_status.is_none());
+        assert!(!only_fail.is_c2_app_load_pair());
+        let only_chain = parse_journal_fw_status_pair("Status 0x4000003\n");
+        assert!(only_chain.failed_cmd_status.is_none());
+        assert_eq!(only_chain.chain_status, Some(0x4_000_003));
+        assert!(!only_chain.is_c2_app_load_pair());
+    }
+
+    #[test]
+    fn c2_live_cmdbuf_vs_pure_start_npu_rebuild_research() {
+        // Live paddrs from operator C2 last_apply (2026-07-18).
+        let ifm = 0x7fda_3b83_5000;
+        let wts = 0x7fda_3b66_b000;
+        let ofm = 0x7fda_3b83_4000;
+        let inst = 0x402_0000;
+        let pure =
+            rebuild_c2_live_start_npu_cmd_bo(inst, 1688, ifm, wts, ofm, 0x1).expect("rebuild");
+        let dec = decode_start_npu_cmd_bo(&pure).expect("decode pure");
+        assert_eq!(dec.prop_count, 0, "shim I/O uses prop_count=0");
+        assert_eq!(dec.inst_size, 1688);
+        assert_eq!(dec.inst_addr, inst);
+        assert_eq!(dec.cu_mask, 0x1);
+        assert_eq!(dec.flexible_args.len(), 15);
+        assert_eq!(dec.flexible_args[0], 3, "xrt3 n_bos low");
+        // IFM lo after marker (u64 3, u64 0, u32 0) = index 5
+        assert_eq!(dec.flexible_args[5], (ifm & 0xffff_ffff) as u32);
+        assert_eq!(dec.flexible_args[6], (ifm >> 32) as u32);
+
+        let live = c2_live_cmdbuf_words_embedded();
+        assert_eq!(live.len(), 28);
+        assert!(live.contains(&0x698));
+        assert_eq!(
+            live[12], 0xf,
+            "live dump has 0xf at word12 (research marker)"
+        );
+        assert_eq!(live[1], 0x0402_0000, "instr lo appears early in live dump");
+        // Live dump is longer / different framing than pure 21-word BO.
+        let pure_words: Vec<u32> = pure
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(pure_words.len(), 21); // header + 20 data
+        let d = diff_u32_word_lists(&pure_words, live);
+        assert!(d.first_mismatch.is_some(), "live dump ≠ pure BO framing");
+        assert_ne!(d.left_len, d.right_len);
+
+        let note = format_c2_cmdbuf_research_note(&pure, live);
+        assert!(note.contains("envelope_exact_match=0"));
+        assert!(note.contains("pure_prop_count=0"));
+        assert!(note.contains("live_word12_is_0xf=1"));
+        assert!(note.contains("hypothesis_live_prop_count_15_or_framing=1"));
+        assert!(note.contains("not_c_ready=1"));
+        assert!(note.contains("invent_pass=0"));
+
+        // Tracked fixture must parse to the same words (always required in-tree).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/gt_capture/c2_live_cmdbuf_words.txt");
+        assert!(
+            path.is_file(),
+            "tracked fixture missing: {}",
+            path.display()
+        );
+        let text = std::fs::read_to_string(&path).expect("read fixture");
+        let from_file = parse_u32_hex_word_list(&text).expect("parse fixture");
+        assert_eq!(from_file.as_slice(), live);
+    }
+
+    /// Track F — semantic map of live 28w dump vs pure xrt3 rebuild paddrs.
+    #[test]
+    fn decode_c2_live_cmdbuf_research_semantic_map() {
+        let (inst, ifm, wts, ofm, _ctrl) = c2_live_io_paddrs_locked();
+        let expect = C2ExpectPaddrs::from_c2_locked_io();
+        assert!(expect.is_complete_and_valid());
+        let pure =
+            rebuild_c2_live_start_npu_cmd_bo(inst, 1688, ifm, wts, ofm, 0x1).expect("rebuild");
+        let live = c2_live_cmdbuf_words_embedded();
+        assert_eq!(live.len(), C2_LIVE_CMDBUF_WORD_COUNT);
+
+        let map = decode_c2_live_cmdbuf_research(live, Some(&pure), expect);
+        assert_eq!(map.live_word_count, 28);
+        assert_eq!(map.suspected_framing_extra_words, 7); // 28 − 21
+        assert_eq!(map.instr_addr, Some(inst));
+        assert_eq!(map.instr_size, Some(0x698));
+        assert_eq!(map.word12_marker, Some(0xf));
+        assert_eq!(map.n_bos_token, Some(3));
+        assert_eq!(map.ifm_paddr, Some(ifm));
+        assert_eq!(map.wts_paddr, Some(wts));
+        assert_eq!(map.ofm_paddr, Some(ofm));
+        assert!(map.logical_paddrs_match_expect);
+        assert!(!map.envelope_exact_match, "cmdlist framing ≠ pure BO");
+        assert!(!map.pure_bo_unaligned);
+
+        let note = map.format_soft_note();
+        assert!(note.contains("c2_live_cmdbuf_map"));
+        assert!(note.contains("envelope_exact_match=0"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "logical_paddrs_match_expect=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "logical_paddrs_match_pure=1"
+        ));
+        assert!(note.contains("instr_size=0x698"));
+        assert!(note.contains("word12_is_0xf=1"));
+        assert!(note.contains("do_not_invent_prop_count_15=1"));
+        assert!(note.contains("word12_marker_0xf_research=1"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(!residual_note_has_exact_token(&note, "ran_on_npu=1"));
+        assert!(note.contains(&format!("ifm=0x{ifm:x}")));
+        assert!(note.contains("suspected_framing_extra_words=7"));
+
+        // Convenience wrapper full equality.
+        let map2 = decode_c2_live_cmdbuf_vs_pure_rebuild(&pure, expect);
+        assert_eq!(map2, map);
+
+        // Wrong expected IFM → logical match fails (no invent).
+        let mut bad_expect = expect;
+        bad_expect.ifm = Some(0xdead_beef);
+        let bad = decode_c2_live_cmdbuf_research(live, Some(&pure), bad_expect);
+        assert!(!bad.logical_paddrs_match_expect);
+
+        // Partial expect (only ifm) must not claim full logical match even if ifm ok.
+        let partial = C2ExpectPaddrs {
+            ifm: Some(ifm),
+            ..C2ExpectPaddrs::default()
+        };
+        let part = decode_c2_live_cmdbuf_research(live, Some(&pure), partial);
+        assert!(!part.logical_paddrs_match_expect);
+        assert!(!partial.is_complete());
+
+        // Mismatch wts / ofm / instr alone.
+        for field in ["instr", "wts", "ofm"] {
+            let mut e = expect;
+            match field {
+                "instr" => e.instr = Some(0x1111_2222),
+                "wts" => e.wts = Some(0xdead_beef_cafe),
+                "ofm" => e.ofm = Some(0xfeed_face_0000),
+                _ => unreachable!(),
+            }
+            let m = decode_c2_live_cmdbuf_research(live, Some(&pure), e);
+            assert!(
+                !m.logical_paddrs_match_expect,
+                "mismatch {field} must clear full match"
+            );
+        }
+
+        // Wrong instr size at locked index → size_ok false.
+        let mut live_bad_sz: Vec<u32> = live.to_vec();
+        live_bad_sz[C2_LIVE_INSTR_SIZE_WORD_IDX] = 0x1000;
+        let bad_sz = decode_c2_live_cmdbuf_research(&live_bad_sz, Some(&pure), expect);
+        assert!(!bad_sz.logical_paddrs_match_expect);
+        assert_eq!(bad_sz.instr_size, Some(0x1000));
+
+        // Invalid live paddr (zero) → field None + no full match even if expect=0.
+        let mut live_z: Vec<u32> = live.to_vec();
+        live_z[C2_LIVE_IFM_LO_WORD_IDX] = 0;
+        live_z[C2_LIVE_IFM_LO_WORD_IDX + 1] = 0;
+        let zero_got = decode_c2_live_cmdbuf_research(&live_z, Some(&pure), expect);
+        assert!(zero_got.ifm_paddr.is_none());
+        assert!(!zero_got.logical_paddrs_match_expect);
+        let expect_zero = C2ExpectPaddrs {
+            instr: Some(inst),
+            ifm: Some(0),
+            wts: Some(wts),
+            ofm: Some(ofm),
+        };
+        assert!(!expect_zero.is_complete_and_valid());
+        let zmatch = decode_c2_live_cmdbuf_research(&live_z, Some(&pure), expect_zero);
+        assert!(!zmatch.logical_paddrs_match_expect);
+
+        // Short dump: no locked fields; no size invent from bare contains.
+        let short = &live[..20];
+        let sh = decode_c2_live_cmdbuf_research(short, Some(&pure), expect);
+        assert!(sh.instr_addr.is_none());
+        assert!(sh.instr_size.is_none());
+        assert!(sh.ifm_paddr.is_none());
+        assert!(!sh.logical_paddrs_match_expect);
+        assert!(!sh.envelope_exact_match);
+
+        // Unaligned pure BO → pure_bo_unaligned + envelope false.
+        let mut unaligned = pure.clone();
+        unaligned.push(0xaa);
+        let ua = decode_c2_live_cmdbuf_research(live, Some(&unaligned), expect);
+        assert!(ua.pure_bo_unaligned);
+        assert!(!ua.envelope_exact_match);
+
+        // Envelope exact match when pure words == live words.
+        let live_as_bo: Vec<u8> = live.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let env_ok = decode_c2_live_cmdbuf_research(live, Some(&live_as_bo), expect);
+        assert!(env_ok.envelope_exact_match);
+        assert_eq!(env_ok.suspected_framing_extra_words, 0);
+        // Flip one pure word → envelope false; logical may still hold.
+        let mut flipped = live_as_bo.clone();
+        flipped[0] ^= 0xff;
+        let env_bad = decode_c2_live_cmdbuf_research(live, Some(&flipped), expect);
+        assert!(!env_bad.envelope_exact_match);
+        assert!(env_bad.logical_paddrs_match_expect);
+
+        // No expectations → vacuous logical match stays false.
+        let bare = decode_c2_live_cmdbuf_research(live, None, C2ExpectPaddrs::default());
+        assert!(!bare.logical_paddrs_match_expect);
+        assert!(!bare.envelope_exact_match);
+        assert_eq!(bare.instr_addr, Some(inst));
+        assert_eq!(bare.instr_size, Some(0x698));
+        assert_eq!(bare.ifm_paddr, Some(ifm));
+        assert_eq!(bare.suspected_framing_extra_words, 7);
+    }
+
+    /// Track G — cmdlist msg size 0x70 locks to 112 B cmdbuf.
+    #[test]
+    fn c2_live_cmdlist_msg_size_0x70_matches_cmdbuf() {
+        let msg = c2_live_cmdlist_msg_words_embedded();
+        assert_eq!(msg.len(), 6);
+        assert_eq!(msg[4], C2_LIVE_CMDLIST_MSG_SIZE_BYTES);
+        assert_eq!(C2_LIVE_CMDLIST_MSG_SIZE_BYTES, 0x70);
+        assert_eq!(
+            C2_LIVE_CMDLIST_MSG_SIZE_BYTES as usize,
+            C2_LIVE_CMDBUF_WORD_COUNT * 4
+        );
+        assert_eq!(
+            C2_LIVE_CMDLIST_MSG_SIZE_BYTES as usize,
+            c2_live_cmdbuf_words_embedded().len() * 4
+        );
+        let note = format_c2_cmdlist_msg_research_note(msg);
+        assert!(note.contains("msg_size_field=0x70"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "msg_size_matches_expected=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "msg_size_matches_cmdbuf=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "expected_cmdlist_msg_size=0x70"
+        ));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+
+        // Wrong size at index 4.
+        let mut bad_msg = msg.to_vec();
+        bad_msg[4] = 0x40;
+        let nbad = format_c2_cmdlist_msg_research_note(&bad_msg);
+        assert!(residual_note_has_exact_token(
+            &nbad,
+            "msg_size_matches_expected=0"
+        ));
+
+        // Short / empty msg → size field absent.
+        let nempty = format_c2_cmdlist_msg_research_note(&[]);
+        assert!(nempty.contains("msg_size_field=absent"));
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/gt_capture/c2_live_cmdlist_msg_words.txt");
+        assert!(
+            path.is_file(),
+            "tracked fixture missing: {}",
+            path.display()
+        );
+        let text = std::fs::read_to_string(&path).expect("read");
+        let from_file = parse_u32_hex_word_list(&text).expect("parse");
+        assert_eq!(from_file.as_slice(), msg);
+    }
+
+    /// Track H — empty / non-aiebu / invalid paddr + staged or synthetic ELF.
+    #[test]
+    fn audit_aiebu_rela_with_c2_live_paddrs_offline() {
+        let empty = audit_aiebu_rela_with_live_paddrs(&[], 1, 2, 3, 4);
+        assert!(!empty.elf_present);
+        assert!(!empty.patched_ctrltext_walk_ok);
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(&en, "elf_present=0"));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+
+        // Non-aiebu non-empty bytes.
+        let garbage = audit_aiebu_rela_with_live_paddrs(b"not-elf", 1, 2, 3, 4);
+        assert!(garbage.elf_present);
+        assert!(!garbage.patched_ctrltext_walk_ok);
+        assert_eq!(garbage.detail, "not_aiebu_elf_ctrltext");
+        let gn = garbage.format_soft_note();
+        assert!(gn.contains("not_aiebu_elf_ctrltext"));
+        assert!(!gn.contains("userspace_patch_ok_fw_load_still_open=1"));
+        assert!(residual_note_has_exact_token(&gn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&gn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&gn, "not_ran_on_npu=1"));
+
+        let (_inst, ifm, wts, ofm, ctrl) = c2_live_io_paddrs_locked();
+
+        // Synthetic minimal aiebu ELF — always CI-meaningful (patch+walk path).
+        let ctrltext = build_strix_research_noop_txn().expect("noop txn");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        assert!(is_aiebu_elf_ctrltext(&synth));
+        // Zero paddr refuse (any of ifm/wts/ofm/ctrl).
+        let inv = audit_aiebu_rela_with_live_paddrs(&synth, 0, wts, ofm, ctrl);
+        assert!(inv.elf_present);
+        assert!(!inv.patched_ctrltext_walk_ok);
+        assert_eq!(inv.detail, "invalid_live_paddr");
+        // u64::MAX is also invalid (same refuse path as zero).
+        let inv_max = audit_aiebu_rela_with_live_paddrs(&synth, ifm, wts, ofm, u64::MAX);
+        assert!(inv_max.elf_present);
+        assert!(!inv_max.patched_ctrltext_walk_ok);
+        assert_eq!(inv_max.detail, "invalid_live_paddr");
+        // Valid paddrs → patch path runs (walk may fail on noop txn — still not skip).
+        let a_syn = audit_aiebu_rela_with_live_paddrs(&synth, ifm, wts, ofm, ctrl);
+        assert!(a_syn.elf_present);
+        assert_ne!(a_syn.detail.as_str(), "invalid_live_paddr");
+        // One crafted rela — must not soft-skip with rela_count=0 / empty detail.
+        assert_eq!(a_syn.rela_count, Some(1));
+        assert!(
+            a_syn.detail.starts_with("classic_walk_ok")
+                || a_syn.detail.starts_with("walk_failed")
+                || a_syn.detail.starts_with("patch_failed"),
+            "expected post-parse detail, got {:?}",
+            a_syn.detail
+        );
+        let sn = a_syn.format_soft_note();
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&sn, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&sn, "ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "userspace_elf_rela_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(&sn, "rela_count=1"));
+
+        // Optional full staged mladf only (silicon_lab / gt_capture) — never the
+        // 1072 B research stub (`testdata/xdna2_cmd/lab_instr.elf`, rela×1).
+        // Align with Track K soft-skip: gate ×12/1688 before hard assert.
+        let paths = [
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/gt_capture/instr_pre.elf"),
+        ];
+        let mut ran_staged = false;
+        for p in &paths {
+            if !p.is_file() {
+                continue;
+            }
+            let Ok(elf) = std::fs::read(p) else {
+                continue;
+            };
+            if !is_aiebu_elf_ctrltext(&elf) {
+                continue;
+            }
+            let a = audit_aiebu_rela_with_live_paddrs(&elf, ifm, wts, ofm, ctrl);
+            // Gate: only lock ×12/1688 when candidate is full staged mladf.
+            if a.rela_count != Some(12) || a.patched_ctrltext_len != Some(1688) {
+                eprintln!(
+                    "OFFLINE_ASSET_SKIP: aiebu at {} not staged mladf (rela={:?} len={:?})",
+                    p.display(),
+                    a.rela_count,
+                    a.patched_ctrltext_len
+                );
+                continue;
+            }
+            assert!(a.elf_present);
+            assert!(
+                a.patched_ctrltext_walk_ok,
+                "classic walk should pass offline: {}",
+                a.detail
+            );
+            let n = a.format_soft_note();
+            assert!(residual_note_has_exact_token(&n, "userspace_elf_rela_ok=1"));
+            assert!(residual_note_has_exact_token(&n, "userspace_rela_ok=1"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "userspace_patch_ok_fw_load_still_open=1"
+            ));
+            assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+            assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+            ran_staged = true;
+            break;
+        }
+        if !ran_staged {
+            eprintln!(
+                "OFFLINE_ASSET_SKIP: no full staged mladf aiebu ELF (synthetic path still locked)"
+            );
+        }
+        // Require staged only when env is explicitly truthy (`1` / `true`), same
+        // convention as `XDNA2_LAB_PRINT_C2_CMDBUF_RESEARCH` — presence of `0`/`false`
+        // must NOT force the hard assert.
+        if env_flag_truthy_os("XDNA2_REQUIRE_STAGED_ELF") {
+            assert!(
+                ran_staged,
+                "XDNA2_REQUIRE_STAGED_ELF=1|true but no full staged mladf ELF found"
+            );
+        }
+    }
+
+    /// Track I — checklist optional journal dual codes; absent stays honest.
+    #[test]
+    fn app_load_checklist_journal_dual_optional() {
+        let sig = LastApplyDetailSignals {
+            aiebu_elf: Some(true),
+            rela_count: Some(12),
+            aiebu_rela_patched: true,
+            ert_error: true,
+            instr_bo_type: Some("Dev".into()),
+            instr_map_offset: Some(u64::MAX),
+            content_size_b: Some(1688),
+            start_npu_size_b: Some(1688),
+            bo_size_b: Some(4096),
+            ofm_raw_nonzero_bytes: Some(0),
+            submit_wait_not_ok: true,
+            fw_status_code: None, // detail lacks hex — common last_apply shape
+            ..LastApplyDetailSignals::default()
+        };
+        let class = SiliconResidualClass::AppLoadPdiFailAfterAiebu;
+
+        // No journal → absent honesty (and fw_code_absent from detail).
+        let ck = format_app_load_offline_checklist(class, &sig);
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "fw_code_absent_in_detail=1"
+        ));
+        assert!(residual_note_has_exact_token(&ck, "journal_text_absent=1"));
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "journal_c2_app_load_pair=1"
+        ));
+        assert!(!ck.contains("journal_c2_app_load_pair=")); // omit pair when absent
+        assert!(residual_note_has_exact_token(&ck, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ck, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&ck, "invent_pass=0"));
+        assert!(!residual_note_has_exact_token(&ck, "ran_on_npu=1"));
+
+        let j = "\
+amdxdna: Status 0x4000003\n\
+amdxdna: Failed cmd idx 0, status 0x3000003\n";
+        let ck_j = format_app_load_offline_checklist_ex(class, &sig, Some(j));
+        assert!(residual_note_has_exact_token(
+            &ck_j,
+            "journal_failed_cmd=0x3000003"
+        ));
+        assert!(ck_j.contains("journal_failed_cmd_name=APP_LOAD_PDI_FAIL"));
+        assert!(residual_note_has_exact_token(
+            &ck_j,
+            "journal_chain_status=0x4000003"
+        ));
+        assert!(ck_j.contains("journal_chain_name=AIE2_STATUS_INVALID_PARAM"));
+        assert!(residual_note_has_exact_token(
+            &ck_j,
+            "journal_c2_app_load_pair=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_j,
+            "fw_code_absent_in_detail=1"
+        )); // detail still lacks
+        assert!(!residual_note_has_exact_token(
+            &ck_j,
+            "journal_text_absent=1"
+        ));
+        assert!(residual_note_has_exact_token(&ck_j, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&ck_j, "invent_pass=0"));
+        assert!(!residual_note_has_exact_token(&ck_j, "ran_on_npu=1"));
+        // Empty journal string treated as absent.
+        let ck_e = format_app_load_offline_checklist_ex(class, &sig, Some("  \n"));
+        assert!(residual_note_has_exact_token(
+            &ck_e,
+            "journal_text_absent=1"
+        ));
+        // No invent pair from unrelated text.
+        let ck_u = format_app_load_offline_checklist_ex(class, &sig, Some("hello world\n"));
+        assert!(residual_note_has_exact_token(
+            &ck_u,
+            "journal_failed_cmd=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_u,
+            "journal_chain_status=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_u,
+            "journal_c2_app_load_pair=0"
+        ));
+        // One-sided: Failed cmd only → pair=0, chain absent.
+        let ck_one = format_app_load_offline_checklist_ex(
+            class,
+            &sig,
+            Some("Failed cmd idx 0, status 0x3000003\n"),
+        );
+        assert!(residual_note_has_exact_token(
+            &ck_one,
+            "journal_failed_cmd=0x3000003"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_one,
+            "journal_chain_status=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_one,
+            "journal_c2_app_load_pair=0"
+        ));
+        // One-sided: chain Status only.
+        let ck_ch = format_app_load_offline_checklist_ex(class, &sig, Some("Status 0x4000003\n"));
+        assert!(residual_note_has_exact_token(
+            &ck_ch,
+            "journal_failed_cmd=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_ch,
+            "journal_chain_status=0x4000003"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck_ch,
+            "journal_c2_app_load_pair=0"
+        ));
+    }
+
+    /// Track K — pure SHA-256 FIPS vectors (empty, abc, multi-block) + oversize refuse.
+    #[test]
+    fn sha256_hex_lower_fips_vectors_and_oversize() {
+        assert_eq!(
+            sha256_hex_lower(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex_lower(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Multi-block FIPS-180-2 vector (56 bytes → padding crosses block).
+        let multi = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        assert_eq!(
+            sha256_hex_lower(multi),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(sha256_digest(b"abc").map(|d| d.len()), Some(32));
+        // Oversize refuse at public boundary (no multi-GiB clone).
+        let over = vec![0_u8; (MAX_INSTRUCTION_BLOB_BYTES as usize).saturating_add(1)];
+        assert!(sha256_digest(&over).is_none());
+        assert!(sha256_hex_lower(&over).is_empty());
+    }
+
+    #[test]
+    fn txn_op_opcode_profile_table() {
+        use super::super::txn::XaieTxnOp;
+        let empty = TxnOpOpcodeProfile::from_ops(&[]);
+        assert_eq!(empty.total, 0);
+        assert_eq!(
+            empty.format_soft_tokens(),
+            "op_total=0 op_write=0 op_block_write=0 op_block_set=0 op_mask_write=0 op_mask_poll=0 op_noop=0 op_preempt=0 op_mask_poll_busy=0 op_custom_or_other=0"
+        );
+        let mut ops = Vec::new();
+        for op in 0_u8..=7 {
+            ops.push(XaieTxnOp {
+                opcode: op,
+                byte_offset: 0,
+                byte_len: 4,
+            });
+        }
+        ops.push(XaieTxnOp {
+            opcode: 128,
+            byte_offset: 0,
+            byte_len: 4,
+        });
+        let p = TxnOpOpcodeProfile::from_ops(&ops);
+        assert_eq!(p.total, 9);
+        assert_eq!(p.write, 1);
+        assert_eq!(p.block_write, 1);
+        assert_eq!(p.block_set, 1);
+        assert_eq!(p.mask_write, 1);
+        assert_eq!(p.mask_poll, 1);
+        assert_eq!(p.noop, 1);
+        assert_eq!(p.preempt, 1);
+        assert_eq!(p.mask_poll_busy, 1);
+        assert_eq!(p.custom_or_other, 1);
+        assert_eq!(
+            p.format_soft_tokens(),
+            "op_total=9 op_write=1 op_block_write=1 op_block_set=1 op_mask_write=1 op_mask_poll=1 op_noop=1 op_preempt=1 op_mask_poll_busy=1 op_custom_or_other=1"
+        );
+        // Gap opcode 8 also custom_or_other.
+        let gap = TxnOpOpcodeProfile::from_ops(&[XaieTxnOp {
+            opcode: 8,
+            byte_offset: 0,
+            byte_len: 1,
+        }]);
+        assert_eq!(gap.custom_or_other, 1);
+        assert_eq!(gap.total, 1);
+    }
+
+    #[test]
+    fn profile_instr_payload_bytes_branches_and_honesty() {
+        let empty = profile_instr_payload_bytes(&[]);
+        assert_eq!(empty.blob_kind, "empty");
+        assert!(!empty.classic_walk_ok);
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "pdi_marker_public=marker_absent_public"
+        ));
+
+        let noop = build_strix_research_noop_txn().expect("noop");
+        let p = profile_instr_payload_bytes(&noop);
+        assert_eq!(p.blob_kind, "classic_txn_v01");
+        assert!(p.classic_walk_ok);
+        assert!(p.payload_len > 0);
+        assert_eq!(p.payload_sha256_hex.len(), 64);
+        assert_eq!(p.payload_sha256_hex, sha256_hex_lower(&noop));
+        let n = p.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(n.contains("op_total="));
+        assert!(!p.staged_mladf_classic_profile);
+
+        // unknown_raw short non-txn
+        let raw = profile_instr_payload_bytes(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(raw.blob_kind, "unknown_raw");
+        assert!(!raw.classic_walk_ok);
+        let rn = raw.format_soft_note();
+        assert!(residual_note_has_exact_token(&rn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&rn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&rn, "not_ran_on_npu=1"));
+
+        // aie2_elf_ctrltext_unpeeled when full ELF slipped into profile
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let elf = build_minimal_test_elf32(&ctrltext, &relas);
+        assert!(is_aiebu_elf_ctrltext(&elf));
+        let unp = profile_instr_payload_bytes(&elf);
+        assert_eq!(unp.blob_kind, "aie2_elf_ctrltext_unpeeled");
+        assert!(!unp.classic_walk_ok);
+        let un = unp.format_soft_note();
+        assert!(residual_note_has_exact_token(&un, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&un, "not_c_ready=1"));
+
+        // oversized_refused
+        let over = vec![0_u8; (MAX_INSTRUCTION_BLOB_BYTES as usize).saturating_add(1)];
+        let o = profile_instr_payload_bytes(&over);
+        assert_eq!(o.blob_kind, "oversized_refused");
+        assert!(o.payload_sha256_hex.is_empty());
+        let on = o.format_soft_note();
+        assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&on, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&on, "not_ran_on_npu=1"));
+
+        // txn_header_only: buffer_len == txn_size but op walk fails (garbage body).
+        // XAie layout: major/minor/dev_gen/rows/cols/mem @0..6; num_ops @8; txn_size @12.
+        let mut hdr_only = vec![0_u8; 32];
+        hdr_only[0] = 0; // major
+        hdr_only[1] = 1; // minor (v0.1)
+        hdr_only[2] = 4; // dev_gen
+        hdr_only[3] = 8; // num_rows
+        hdr_only[4] = 6; // num_cols
+        hdr_only[5] = 0; // num_mem_tile_rows
+        hdr_only[8..12].copy_from_slice(&1_u32.to_le_bytes()); // num_ops=1
+        hdr_only[12..16].copy_from_slice(&32_u32.to_le_bytes()); // txn_size == len
+        // body[16..] left zeros → walk fails → TxnHeaderOnly
+        let ho = profile_instr_payload_bytes(&hdr_only);
+        assert_eq!(ho.blob_kind, "txn_header_only", "detail payload={ho:?}");
+        assert!(!ho.classic_walk_ok);
+        assert!(!ho.staged_mladf_classic_profile);
+        let hn = ho.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hn,
+            "blob_kind=txn_header_only"
+        ));
+        assert!(residual_note_has_exact_token(&hn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&hn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&hn, "not_ran_on_npu=1"));
+    }
+
+    #[test]
+    fn profile_instr_payload_after_rela_ci_mandatory_userspace_ok() {
+        // Empty / garbage / invalid paddr honesty.
+        let empty = profile_instr_payload_after_rela(&[], 1, 2, 3, 4);
+        assert!(!empty.userspace_ok_fw_load_open);
+        assert!(empty.payload.is_none());
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &en,
+            "userspace_ok_fw_load_open=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "userspace_patch_ok_fw_load_still_open=0"
+        ));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+
+        let garbage = profile_instr_payload_after_rela_c2_locked(b"not-elf");
+        assert!(!garbage.userspace_ok_fw_load_open);
+        assert_eq!(garbage.detail, "not_aiebu_elf_ctrltext");
+        let gn = garbage.format_soft_note();
+        assert!(residual_note_has_exact_token(&gn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&gn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&gn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &gn,
+            "userspace_ok_fw_load_open=0"
+        ));
+
+        let (_i, _ifm, wts, ofm, ctrl) = c2_live_io_paddrs_locked();
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let inv = profile_instr_payload_after_rela(&synth, 0, wts, ofm, ctrl);
+        assert!(!inv.userspace_ok_fw_load_open);
+        assert_eq!(inv.detail, "invalid_live_paddr");
+
+        // CI-mandatory: synthetic ELF + 1 rela + walkable noop ctrltext → userspace_ok=1.
+        let a_syn = profile_instr_payload_after_rela_c2_locked(&synth);
+        assert!(a_syn.rela_audit.elf_present);
+        assert!(
+            a_syn.userspace_ok_fw_load_open,
+            "synthetic noop+rela must lock userspace_ok without staged asset: detail={}",
+            a_syn.detail
+        );
+        assert_eq!(a_syn.rela_audit.rela_count, Some(1));
+        assert!(a_syn.rela_audit.patched_ctrltext_walk_ok);
+        let pay = a_syn.payload.as_ref().expect("payload after single patch");
+        assert!(pay.classic_walk_ok);
+        assert_eq!(pay.blob_kind, "classic_txn_v01");
+        assert_eq!(pay.payload_sha256_hex.len(), 64);
+        // Exact soft tokens from fields (no weak contains OR).
+        let sn = a_syn.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "userspace_ok_fw_load_open=1"
+        ));
+        // Track H alias = walk_ok alone (same 1 here because walk OK).
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "userspace_patch_ok_fw_load_still_open=1"
+        ));
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&sn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&sn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            &format!("payload_sha256={}", pay.payload_sha256_hex)
+        ));
+        assert!(!pay.staged_mladf_classic_profile);
+        // Single-patch: rela_audit holds same bytes as profiled.
+        assert_eq!(
+            a_syn.rela_audit.patched_ctrltext.as_ref().map(|b| b.len()),
+            Some(pay.payload_len)
+        );
+
+        // Optional full staged mladf (silicon_lab / gt_capture only — not 1072 B stub).
+        let paths = [
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/gt_capture/instr_pre.elf"),
+        ];
+        let mut ran = false;
+        for pth in &paths {
+            if !pth.is_file() {
+                continue;
+            }
+            let elf = match std::fs::read(pth) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !is_aiebu_elf_ctrltext(&elf) {
+                continue;
+            }
+            let r = profile_instr_payload_after_rela_c2_locked(&elf);
+            // Gate: only lock ×12/1688 when candidate is full staged mladf.
+            if r.rela_audit.rela_count != Some(12)
+                || r.rela_audit.patched_ctrltext_len != Some(1688)
+            {
+                eprintln!(
+                    "OFFLINE_ASSET_SKIP: aiebu at {} not staged mladf (rela={:?} len={:?})",
+                    pth.display(),
+                    r.rela_audit.rela_count,
+                    r.rela_audit.patched_ctrltext_len
+                );
+                continue;
+            }
+            assert!(r.userspace_ok_fw_load_open, "detail={}", r.detail);
+            let pay = r.payload.as_ref().expect("payload");
+            assert_eq!(pay.payload_len, 1688);
+            assert!(pay.classic_walk_ok);
+            assert!(pay.staged_mladf_classic_profile);
+            assert_eq!(pay.txn_num_ops, Some(40));
+            assert_eq!(pay.blob_kind, "classic_txn_v01");
+            assert_eq!(pay.payload_sha256_hex.len(), 64);
+            let op = pay.op_profile.as_ref().expect("ops");
+            assert_eq!(op.total, 40);
+            let n = r.format_soft_note();
+            assert!(residual_note_has_exact_token(
+                &n,
+                "userspace_ok_fw_load_open=1"
+            ));
+            assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "staged_mladf_classic_profile=1"
+            ));
+            assert!(residual_note_has_exact_token(
+                &n,
+                &format!("payload_sha256={}", pay.payload_sha256_hex)
+            ));
+            assert!(residual_note_has_exact_token(&n, "op_total=40"));
+            let r2 = profile_instr_payload_after_rela_c2_locked(&elf);
+            assert_eq!(
+                r.payload.as_ref().unwrap().payload_sha256_hex,
+                r2.payload.as_ref().unwrap().payload_sha256_hex
+            );
+            ran = true;
+            break;
+        }
+        if !ran {
+            eprintln!(
+                "OFFLINE_ASSET_SKIP: no full staged mladf aiebu ELF (synthetic userspace_ok still locked)"
+            );
+        }
+        if env_flag_truthy_os("XDNA2_REQUIRE_STAGED_ELF") {
+            assert!(
+                ran,
+                "XDNA2_REQUIRE_STAGED_ELF requires full staged mladf ELF for Track K"
+            );
+        }
+    }
+
+    #[test]
+    fn instr_pdi_research_token_divergence_walk_vs_userspace_ok() {
+        // Production path: empty-rela ELF refuses patch → walk=0 and userspace_ok=0
+        // (cannot produce walk=1 without rela via public API). Lock soft-note
+        // predicates via direct field construction instead.
+        let walk_ok_no_rela = InstrPdiLoadResearch {
+            rela_audit: C2RelaPaddrAudit {
+                elf_present: true,
+                rela_count: Some(0),
+                patched_ctrltext_walk_ok: true,
+                patched_ctrltext_len: Some(416),
+                patched_ctrltext: None,
+                detail: "walk_ok_forced_no_rela".into(),
+            },
+            payload: Some(InstrPayloadProfile {
+                payload_len: 416,
+                classic_walk_ok: true,
+                blob_kind: "classic_txn_v01".into(),
+                ..InstrPayloadProfile::default()
+            }),
+            // Stricter bit: walk alone is not enough without rela>0.
+            userspace_ok_fw_load_open: false,
+            detail: "walk_ok_but_no_rela_or_profile".into(),
+        };
+        let n = walk_ok_no_rela.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "userspace_ok_fw_load_open=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "userspace_patch_ok_fw_load_still_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "patched_ctrltext_walk_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "rela_count=0"));
+
+        // walk=1 + rela>0 but classic_walk_ok=false → userspace_ok still 0.
+        let walk_ok_no_classic = InstrPdiLoadResearch {
+            rela_audit: C2RelaPaddrAudit {
+                elf_present: true,
+                rela_count: Some(1),
+                patched_ctrltext_walk_ok: true,
+                patched_ctrltext_len: Some(64),
+                patched_ctrltext: None,
+                detail: "walk_ok_profile_not_classic".into(),
+            },
+            payload: Some(InstrPayloadProfile {
+                payload_len: 64,
+                classic_walk_ok: false,
+                blob_kind: "unknown_raw".into(),
+                ..InstrPayloadProfile::default()
+            }),
+            userspace_ok_fw_load_open: false,
+            detail: "walk_ok_but_no_rela_or_profile".into(),
+        };
+        let n2 = walk_ok_no_classic.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n2,
+            "userspace_patch_ok_fw_load_still_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n2,
+            "userspace_ok_fw_load_open=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n2,
+            "userspace_elf_rela_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(&n2, "invent_pass=0"));
+
+        // Empty-rela production path: never invent userspace_ok=1.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let elf_no_rela = build_minimal_test_elf32(&ctrltext, &[]);
+        let r = profile_instr_payload_after_rela_c2_locked(&elf_no_rela);
+        assert!(!r.userspace_ok_fw_load_open);
+        let rn = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &rn,
+            "userspace_ok_fw_load_open=0"
+        ));
+        assert!(residual_note_has_exact_token(&rn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&rn, "not_c_ready=1"));
+    }
+
+    #[test]
+    fn cross_check_c2_cmdlist_fill_public_locked_and_negatives() {
+        let (inst, ifm, wts, ofm, _ctrl) = c2_live_io_paddrs_locked();
+        let pure = rebuild_c2_live_start_npu_cmd_bo(inst, 1688, ifm, wts, ofm, 0x1).expect("pure");
+        let x = cross_check_c2_cmdlist_fill_locked(Some(&pure));
+        assert_eq!(x.live_cmdbuf_bytes, 112);
+        assert_eq!(x.cmdlist_msg_size_field, Some(0x70));
+        assert!(x.msg_size_matches_live_cmdbuf);
+        assert!(x.pure_is_21w_start_npu);
+        assert_eq!(x.pure_start_npu_bytes, Some(84));
+        assert!(x.live_instr_size_content_1688);
+        assert!(x.logical_paddrs_match_expect);
+        assert!(!x.envelope_exact_match);
+        let n = x.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "fill_slot_body_invent=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_prop_count_15=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "fill_slot_public_expect=msg_size_eq_cmdbuf_dump"
+        ));
+
+        // Bare (no pure) still maps msg size + honesty.
+        let bare = cross_check_c2_cmdlist_fill_locked(None);
+        assert!(bare.msg_size_matches_live_cmdbuf);
+        assert!(!bare.pure_is_21w_start_npu);
+        let bn = bare.format_soft_note();
+        assert!(residual_note_has_exact_token(&bn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&bn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&bn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &bn,
+            "do_not_invent_prop_count_15=1"
+        ));
+
+        // Negatives: empty live, short msg, wrong pure len (84 zeros ≠ START_NPU).
+        let empty_live = cross_check_c2_cmdlist_fill_public(&[], &[], Some(&pure));
+        assert!(!empty_live.msg_size_matches_live_cmdbuf);
+        assert_eq!(empty_live.live_cmdbuf_bytes, 0);
+        let en = empty_live.format_soft_note();
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "do_not_invent_prop_count_15=1"
+        ));
+
+        let short_msg = cross_check_c2_cmdlist_fill_public(
+            c2_live_cmdbuf_words_embedded(),
+            &[0, 0, 0], // no size at idx 4
+            Some(&pure),
+        );
+        assert!(!short_msg.msg_size_matches_live_cmdbuf);
+        assert_eq!(short_msg.cmdlist_msg_size_field, None);
+        let sn = short_msg.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "cmdlist_msg_size_field=absent"
+        ));
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+
+        let fake84 = vec![0_u8; 84];
+        let bad_pure = cross_check_c2_cmdlist_fill_locked(Some(&fake84));
+        assert!(!bad_pure.pure_is_21w_start_npu); // decode fails / prop_count not 0
+        assert_eq!(bad_pure.pure_start_npu_bytes, Some(84));
+        let bp = bad_pure.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &bp,
+            "pure_is_21w_start_npu=0"
+        ));
+        assert!(residual_note_has_exact_token(&bp, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &bp,
+            "do_not_invent_prop_count_15=1"
+        ));
+    }
+
+    #[test]
+    fn app_load_checklist_userspace_elf_rela_app_load_token_split() {
+        let sig_ok = LastApplyDetailSignals {
+            aiebu_elf: Some(true),
+            rela_count: Some(12),
+            aiebu_rela_patched: true,
+            ert_error: true,
+            instr_bo_type: Some("Dev".into()),
+            ofm_raw_nonzero_bytes: Some(0),
+            ..LastApplyDetailSignals::default()
+        };
+        let class = SiliconResidualClass::AppLoadPdiFailAfterAiebu;
+        let ck = format_app_load_offline_checklist(class, &sig_ok);
+        // Checklist uses distinct token (not research userspace_ok_fw_load_open).
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "checklist_userspace_elf_rela_app_load=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "userspace_ok_fw_load_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "userspace_elf_rela_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(&ck, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ck, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&ck, "invent_pass=0"));
+        // Track L checklist tokens on APP_LOAD class (public surface only).
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "checklist_partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "checklist_pdi_marker_public=marker_absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "checklist_public_pdi_image_decode=0"
+        ));
+        // Research token names must not leak into checklist without prefix.
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "pdi_marker_public=marker_absent_public"
+        ));
+
+        // (1) APP_LOAD class + aiebu + no rela → no checklist userspace token;
+        //     Track L surface tokens still emit (class-gated, not rela-gated).
+        let sig_no_rela = LastApplyDetailSignals {
+            aiebu_elf: Some(true),
+            rela_count: None,
+            aiebu_rela_patched: false,
+            ert_error: true,
+            ..LastApplyDetailSignals::default()
+        };
+        // Class label is forced here for emission gate isolation (classify may
+        // map aiebu-no-rela to ErtErrorUnknownBlob — still exercise APP_LOAD arm).
+        let ck1 = format_app_load_offline_checklist(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &sig_no_rela,
+        );
+        assert!(!residual_note_has_exact_token(
+            &ck1,
+            "checklist_userspace_elf_rela_app_load=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck1,
+            "userspace_ok_fw_load_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck1,
+            "checklist_partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck1,
+            "checklist_pdi_marker_public=marker_absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck1,
+            "checklist_public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(&ck1, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ck1, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&ck1, "invent_pass=0"));
+
+        // (2) non-APP_LOAD + aiebu + rela×12 → no checklist userspace token,
+        //     no Track L class-gated surface tokens.
+        let ck2 =
+            format_app_load_offline_checklist(SiliconResidualClass::ErtErrorUnknownBlob, &sig_ok);
+        assert!(!residual_note_has_exact_token(
+            &ck2,
+            "checklist_userspace_elf_rela_app_load=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck2,
+            "userspace_ok_fw_load_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck2,
+            "checklist_partition_surface_public=status_name_only"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck2,
+            "checklist_pdi_marker_public=marker_absent_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck2,
+            "checklist_public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(&ck2, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ck2, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&ck2, "invent_pass=0"));
+
+        // Locked APP_LOAD path: never invent decode=1 or prop_count=15.
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "checklist_public_pdi_image_decode=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "public_pdi_image_decode=1"
+        ));
+        assert!(!residual_note_has_exact_token(&ck, "prop_count=15"));
+        assert!(!residual_note_has_exact_token(
+            &ck,
+            "do_not_invent_prop_count_15=0"
+        ));
+    }
+
+    #[test]
+    fn app_load_pdi_partition_research_c2_locked_and_honesty() {
+        // CI-mandatory: locked C2 pair + APP_LOAD class + userspace content green.
+        let r = research_app_load_pdi_partition_c2_locked(true);
+        assert_eq!(r.failed_cmd_status, Some(AIE2_FW_APP_LOAD_PDI_FAIL));
+        assert_eq!(r.chain_status, Some(AIE2_FW_INVALID_PARAM));
+        assert!(r.c2_app_load_pair);
+        assert!(r.class_app_load_after_aiebu);
+        assert!(r.userspace_content_ok);
+        assert!(r.fw_residual_open_after_userspace);
+        assert_eq!(r.partition_surface_public, PUBLIC_PARTITION_SURFACE_TOKEN);
+        assert_eq!(r.pdi_marker_public, PUBLIC_PDI_MARKER_TOKEN);
+        assert_eq!(r.partition_surface_public, "status_name_only");
+        assert_eq!(r.pdi_marker_public, "marker_absent_public");
+
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "app_load_pdi_partition_research"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pdi_marker_public=marker_absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "fw_residual_open_after_userspace=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "userspace_content_ok=1"));
+        assert!(residual_note_has_exact_token(&n, "c2_app_load_pair=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "class_app_load_after_aiebu=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "failed_cmd=0x3000003"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "failed_cmd_name=APP_LOAD_PDI_FAIL"
+        ));
+        assert!(residual_note_has_exact_token(&n, "chain_status=0x4000003"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "chain_name=AIE2_STATUS_INVALID_PARAM"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_fw_name_implies_pdi_load=1"
+        ));
+        // Exact-token honesty: never substring invent_pass / ran_on_npu success.
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "prop_count=15"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=1"
+        ));
+
+        // Default is honesty-safe (surface tokens always PUBLIC_*; flags false).
+        let d = AppLoadPdiPartitionResearch::default();
+        assert_eq!(d.partition_surface_public, PUBLIC_PARTITION_SURFACE_TOKEN);
+        assert_eq!(d.pdi_marker_public, PUBLIC_PDI_MARKER_TOKEN);
+        assert!(!d.fw_residual_open_after_userspace);
+        let dn = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "pdi_marker_public=marker_absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "not_c_ready=1"));
+        // Never empty surface tokens from Default.
+        assert!(!residual_note_has_exact_token(
+            &dn,
+            "partition_surface_public="
+        ));
+        assert!(!residual_note_has_exact_token(&dn, "pdi_marker_public="));
+
+        // Named constants match aie2_fw_status_name.
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL),
+            "APP_LOAD_PDI_FAIL"
+        );
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_INVALID_PARAM),
+            "AIE2_STATUS_INVALID_PARAM"
+        );
+        assert_eq!(AIE2_FW_APP_LOAD_PDI_FAIL, 0x3_000_003);
+        assert_eq!(AIE2_FW_INVALID_PARAM, 0x4_000_003);
+
+        // Locked journal fixture parses to C2 pair.
+        let pair = parse_journal_fw_status_pair(c2_locked_app_load_journal_text());
+        assert!(pair.is_c2_app_load_pair());
+    }
+
+    #[test]
+    fn app_load_pdi_partition_dual_residual_truth_table() {
+        // TFT: pair-only + userspace=1 + non-APP_LOAD class → fw open (locks || pair).
+        let pair = parse_journal_fw_status_pair(c2_locked_app_load_journal_text());
+        assert!(pair.is_c2_app_load_pair());
+        let pair_us = research_app_load_pdi_partition(
+            SiliconResidualClass::ErtErrorUnknownBlob,
+            Some(&pair),
+            true,
+        );
+        assert!(!pair_us.class_app_load_after_aiebu);
+        assert!(pair_us.c2_app_load_pair);
+        assert!(pair_us.userspace_content_ok);
+        assert!(
+            pair_us.fw_residual_open_after_userspace,
+            "pair alone + userspace must open dual residual"
+        );
+        let pn = pair_us.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "fw_residual_open_after_userspace=1"
+        ));
+        assert!(residual_note_has_exact_token(&pn, "c2_app_load_pair=1"));
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "class_app_load_after_aiebu=0"
+        ));
+        assert!(residual_note_has_exact_token(&pn, "userspace_content_ok=1"));
+        assert!(residual_note_has_exact_token(&pn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&pn, "not_c_ready=1"));
+
+        // userspace=1 + non-APP_LOAD + no pair → fw closed.
+        let us_only =
+            research_app_load_pdi_partition(SiliconResidualClass::ErtErrorUnknownBlob, None, true);
+        assert!(!us_only.fw_residual_open_after_userspace);
+        assert!(us_only.userspace_content_ok);
+        let un = us_only.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &un,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&un, "userspace_content_ok=1"));
+        assert!(residual_note_has_exact_token(&un, "c2_app_load_pair=0"));
+        assert!(residual_note_has_exact_token(&un, "invent_pass=0"));
+    }
+
+    #[test]
+    fn app_load_pdi_partition_research_negatives_no_invent() {
+        // Split: userspace=false × (class-only | pair-only | neither) → fw=0.
+        let class_only_no_us = research_app_load_pdi_partition(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            None,
+            false,
+        );
+        assert!(class_only_no_us.class_app_load_after_aiebu);
+        assert!(!class_only_no_us.c2_app_load_pair);
+        assert!(!class_only_no_us.userspace_content_ok);
+        assert!(!class_only_no_us.fw_residual_open_after_userspace);
+        let cn = class_only_no_us.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &cn,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&cn, "userspace_content_ok=0"));
+        assert!(residual_note_has_exact_token(
+            &cn,
+            "class_app_load_after_aiebu=1"
+        ));
+        assert!(residual_note_has_exact_token(&cn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&cn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &cn,
+            "partition_surface_public=status_name_only"
+        ));
+
+        let pair_only_no_us = research_app_load_pdi_partition_c2_locked(false);
+        assert!(pair_only_no_us.c2_app_load_pair);
+        assert!(!pair_only_no_us.userspace_content_ok);
+        assert!(!pair_only_no_us.fw_residual_open_after_userspace);
+        let pn = pair_only_no_us.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&pn, "userspace_content_ok=0"));
+        assert!(residual_note_has_exact_token(&pn, "c2_app_load_pair=1"));
+        assert!(residual_note_has_exact_token(&pn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&pn, "not_c_ready=1"));
+
+        let neither =
+            research_app_load_pdi_partition(SiliconResidualClass::ErtErrorUnknownBlob, None, false);
+        assert!(!neither.class_app_load_after_aiebu);
+        assert!(!neither.c2_app_load_pair);
+        assert!(!neither.userspace_content_ok);
+        assert!(!neither.fw_residual_open_after_userspace);
+        let nn = neither.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &nn,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&nn, "failed_cmd=absent"));
+        assert!(residual_note_has_exact_token(&nn, "chain_status=absent"));
+        assert!(residual_note_has_exact_token(&nn, "c2_app_load_pair=0"));
+        assert!(residual_note_has_exact_token(
+            &nn,
+            "public_fw_name_implies_pdi_load=0"
+        ));
+        assert!(residual_note_has_exact_token(&nn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&nn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&nn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &nn,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &nn,
+            "pdi_marker_public=marker_absent_public"
+        ));
+        assert!(!residual_note_has_exact_token(&nn, "failed_cmd=0x3000003"));
+        assert!(!residual_note_has_exact_token(
+            &nn,
+            "failed_cmd_name=APP_LOAD_PDI_FAIL"
+        ));
+
+        // Empty journal + APP_LOAD + userspace=1 → fw open (class arm); exact token.
+        let empty = research_app_load_pdi_partition_from_journal(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            Some("   \n\t  "),
+            true,
+        );
+        assert!(empty.failed_cmd_status.is_none());
+        assert!(empty.class_app_load_after_aiebu);
+        assert!(empty.fw_residual_open_after_userspace);
+        assert!(!empty.c2_app_load_pair);
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &en,
+            "fw_residual_open_after_userspace=1"
+        ));
+        assert!(residual_note_has_exact_token(&en, "failed_cmd=absent"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "public_fw_name_implies_pdi_load=1"
+        ));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+
+        // Partial journal (failed only) — no invent chain / no c2 pair; class+us open.
+        let partial = research_app_load_pdi_partition_from_journal(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            Some("Failed cmd idx 0, status 0x3000003\n"),
+            true,
+        );
+        assert_eq!(partial.failed_cmd_status, Some(AIE2_FW_APP_LOAD_PDI_FAIL));
+        assert!(partial.chain_status.is_none());
+        assert!(!partial.c2_app_load_pair);
+        assert!(partial.fw_residual_open_after_userspace);
+        let prn = partial.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &prn,
+            "fw_residual_open_after_userspace=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &prn,
+            "failed_cmd_name=APP_LOAD_PDI_FAIL"
+        ));
+        assert!(residual_note_has_exact_token(&prn, "chain_status=absent"));
+        assert!(residual_note_has_exact_token(&prn, "c2_app_load_pair=0"));
+        assert!(residual_note_has_exact_token(&prn, "invent_pass=0"));
+
+        // Oversized journal paste → treated as absent (no invent codes).
+        let over = "x".repeat(MAX_APP_LOAD_JOURNAL_TEXT_BYTES.saturating_add(1));
+        let oversized = research_app_load_pdi_partition_from_journal(
+            SiliconResidualClass::ErtErrorUnknownBlob,
+            Some(&over),
+            false,
+        );
+        assert!(oversized.failed_cmd_status.is_none());
+        assert!(!oversized.c2_app_load_pair);
+        let on = oversized.format_soft_note();
+        assert!(residual_note_has_exact_token(&on, "failed_cmd=absent"));
+        assert!(residual_note_has_exact_token(
+            &on,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
+
+        // Unknown FW code name — still no invent PDI layout.
+        let unk = research_app_load_pdi_partition(
+            SiliconResidualClass::ErtErrorUnknownBlob,
+            Some(&JournalFwStatusPair {
+                failed_cmd_status: Some(0xdead_beef),
+                chain_status: None,
+            }),
+            false,
+        );
+        let un = unk.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &un,
+            "failed_cmd_name=unknown_fw_status"
+        ));
+        assert!(residual_note_has_exact_token(
+            &un,
+            "public_fw_name_implies_pdi_load=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &un,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &un,
+            "fw_residual_open_after_userspace=0"
+        ));
+        assert!(residual_note_has_exact_token(&un, "invent_pass=0"));
+    }
+
+    #[test]
+    fn public_pdi_evidence_scan_track_m_closed_and_honesty() {
+        // Track M: closed bag locks no new PDI fields beyond Track L.
+        let s = scan_public_pdi_partition_evidence();
+        assert_eq!(s.public_pdi_evidence_depth, PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN);
+        assert_eq!(s.public_pdi_evidence_depth, PUBLIC_PARTITION_SURFACE_TOKEN);
+        assert_eq!(s.public_pdi_evidence_depth, "status_name_only");
+        assert_eq!(s.new_public_pdi_fields, PUBLIC_PDI_NEW_FIELDS_CLOSED);
+        assert_eq!(s.new_public_pdi_fields, 0);
+        assert!(s.do_not_invent_pdi_layout);
+        assert!(!s.public_pdi_image_decode);
+        assert_eq!(s.partition_surface_public, PUBLIC_PARTITION_SURFACE_TOKEN);
+        assert_eq!(s.pdi_marker_public, PUBLIC_PDI_MARKER_TOKEN);
+        assert!(s.app_load_code_name_ok);
+        assert!(s.invalid_param_code_name_ok);
+        assert!(s.is_scan_closed_no_new_public_fields());
+
+        // Closed alias is identical.
+        let c = scan_public_pdi_partition_evidence_closed();
+        assert_eq!(c, s);
+
+        // Default == scan path (name_ok via aie2_fw_status_name; no hard-code drift).
+        let d = PublicPdiEvidenceScan::default();
+        assert_eq!(d, s);
+        assert_eq!(d, scan_public_pdi_partition_evidence());
+        let dn = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "scan_closed_no_new_public_fields=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&dn, "not_ran_on_npu=1"));
+
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_scan"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(&n, "new_public_pdi_fields=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pdi_marker_public=marker_absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scan_closed_no_new_public_fields=1"
+        ));
+        // Named key const must match emitted soft token prefix.
+        assert!(n.contains(&format!("{PUBLIC_PDI_SCAN_CLOSED_TOKEN_KEY}=")));
+        assert!(residual_note_has_exact_token(&n, "app_load_code_name_ok=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "invalid_param_code_name_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "locked_app_load=0x3000003"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "locked_invalid_param=0x4000003"
+        ));
+        // Exact-token honesty: never success / invent / layout decode.
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "prop_count=15"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "new_public_pdi_fields=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth="
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "partition_surface_public="
+        ));
+        assert!(!residual_note_has_exact_token(&n, "pdi_marker_public="));
+        // Ban invented stronger-depth soft tokens (exact; not weak assert_ne on field).
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=image_layout_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=ioctl_decode_public"
+        ));
+
+        // Locked codes still status-name only (Track L constants).
+        assert_eq!(AIE2_FW_APP_LOAD_PDI_FAIL, 0x3_000_003);
+        assert_eq!(AIE2_FW_INVALID_PARAM, 0x4_000_003);
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL),
+            "APP_LOAD_PDI_FAIL"
+        );
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_INVALID_PARAM),
+            "AIE2_STATUS_INVALID_PARAM"
+        );
+
+        // Token split: Track M research note does not emit checklist_ prefixes
+        // (checklist remains class-gated under format_app_load_offline_checklist*).
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_partition_surface_public=status_name_only"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_pdi_marker_public=marker_absent_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_userspace_elf_rela_app_load=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "userspace_ok_fw_load_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "userspace_patch_ok_fw_load_still_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "fw_residual_open_after_userspace=1"
+        ));
+
+        // Hostile hand-built bag: closed bit must derive =0; honesty trio still holds.
+        let mut hostile = s.clone();
+        hostile.new_public_pdi_fields = 1;
+        assert!(!hostile.is_scan_closed_no_new_public_fields());
+        let hn = hostile.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hn,
+            "scan_closed_no_new_public_fields=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &hn,
+            "new_public_pdi_fields=1"
+        ));
+        assert!(residual_note_has_exact_token(&hn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&hn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&hn, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(
+            &hn,
+            "scan_closed_no_new_public_fields=1"
+        ));
+
+        // Hostile decode / invent-layout flags also clear closed.
+        let mut hostile_decode = s.clone();
+        hostile_decode.public_pdi_image_decode = true;
+        assert!(!hostile_decode.is_scan_closed_no_new_public_fields());
+        let hdn = hostile_decode.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hdn,
+            "scan_closed_no_new_public_fields=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &hdn,
+            "public_pdi_image_decode=1"
+        ));
+        assert!(residual_note_has_exact_token(&hdn, "invent_pass=0"));
+
+        let mut hostile_layout = s.clone();
+        hostile_layout.do_not_invent_pdi_layout = false;
+        assert!(!hostile_layout.is_scan_closed_no_new_public_fields());
+        let hln = hostile_layout.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hln,
+            "scan_closed_no_new_public_fields=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &hln,
+            "do_not_invent_pdi_layout=0"
+        ));
+        assert!(residual_note_has_exact_token(&hln, "not_c_ready=1"));
+
+        // Soft-note sanitizer on M path: space/= inject cannot mint invent_pass=1.
+        let mut inject_m = s.clone();
+        inject_m.public_pdi_evidence_depth = "status invent_pass=1";
+        // M closed does not gate on depth — still closed bit may stay 1; honesty
+        // trio + sanitizer must still hold (no injected invent_pass=1 token).
+        let imn = inject_m.format_soft_note();
+        assert!(!residual_note_has_exact_token(&imn, "invent_pass=1"));
+        assert!(residual_note_has_exact_token(&imn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&imn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&imn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &imn,
+            "public_pdi_evidence_depth=status_invent_pass_1"
+        ));
+    }
+
+    #[test]
+    fn external_public_pdi_evidence_scan_track_n_closed_and_honesty() {
+        // Track N: external public evidence closed — no new kernel/XRT beyond status-name.
+        let s = scan_external_public_pdi_evidence();
+        assert_eq!(
+            s.external_public_pdi_evidence,
+            EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN
+        );
+        assert_eq!(s.external_public_pdi_evidence, "closed_no_new");
+        assert_eq!(
+            s.external_kernel_xrt_beyond_status_name,
+            EXTERNAL_KERNEL_XRT_BEYOND_STATUS_NAME
+        );
+        assert_eq!(s.external_kernel_xrt_beyond_status_name, 0);
+        assert_eq!(s.public_pdi_evidence_depth, PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN);
+        assert_eq!(s.public_pdi_evidence_depth, "status_name_only");
+        assert!(s.do_not_invent_pdi_layout);
+        assert!(!s.public_pdi_image_decode);
+        assert!(s.app_load_code_name_ok);
+        assert!(s.invalid_param_code_name_ok);
+        assert!(s.is_external_scan_closed_no_new());
+
+        // Closed alias is identical.
+        let c = scan_external_public_pdi_evidence_closed();
+        assert_eq!(c, s);
+
+        // Default == scan path (name_ok via aie2_fw_status_name; no hard-code drift).
+        let d = ExternalPublicPdiEvidenceScan::default();
+        assert_eq!(d, s);
+        assert_eq!(d, scan_external_public_pdi_evidence());
+        let dn = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "external_scan_closed_no_new=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&dn, "not_ran_on_npu=1"));
+
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_public_pdi_evidence_scan"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_public_pdi_evidence=closed_no_new"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_kernel_xrt_beyond_status_name=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_scan_closed_no_new=1"
+        ));
+        // Named key const must match emitted soft token prefix.
+        assert!(n.contains(&format!("{EXTERNAL_PUBLIC_PDI_SCAN_CLOSED_TOKEN_KEY}=")));
+        assert!(residual_note_has_exact_token(&n, "app_load_code_name_ok=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "invalid_param_code_name_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "locked_app_load=0x3000003"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "locked_invalid_param=0x4000003"
+        ));
+        // Exact-token honesty: never success / invent / layout decode.
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "prop_count=15"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_kernel_xrt_beyond_status_name=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_public_pdi_evidence="
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth="
+        ));
+        // Ban invented stronger-depth soft tokens.
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=image_layout_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=ioctl_decode_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_public_pdi_evidence=layout_public"
+        ));
+
+        // Locked codes still status-name only (Track L/M constants).
+        assert_eq!(AIE2_FW_APP_LOAD_PDI_FAIL, 0x3_000_003);
+        assert_eq!(AIE2_FW_INVALID_PARAM, 0x4_000_003);
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL),
+            "APP_LOAD_PDI_FAIL"
+        );
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_INVALID_PARAM),
+            "AIE2_STATUS_INVALID_PARAM"
+        );
+
+        // Token split: Track N research note does not emit checklist_ prefixes
+        // or invent K userspace / dual-residual open / Track M closed bag name.
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_partition_surface_public=status_name_only"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_pdi_marker_public=marker_absent_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_userspace_elf_rela_app_load=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "userspace_ok_fw_load_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "userspace_patch_ok_fw_load_still_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "fw_residual_open_after_userspace=1"
+        ));
+        // Distinct from Track M research bag name (no bleed).
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_scan"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "scan_closed_no_new_public_fields=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "new_public_pdi_fields=0"
+        ));
+
+        // Hostile hand-built bag: closed bit must derive =0; honesty trio still holds.
+        let mut hostile = s.clone();
+        hostile.external_kernel_xrt_beyond_status_name = 1;
+        assert!(!hostile.is_external_scan_closed_no_new());
+        let hn = hostile.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hn,
+            "external_scan_closed_no_new=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &hn,
+            "external_kernel_xrt_beyond_status_name=1"
+        ));
+        assert!(residual_note_has_exact_token(&hn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&hn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&hn, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(
+            &hn,
+            "external_scan_closed_no_new=1"
+        ));
+
+        // Hostile decode / invent-layout / depth / token flags also clear closed.
+        // Each secondary bag: full honesty trio + ban closed=1 (Issue 6).
+        let assert_hostile_n = |note: &str, marker: &str| {
+            assert!(
+                residual_note_has_exact_token(note, "external_scan_closed_no_new=0"),
+                "expected closed=0 for {marker}"
+            );
+            assert!(
+                !residual_note_has_exact_token(note, "external_scan_closed_no_new=1"),
+                "ban closed=1 for {marker}"
+            );
+            assert!(residual_note_has_exact_token(note, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(note, "not_c_ready=1"));
+            assert!(residual_note_has_exact_token(note, "not_ran_on_npu=1"));
+        };
+
+        let mut hostile_decode = s.clone();
+        hostile_decode.public_pdi_image_decode = true;
+        assert!(!hostile_decode.is_external_scan_closed_no_new());
+        let hdn = hostile_decode.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hdn,
+            "public_pdi_image_decode=1"
+        ));
+        assert_hostile_n(&hdn, "decode");
+
+        let mut hostile_layout = s.clone();
+        hostile_layout.do_not_invent_pdi_layout = false;
+        assert!(!hostile_layout.is_external_scan_closed_no_new());
+        let hln = hostile_layout.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hln,
+            "do_not_invent_pdi_layout=0"
+        ));
+        assert_hostile_n(&hln, "layout");
+
+        let mut hostile_depth = s.clone();
+        hostile_depth.public_pdi_evidence_depth = "image_layout_public";
+        assert!(!hostile_depth.is_external_scan_closed_no_new());
+        let hdep = hostile_depth.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hdep,
+            "public_pdi_evidence_depth=image_layout_public"
+        ));
+        assert_hostile_n(&hdep, "depth");
+
+        let mut hostile_tok = s.clone();
+        hostile_tok.external_public_pdi_evidence = "layout_public";
+        assert!(!hostile_tok.is_external_scan_closed_no_new());
+        let htk = hostile_tok.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &htk,
+            "external_public_pdi_evidence=layout_public"
+        ));
+        assert_hostile_n(&htk, "token");
+
+        // Issue 7: name_ok=false is diagnostic-only — closed bit stays 1 (Track M parity).
+        let mut name_diag = s.clone();
+        name_diag.app_load_code_name_ok = false;
+        name_diag.invalid_param_code_name_ok = false;
+        assert!(
+            name_diag.is_external_scan_closed_no_new(),
+            "name_ok flags must not clear external closed (diagnostic-only)"
+        );
+        let ndn = name_diag.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &ndn,
+            "external_scan_closed_no_new=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ndn,
+            "app_load_code_name_ok=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ndn,
+            "invalid_param_code_name_ok=0"
+        ));
+        assert!(residual_note_has_exact_token(&ndn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&ndn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ndn, "not_ran_on_npu=1"));
+
+        // Soft-note sanitizer on N path: space/= inject cannot mint invent_pass=1.
+        let mut inject_n = s.clone();
+        inject_n.external_public_pdi_evidence = "x invent_pass=1 ran_on_npu=1";
+        assert!(!inject_n.is_external_scan_closed_no_new());
+        let inn = inject_n.format_soft_note();
+        assert!(!residual_note_has_exact_token(&inn, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&inn, "ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&inn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&inn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&inn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &inn,
+            "external_public_pdi_evidence=x_invent_pass_1_ran_on_npu_1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &inn,
+            "external_scan_closed_no_new=0"
+        ));
+    }
+
+    #[test]
+    fn app_load_maintain_reconfirm_track_o_closed_and_honesty() {
+        // Track O: maintain reconfirm A–N still closed — no new external public evidence.
+        let s = reconfirm_app_load_tracks_a_n_closed();
+        assert_eq!(s.maintain_reconfirm, APP_LOAD_MAINTAIN_RECONFIRM_TOKEN);
+        assert_eq!(s.maintain_reconfirm, "a_n_closed_no_new");
+        assert_eq!(APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN, "not_closed");
+        assert_ne!(
+            APP_LOAD_MAINTAIN_RECONFIRM_TOKEN,
+            APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN
+        );
+        assert!(s.in_tree_m_closed);
+        assert!(s.external_n_closed);
+        assert_eq!(s.public_pdi_evidence_depth, PUBLIC_PDI_EVIDENCE_DEPTH_TOKEN);
+        assert_eq!(s.public_pdi_evidence_depth, "status_name_only");
+        assert!(s.do_not_invent_pdi_layout);
+        assert!(!s.public_pdi_image_decode);
+        assert_eq!(s.new_public_pdi_fields, PUBLIC_PDI_NEW_FIELDS_CLOSED);
+        assert_eq!(
+            s.external_kernel_xrt_beyond_status_name,
+            EXTERNAL_KERNEL_XRT_BEYOND_STATUS_NAME
+        );
+        assert_eq!(s.new_public_pdi_fields, 0);
+        assert_eq!(s.external_kernel_xrt_beyond_status_name, 0);
+        assert!(s.app_load_code_name_ok);
+        assert!(s.invalid_param_code_name_ok);
+        assert!(s.is_maintain_reconfirm_a_n_closed());
+
+        // Maintain alias is identical.
+        let c = reconfirm_app_load_tracks_a_n_closed_maintain();
+        assert_eq!(c, s);
+
+        // Default == reconfirm path (composes M+N; no hard-code drift).
+        let d = AppLoadMaintainReconfirm::default();
+        assert_eq!(d, s);
+        assert_eq!(d, reconfirm_app_load_tracks_a_n_closed());
+        let dn = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "maintain_reconfirm_a_n_closed=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&dn, "not_ran_on_npu=1"));
+        // Closed/Default path must not emit open token.
+        assert!(!residual_note_has_exact_token(
+            &dn,
+            "maintain_reconfirm=not_closed"
+        ));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "maintain_reconfirm=a_n_closed_no_new"
+        ));
+
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "app_load_maintain_reconfirm"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "maintain_reconfirm=a_n_closed_no_new"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "maintain_reconfirm=not_closed"
+        ));
+        assert!(residual_note_has_exact_token(&n, "in_tree_m_closed=1"));
+        assert!(residual_note_has_exact_token(&n, "external_n_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "new_public_pdi_fields=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_kernel_xrt_beyond_status_name=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "maintain_reconfirm_a_n_closed=1"
+        ));
+        // Named key const must match emitted soft token prefix.
+        assert!(n.contains(&format!("{APP_LOAD_MAINTAIN_RECONFIRM_CLOSED_TOKEN_KEY}=")));
+        assert!(residual_note_has_exact_token(&n, "app_load_code_name_ok=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "invalid_param_code_name_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "locked_app_load=0x3000003"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "locked_invalid_param=0x4000003"
+        ));
+        // Exact-token honesty: never success / invent / layout decode.
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "prop_count=15"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_kernel_xrt_beyond_status_name=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "new_public_pdi_fields=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "maintain_reconfirm="));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth="
+        ));
+        // Ban invented stronger-depth / fake-progress soft tokens (N parity).
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=image_layout_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=ioctl_decode_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_depth=m_n_depth_mismatch"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "maintain_reconfirm=new_evidence"
+        ));
+        // Distinct from Track N closed_no_new token (no bleed).
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "maintain_reconfirm=closed_no_new"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_public_pdi_evidence=closed_no_new"
+        ));
+
+        // Locked codes still status-name only (Track L/M/N constants).
+        assert_eq!(AIE2_FW_APP_LOAD_PDI_FAIL, 0x3_000_003);
+        assert_eq!(AIE2_FW_INVALID_PARAM, 0x4_000_003);
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL),
+            "APP_LOAD_PDI_FAIL"
+        );
+        assert_eq!(
+            aie2_fw_status_name(AIE2_FW_INVALID_PARAM),
+            "AIE2_STATUS_INVALID_PARAM"
+        );
+
+        // Token split: Track O research note does not emit checklist_ prefixes
+        // or invent K userspace / dual-residual open / Track M/N bag names.
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_partition_surface_public=status_name_only"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_pdi_marker_public=marker_absent_public"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "checklist_userspace_elf_rela_app_load=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "userspace_ok_fw_load_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "userspace_patch_ok_fw_load_still_open=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "fw_residual_open_after_userspace=1"
+        ));
+        // Distinct from Track M/N research bag names (no bleed).
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "public_pdi_evidence_scan"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "scan_closed_no_new_public_fields=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_public_pdi_evidence_scan"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "external_scan_closed_no_new=1"
+        ));
+
+        // Composed M+N scans are themselves closed (Track O depends on them).
+        assert!(scan_public_pdi_partition_evidence().is_scan_closed_no_new_public_fields());
+        assert!(scan_external_public_pdi_evidence().is_external_scan_closed_no_new());
+
+        // Hostile hand-built bag: closed bit must derive =0; honesty trio still holds.
+        let mut hostile = s.clone();
+        hostile.external_n_closed = false;
+        // Open path: production would set not_closed; hand-built open bit alone
+        // also clears closed (token may still be a_n_closed_no_new until set).
+        assert!(!hostile.is_maintain_reconfirm_a_n_closed());
+        let hn = hostile.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hn,
+            "maintain_reconfirm_a_n_closed=0"
+        ));
+        assert!(residual_note_has_exact_token(&hn, "external_n_closed=0"));
+        assert!(residual_note_has_exact_token(&hn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&hn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&hn, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(
+            &hn,
+            "maintain_reconfirm_a_n_closed=1"
+        ));
+
+        let assert_hostile_o = |note: &str, marker: &str| {
+            assert!(
+                residual_note_has_exact_token(note, "maintain_reconfirm_a_n_closed=0"),
+                "expected closed=0 for {marker}"
+            );
+            assert!(
+                !residual_note_has_exact_token(note, "maintain_reconfirm_a_n_closed=1"),
+                "ban closed=1 for {marker}"
+            );
+            assert!(residual_note_has_exact_token(note, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(note, "not_c_ready=1"));
+            assert!(residual_note_has_exact_token(note, "not_ran_on_npu=1"));
+        };
+
+        // Explicit open token path (production emits when M/N not both closed).
+        let mut open_tok = s.clone();
+        open_tok.maintain_reconfirm = APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN;
+        open_tok.external_n_closed = false;
+        assert_eq!(open_tok.maintain_reconfirm, "not_closed");
+        assert!(!open_tok.is_maintain_reconfirm_a_n_closed());
+        let otn = open_tok.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &otn,
+            "maintain_reconfirm=not_closed"
+        ));
+        assert_hostile_o(&otn, "open_token");
+
+        let mut hostile_m = s.clone();
+        hostile_m.in_tree_m_closed = false;
+        assert!(!hostile_m.is_maintain_reconfirm_a_n_closed());
+        let hm = hostile_m.format_soft_note();
+        assert!(residual_note_has_exact_token(&hm, "in_tree_m_closed=0"));
+        assert_hostile_o(&hm, "m_closed");
+
+        let mut hostile_fields = s.clone();
+        hostile_fields.new_public_pdi_fields = 1;
+        assert!(!hostile_fields.is_maintain_reconfirm_a_n_closed());
+        let hf = hostile_fields.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hf,
+            "new_public_pdi_fields=1"
+        ));
+        assert_hostile_o(&hf, "new_fields");
+
+        let mut hostile_ext = s.clone();
+        hostile_ext.external_kernel_xrt_beyond_status_name = 1;
+        assert!(!hostile_ext.is_maintain_reconfirm_a_n_closed());
+        let he = hostile_ext.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &he,
+            "external_kernel_xrt_beyond_status_name=1"
+        ));
+        assert_hostile_o(&he, "external_count");
+
+        let mut hostile_decode = s.clone();
+        hostile_decode.public_pdi_image_decode = true;
+        assert!(!hostile_decode.is_maintain_reconfirm_a_n_closed());
+        let hdn = hostile_decode.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hdn,
+            "public_pdi_image_decode=1"
+        ));
+        assert_hostile_o(&hdn, "decode");
+
+        let mut hostile_layout = s.clone();
+        hostile_layout.do_not_invent_pdi_layout = false;
+        assert!(!hostile_layout.is_maintain_reconfirm_a_n_closed());
+        let hln = hostile_layout.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hln,
+            "do_not_invent_pdi_layout=0"
+        ));
+        assert_hostile_o(&hln, "layout");
+
+        let mut hostile_depth = s.clone();
+        hostile_depth.public_pdi_evidence_depth = "image_layout_public";
+        assert!(!hostile_depth.is_maintain_reconfirm_a_n_closed());
+        let hdep = hostile_depth.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hdep,
+            "public_pdi_evidence_depth=image_layout_public"
+        ));
+        assert_hostile_o(&hdep, "depth");
+
+        // Compose depth sentinel m_n_depth_mismatch → closed=0.
+        let mut hostile_mm = s.clone();
+        hostile_mm.public_pdi_evidence_depth = "m_n_depth_mismatch";
+        assert!(!hostile_mm.is_maintain_reconfirm_a_n_closed());
+        let hmm = hostile_mm.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hmm,
+            "public_pdi_evidence_depth=m_n_depth_mismatch"
+        ));
+        assert_hostile_o(&hmm, "m_n_depth_mismatch");
+
+        let mut hostile_tok = s.clone();
+        hostile_tok.maintain_reconfirm = "new_evidence";
+        assert!(!hostile_tok.is_maintain_reconfirm_a_n_closed());
+        let htk = hostile_tok.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &htk,
+            "maintain_reconfirm=new_evidence"
+        ));
+        assert_hostile_o(&htk, "token");
+
+        // Hostile: N's `closed_no_new` on maintain field must clear O closed
+        // (token namespace split — O requires a_n_closed_no_new only).
+        let mut hostile_n_tok = s.clone();
+        hostile_n_tok.maintain_reconfirm = EXTERNAL_PUBLIC_PDI_EVIDENCE_TOKEN;
+        assert_eq!(hostile_n_tok.maintain_reconfirm, "closed_no_new");
+        assert!(!hostile_n_tok.is_maintain_reconfirm_a_n_closed());
+        let hnt = hostile_n_tok.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hnt,
+            "maintain_reconfirm=closed_no_new"
+        ));
+        assert_hostile_o(&hnt, "n_token_on_maintain");
+
+        // Hostile depth ioctl_decode_public (N parity ban).
+        let mut hostile_ioctl = s.clone();
+        hostile_ioctl.public_pdi_evidence_depth = "ioctl_decode_public";
+        assert!(!hostile_ioctl.is_maintain_reconfirm_a_n_closed());
+        let hio = hostile_ioctl.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &hio,
+            "public_pdi_evidence_depth=ioctl_decode_public"
+        ));
+        assert_hostile_o(&hio, "ioctl_depth");
+
+        // Soft-note sanitizer: space/=/control injection cannot mint invent_pass=1.
+        let mut inject = s.clone();
+        inject.maintain_reconfirm = "x invent_pass=1 ran_on_npu=1";
+        assert!(!inject.is_maintain_reconfirm_a_n_closed());
+        let inj = inject.format_soft_note();
+        assert!(!residual_note_has_exact_token(&inj, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&inj, "ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&inj, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&inj, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&inj, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &inj,
+            "maintain_reconfirm=x_invent_pass_1_ran_on_npu_1"
+        ));
+        assert_hostile_o(&inj, "space_inject");
+
+        let mut inject_depth = s.clone();
+        inject_depth.public_pdi_evidence_depth = "status invent_pass=1";
+        assert!(!inject_depth.is_maintain_reconfirm_a_n_closed());
+        let idn = inject_depth.format_soft_note();
+        assert!(!residual_note_has_exact_token(&idn, "invent_pass=1"));
+        assert!(residual_note_has_exact_token(&idn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &idn,
+            "public_pdi_evidence_depth=status_invent_pass_1"
+        ));
+        assert_hostile_o(&idn, "depth_inject");
+
+        // Shared sanitizer pure unit.
+        assert_eq!(sanitize_soft_note_field_value("a b=c\td"), "a_b_c_d");
+        assert_eq!(
+            sanitize_soft_note_field_value(APP_LOAD_MAINTAIN_RECONFIRM_TOKEN),
+            APP_LOAD_MAINTAIN_RECONFIRM_TOKEN
+        );
+        assert_eq!(
+            sanitize_soft_note_field_value(APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN),
+            APP_LOAD_MAINTAIN_RECONFIRM_OPEN_TOKEN
+        );
+
+        // name_ok=false is diagnostic-only — closed bit stays 1 (M/N parity).
+        let mut name_diag = s.clone();
+        name_diag.app_load_code_name_ok = false;
+        name_diag.invalid_param_code_name_ok = false;
+        assert!(
+            name_diag.is_maintain_reconfirm_a_n_closed(),
+            "name_ok flags must not clear maintain closed (diagnostic-only)"
+        );
+        let ndn = name_diag.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &ndn,
+            "maintain_reconfirm_a_n_closed=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ndn,
+            "app_load_code_name_ok=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ndn,
+            "invalid_param_code_name_ok=0"
+        ));
+        assert!(residual_note_has_exact_token(&ndn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&ndn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ndn, "not_ran_on_npu=1"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // test-only env isolation for TMPDIR=/ clamp
+    fn last_apply_temp_root_clamps_fs_root_tmpdir() {
+        // TMPDIR=/ must not make path_under_allowed_roots accept every absolute path.
+        let _guard = TmpdirEnvGuard::set("/");
+        let root = last_apply_temp_root();
+        assert_ne!(
+            root,
+            Path::new("/"),
+            "temp root must not be filesystem root"
+        );
+        // Clamped path is /tmp or its canonicalize (e.g. /private/tmp on some hosts).
+        let as_str = root.to_string_lossy();
+        assert!(
+            as_str == "/tmp" || as_str.ends_with("/tmp") || root.ends_with("tmp"),
+            "expected /tmp clamp, got {}",
+            root.display()
+        );
+        // Outside home/etc must refuse even when TMPDIR was /.
+        assert!(
+            !path_under_allowed_roots(Path::new("/etc/x.json")),
+            "/etc must refuse under TMPDIR=/"
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            let home_json = PathBuf::from(home).join("x.json");
+            assert!(
+                !path_under_allowed_roots(&home_json),
+                "$HOME/x.json must refuse under TMPDIR=/"
+            );
+            assert!(!last_apply_path_is_allowed(&home_json));
+        }
+        // /tmp under clamp remains allow-root for .json names (lexical).
+        assert!(path_under_allowed_roots(Path::new(
+            "/tmp/dragon_npu_la_clamp_probe.json"
+        )));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // test-only env isolation for TMPDIR symlink→/
+    fn last_apply_temp_root_clamps_symlink_to_fs_root() {
+        // TMPDIR = symlink to / is not lexically RootDir; canonicalize → / must re-clamp.
+        // Hard-fail if symlink cannot be created — Linux CI must cover this residual.
+        let pid = std::process::id();
+        let link = PathBuf::from(format!("/tmp/dragon_npu_tmpdir_rootlink_{pid}"));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&link);
+        std::os::unix::fs::symlink("/", &link).expect(
+            "symlink to / under /tmp required for last_apply_temp_root clamp coverage (Linux CI)",
+        );
+        let _guard = TmpdirEnvGuard::set(&link);
+        let root = last_apply_temp_root();
+        assert_ne!(
+            root,
+            Path::new("/"),
+            "symlink-to-/ TMPDIR must not resolve allow-root to /"
+        );
+        assert!(
+            !path_is_filesystem_root(&root),
+            "post-clamp root must not be fs root: {}",
+            root.display()
+        );
+        // Parity with lexical TMPDIR=/ companion: clamped root is /tmp shape.
+        let as_str = root.to_string_lossy();
+        assert!(
+            as_str == "/tmp" || as_str.ends_with("/tmp") || root.ends_with("tmp"),
+            "expected /tmp clamp after symlink-to-/, got {}",
+            root.display()
+        );
+        if let Ok(tmp_canon) = std::fs::canonicalize("/tmp") {
+            assert_eq!(
+                root, tmp_canon,
+                "clamped root should equal canonicalize(/tmp)"
+            );
+        }
+        assert!(
+            !path_under_allowed_roots(Path::new("/etc/x.json")),
+            "/etc must refuse under TMPDIR=symlink-to-/"
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            let home_json = PathBuf::from(home).join("x.json");
+            assert!(
+                !path_under_allowed_roots(&home_json),
+                "$HOME/x.json must refuse under TMPDIR=symlink-to-/"
+            );
+            assert!(!last_apply_path_is_allowed(&home_json));
+        }
+        // Clamped /tmp still allows .json under /tmp.
+        assert!(path_under_allowed_roots(Path::new(
+            "/tmp/dragon_npu_la_symlink_clamp_probe.json"
+        )));
+        drop(_guard);
+        let _ = std::fs::remove_file(&link);
     }
 }

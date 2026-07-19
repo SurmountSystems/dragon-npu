@@ -3,16 +3,17 @@
 **Purpose:** One canonical operator sequence for a **single** Milestone C Pass
 apply against the locked **APP_LOAD_PDI_FAIL** residual.
 
-**Status (IMPL `3a14f38d` C4 readiness / unlock `b17b0119`):** **UNLOCKED once** for a
-**single** operator HITL C apply under stamp **`C_UNLOCK=b17b0119`**. Live C2
-still needs **operator sudo** for L3 (agent prep = `tools/hitl_c2_once.sh`).
-Post-C2 offline = `tools/c3_post_c2_classify.sh` (C3_SKIP without new evidence) +
+**Status (IMPL `b6a66dee` gate-only maintain):** `C_UNLOCK=b17b0119` **CONSUMED** (operator C2 2026-07-18). Further C needs **new agent unlock** + offline delta. Gate-only maintain ≠ Pass ≠ `ran_on_npu`.
+
+Post-C2 offline under CONSUMED = `tools/c3_post_c2_classify.sh` (C3_SKIP without new evidence) +
 `tools/c4_pass_check.sh` (C4_SKIP without PassCandidate snapshot).
 **Offline C4 check ≠ invent product Pass** / ≠ `ran_on_npu` claim.
+Live L3 sandwich is **future-unlock-only** (not under CONSUMED `b17b0119`).
+
 
 | Claim | Truth |
 |-------|--------|
-| One L3 sandwich + `hitl_c` | **Allowed** (operator only) |
+| One L3 sandwich + `hitl_c` under `b17b0119` | **CONSUMED** — do not re-run; needs **new** unlock |
 | Permanent open season / more C without **new agent unlock** | **No** (evidence may justify unlock; never auto-unlocks) |
 | Silicon Pass / `ran_on_npu` | **No** until OFM allclose + ERT Completed |
 | Leave L3 open / set permanent userspace ALLOW | **No** — always restore L3=`exec_cmd_allow=0`; never leave `XDNA2_ALLOW_EXEC_CMD=1` sticky |
@@ -22,15 +23,15 @@ Soft residual class / `CLASSIFY_SOFT_OK` / `app_load_checklist=…` /
 `OFFLINE_GATES_OK` / `C3_SKIP` / **`C4_SKIP`** still **≠** Pass and never
 substitute for this stamp. Offline `c4_pass_check` is snapshot audit only.
 
-SSoT residual: [RESIDUAL.md](../RESIDUAL.md) · B/C overview: [HITL_BC.md](./HITL_BC.md) ·
+single source of truth residual: [RESIDUAL.md](../RESIDUAL.md) · B/C overview: [HITL_BC.md](./HITL_BC.md) ·
 contract: [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md).
 
 ---
 
 ## Unlock policy (hard)
 
-C runs **only if the agent explicitly says ready** (this IMPL: **yes, once** —
-`C_UNLOCK=b17b0119`). **Further applies require a new agent unlock** — not open
+C runs **only if the agent explicitly says ready** with a **new** unlock stamp.
+`C_UNLOCK=b17b0119` is **CONSUMED** (gate-only `b6a66dee`; prior `dd35ae15`). **Further applies require a new agent unlock** — not open
 season. New offline last_apply/journal evidence may **justify** that unlock
 decision; evidence **never auto-unlocks** C.
 
@@ -117,40 +118,49 @@ again. Manual offline prep above mirrors that path without L3.
 
 ---
 
-## Exact apply (UNLOCKED once — `C_UNLOCK=b17b0119`)
+## Exact apply (CONSUMED — `C_UNLOCK=b17b0119`; gate-only `b6a66dee`)
 
-**Operator C2 only.** Agent does **not** run this. Unlock **≠** Pass.
+> **Stamp CONSUMED.** Do **not** open L3 under `b17b0119`. Record-only / offline path only.
+> Live apply under this stamp is **closed**. Offline path = `c3` / `c4` / `run_offline_gates` only.
 
-### Prep helper (no L3 / no EXEC)
+**Historical operator C2 (already ran).** Agent does **not** re-run this under `b17b0119`. Unlock **≠** Pass.
+
+### Offline path under CONSUMED (no L3 / no EXEC)
 
 ```bash
 cd ~/Projects/ai/dragon-npu
 export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
-# Soft unlock NOTE + optional gates + preflight + prints bash/fish sandwich:
+# Soft CONSUMED NOTE + optional gates + preflight + prints HISTORICAL sandwich text:
 bash tools/hitl_c2_once.sh
-# sandwich text only:
+# sandwich text only (record-only; does not open L3):
 bash tools/hitl_c2_once.sh --print-only
-# Fail-closed when L3 closed (expect exit 1):
+# Offline residual / Pass audit only:
+bash tools/c3_post_c2_classify.sh
+bash tools/c4_pass_check.sh
+bash tools/run_offline_gates.sh
+# Fail-closed when L3 closed (expect exit 1) — refuse demo, not apply:
 # bash tools/hitl_c2_once.sh --apply-if-l3-open
 # bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 ```
 
-Recommended sandwich (operator opens/closes L3):
+### HISTORICAL / CONSUMED sandwich (record-only — **all L3/apply lines commented**)
+
+Do **not** paste-run under `b17b0119`. Kept for residual archaeology only.
 
 ```bash
 cd ~/Projects/ai/dragon-npu
 # bash: export XDNA2_LAB_BO_DIAG=1
 # fish: set -gx XDNA2_LAB_BO_DIAG 1
 
-# C_UNLOCK=b17b0119 one-shot; restore L3; ≠ ran_on_npu until Pass
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
-# or: bash tools/hitl_c2_once.sh --apply-if-l3-open
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
+# HISTORICAL record-only — C_UNLOCK=b17b0119 CONSUMED; do not open L3 under this stamp
+# sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+# or: # bash tools/hitl_c2_once.sh --apply-if-l3-open
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 ```
 
-What hitl_c enforces (default path):
+What hitl_c enforces (default path; **Future unlock only** — not active under CONSUMED):
 
 - Forces **`lab_instr.elf`** (refuses non-ELF magic; no `--blob` override)
 - Runs **`silicon_contract_check.sh --require-pass-assets`** (A9) — hard-fail
@@ -158,10 +168,14 @@ What hitl_c enforces (default path):
 - Then **`silicon_lab_preflight.sh --require-pass-assets`**
 - Single-shot silicon-mladf apply; post-check `exec_cmd_allow=0` (exit **5** if still open)
 
-Alternate (let lab_exec try L3 open; may print human sudo steps):
+### Future unlock only (live L3 apply — **not** under `b17b0119`)
+
+Live apply requires a **new** agent unlock stamp. Until then, leave all lines commented.
 
 ```bash
-bash tools/hitl_c_pass_apply.sh
+# FUTURE UNLOCK ONLY — requires new C_UNLOCK=… (not b17b0119 CONSUMED)
+# bash tools/hitl_c_pass_apply.sh
+# bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 ```
 
 ### Flags — force vs skip (research only — **not** unlock)
@@ -200,10 +214,10 @@ Same family as `scripts/lab_exec_once.sh`, plus hitl_c early exits:
 silicon failed vs restore failed.
 
 ```bash
-# always verify after any apply:
-cat /sys/module/amdxdna/parameters/exec_cmd_allow   # expect 0
-# if not 0:
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# always verify after any apply (offline check OK; restore only if L3 left open):
+cat /sys/module/amdxdna/parameters/exec_cmd_allow   # expect 0 or N
+# if not 0/N (CRITICAL restore — only when L3 was opened under a live unlock):
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 ```
 
 ---
@@ -260,10 +274,11 @@ Never claim Pass from envelope accept alone, zero golden, offline
 - Journal:  
   `journalctl -k -b --no-pager | rg -i 'Failed cmd|Status 0x|APP_LOAD|amdxdna' | tail -20`
 
-Always restore:
+Always restore L3 after any **live** apply (Future unlock only — not under CONSUMED `b17b0119`):
 
 ```bash
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# FUTURE UNLOCK / live apply only — under CONSUMED, L3 should already be N:
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 ```
 
@@ -306,16 +321,19 @@ residual) or **C4** (only if OFM allclose + ERT Completed + `ran_on_npu=true`).
 
 ## Highest-value next (after this recipe)
 
-1. **Operator C2 now** (`C_UNLOCK=b17b0119`): `bash tools/hitl_c2_once.sh` then
-   sandwich above; **always restore L3** (`exec_cmd_allow=0`); paste residual if
-   not Pass. Unlock **≠** Pass. Offline green alone still does **not** equal Pass.
-   Further C needs a **new agent unlock** (evidence may justify; never auto-unlocks).
-   Agent prep stamp `de4d9fa4` does **not** complete C2 without your sudo.
-2. **After C2:** `bash tools/c3_post_c2_classify.sh` + `bash tools/c4_pass_check.sh`
-   + `run_offline_gates.sh` → agent **C3** when fingerprint differs
-   (`C3_EVIDENCE=1`, even if still APP_LOAD) / **C4** only if
-   `C4_PASS_CANDIDATE` (still product Pass = live decide). Maintain pure-direct
-   offline gates meanwhile if C2 still pending. Same body as baseline →
+1. **Maintain offline gates** (gate-only `b6a66dee`; prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED`):
+   `bash tools/run_offline_gates.sh` (+ optional `hitl_c2_once.sh --print-only` for
+   CONSUMED NOTE). **No** live L3 sandwich under this stamp. Offline green alone
+   still does **not** equal Pass / C-ready / `ran_on_npu`. Further live C needs a
+   **new agent unlock** (evidence may justify; never auto-unlocks).
+2. **Offline residual / Pass audit (CONSUMED path):** `bash tools/c3_post_c2_classify.sh`
+   + `bash tools/c4_pass_check.sh` + `run_offline_gates.sh` → agent **C3** when
+   fingerprint differs (`C3_EVIDENCE=1`, even if still APP_LOAD) / **C4** only if
+   `C4_PASS_CANDIDATE` (still product Pass = live decide). Same body as baseline →
    `C3_SKIP` + `C4_SKIP` (path alone ≠ evidence) — readiness only, not silicon
-   progress.
+   progress. **C2 is not pending** under `b17b0119` (already completed / CONSUMED).
 3. Optional capture-instr = **logs only** (public true post-patch path closed).
+
+**Under CONSUMED offline path only:** `c3_post_c2_classify.sh` + `c4_pass_check.sh` +
+`run_offline_gates.sh`. Live L3 sandwich only after **new** agent unlock (Future unlock
+block above — not `b17b0119`).

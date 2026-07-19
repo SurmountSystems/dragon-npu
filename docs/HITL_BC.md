@@ -4,19 +4,20 @@ Agent does **offline** work (Track A: contract, GT, pure-direct / **APP_LOAD**
 residual). Public true post-patch dump research is **closed offline** (no live
 `run_` instr BO API; registry = Transaction/cache only). You run **a few
 deliberate HITL sessions** (typically **B** offline/optional OFM; **capture-instr**
-optional for logs; then **C2** under one-shot **`C_UNLOCK=b17b0119`**) — not flag
-ping-pong.
+optional for logs; then **historical C2** under one-shot **`C_UNLOCK=b17b0119`**,
+now **CONSUMED**) — not flag ping-pong.
 
 Do **not** EXEC raw `lab_instr.bin`. Prefer wrappers below (ELF-only on C).
 
 **Unpatched CLASS A / mere `diff rc=0` = body match only → ≠ Pass, ≠ `ran_on_npu`.**
-**One-shot unlock** (`C_UNLOCK=b17b0119`) = permission for **one** C2 only; unlock **≠** Pass.
+**One-shot unlock** (`C_UNLOCK=b17b0119`) = **historical / CONSUMED** (one C2 already ran);
+further C needs a **new agent unlock**; unlock **≠** Pass.
 
-Contract: [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md) · SSoT: [RESIDUAL.md](../RESIDUAL.md).
+Contract: [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md) · single source of truth: [RESIDUAL.md](../RESIDUAL.md).
 
 ## Milestone B — Ground truth (unblocks agent)
 
-**Offline only (no sudo, ~30s):**
+**Offline only (no sudo, ~30s) — Milestone B does not open L3:**
 
 ```bash
 cd ~/Projects/ai/dragon-npu
@@ -31,36 +32,38 @@ missing, or to re-land classic/registry post_patch on disk; unpatched body class
 may already be green via sibling):
 
 ```bash
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/silicon_lab_operator.sh capture-instr   # or: capture_mladf_instr_vendor.sh
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# Optional L3 window (logs only; not current HV under CONSUMED):
+# sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# bash tools/silicon_lab_operator.sh capture-instr   # or: capture_mladf_instr_vendor.sh
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 bash tools/diff_vendor_instr_parity.sh   # offline; unpatched A = body match ≠ Pass
 # CLASS_HINT A–E guides agent offline fix; capture ≠ C unlock
-# C2 one-shot C_UNLOCK=b17b0119 (operator; unlock ≠ Pass) — see HITL_C_APP_LOAD_RECIPE.md
+# C2 one-shot C_UNLOCK=b17b0119 CONSUMED — see HITL_C_APP_LOAD_RECIPE.md
 ```
 
-Highest-value next after unpatched body green: operator **C2** under
-`C_UNLOCK=b17b0119` for **APP_LOAD_PDI_FAIL** (INSTR_BO true post-patch research
-**closed offline**; unlock **≠** Pass) — **ban** more env C applies
-(`XDNA2_LAB_KERNEL_ARG_LAYOUT` / `XDNA2_LAB_INSTR_SIZE_MODE` / `XDNA2_LAB_RELA_MODE`
-spam closed).
+Highest-value next after unpatched body green: **maintain offline gates**
+(gate-only `b6a66dee`; prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**) for **APP_LOAD_PDI_FAIL**
+(INSTR_BO true post-patch research **closed offline**; unlock **≠** Pass) —
+**ban** more env C applies (`XDNA2_LAB_KERNEL_ARG_LAYOUT` /
+`XDNA2_LAB_INSTR_SIZE_MODE` / `XDNA2_LAB_RELA_MODE` spam closed). Further live C
+needs a **new agent unlock**.
 
-**Optional OFM golden re-lock only:**
+**Optional OFM golden re-lock only (commented — not HV under CONSUMED):**
 
 ```bash
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/hitl_b_gt_capture.sh --with-vendor --assume-l3-open
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# bash tools/hitl_b_gt_capture.sh --with-vendor --assume-l3-open
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 ```
 
 ---
 
-## Milestone C — Pass apply (**UNLOCKED once** — `C_UNLOCK=b17b0119`)
+## Milestone C — Pass apply (**CONSUMED** — `C_UNLOCK=b17b0119`; gate-only `b6a66dee`)
 
 **Canonical recipe (prereqs, offline gates, sandwich, success, bans):**
 [HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md).
 
-**Agent unlock (one-shot):** `C_UNLOCK=b17b0119` in [RESIDUAL.md](../RESIDUAL.md).
+**Agent unlock:** `C_UNLOCK=b17b0119` **CONSUMED** (see [RESIDUAL.md](../RESIDUAL.md) gate-only `b6a66dee`).
 Permission for **one** L3 sandwich + `hitl_c` only. **Not** permanent open
 season. Unlock **≠** Pass / **≠** `ran_on_npu`. **L3** = `exec_cmd_allow`
 (restore to 0); **userspace ALLOW** = `XDNA2_ALLOW_EXEC_CMD` (leave unset/0).
@@ -89,20 +92,25 @@ bash tools/hitl_c_pass_apply.sh --help   # docs only; no EXEC
 # bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 ```
 
-**Live sandwich (C2 — operator now; agent does not run):**
+**HISTORICAL / CONSUMED sandwich (C2 already ran under `b17b0119` — record-only; agent does not re-run):**
+
+All L3 open/apply lines are **commented**. Do **not** paste-run under CONSUMED.
+Offline path under CONSUMED = c3 / c4 / `run_offline_gates` only.
 
 ```bash
+# HISTORICAL / CONSUMED — do not re-run L3 under b17b0119
 cd ~/Projects/ai/dragon-npu
-# C_UNLOCK=b17b0119 one-shot; restore L3; ≠ ran_on_npu until Pass
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# C_UNLOCK=b17b0119 one-shot CONSUMED; restore L3; ≠ ran_on_npu until Pass
+# sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 # bash: export XDNA2_LAB_BO_DIAG=1
 # fish: set -gx XDNA2_LAB_BO_DIAG 1
-bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
-# or after L3 open: bash tools/hitl_c2_once.sh --apply-if-l3-open
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+# or after L3 open: # bash tools/hitl_c2_once.sh --apply-if-l3-open
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 # Post-C2 offline (no L3) — C3 pipeline (C3_SKIP without new evidence):
 bash tools/c3_post_c2_classify.sh
+bash tools/c4_pass_check.sh
 bash tools/run_offline_gates.sh
 ```
 
@@ -119,7 +127,7 @@ outcome until root cause fixed — not an offline-gate failure.
 
 Env residual trials (`content` + `xrt3`) already **closed** with identical
 `APP_LOAD_PDI_FAIL`. Unpatched classic body may already exist (CLASS A body
-match). Next value: **operator C2** (unlocked `b17b0119`) then
+match). Next value: **maintain gates** (gate-only `b6a66dee`; prior `dd35ae15`; unlock CONSUMED) then
 `c3_post_c2_classify.sh` (C3 when `C3_EVIDENCE=1`) + `c4_pass_check.sh`
 (offline **PassCandidate** audit only — **≠ invent product Pass**) + maintain
 pure-direct offline gates. Not unpatched A / registry / parity alone.
@@ -154,8 +162,8 @@ bash tools/silicon_lab_operator.sh extract-paddrs   # last_apply → paddrs JSON
 ## Honesty
 
 - B offline ≠ live XRT BO dump; B vendor OFM golden optional  
-- **Highest-value now = operator C2** under `C_UNLOCK=b17b0119` (APP_LOAD residual; post-patch dump research **closed offline**); capture-instr **optional** for logs only; maintain pure-direct offline gates meanwhile  
-- C exit 0 only if product `ran_on_npu=true` (live decide); **C2 unlocked once** under `C_UNLOCK=b17b0119` (unpatched A / parity / registry / residual_class / CLASSIFY_SOFT_OK / checklist / OFFLINE_GATES_OK / `C3_SKIP` / `C4_SKIP` / offline `C4_PASS_CANDIDATE` alone ≠ product Pass / ≠ further unlock)  
+- **Highest-value now = maintain gates** (gate-only `b6a66dee`; prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**) (APP_LOAD residual; post-patch dump research **closed offline**); capture-instr **optional** for logs only; maintain pure-direct offline gates meanwhile  
+- C exit 0 only if product `ran_on_npu=true` (live decide); **C2 CONSUMED** under `C_UNLOCK=b17b0119` (unpatched A / parity / registry / residual_class / CLASSIFY_SOFT_OK / checklist / OFFLINE_GATES_OK / `C3_SKIP` / `C4_SKIP` / offline `C4_PASS_CANDIDATE` alone ≠ product Pass / ≠ further unlock)  
 - Never leave `exec_cmd_allow=1` (L3); never leave sticky `XDNA2_ALLOW_EXEC_CMD=1`  
 - Offline `c4_pass_check` **PassCandidate** audit ≠ invent product Pass  
 - Raw `.bin` EXEC → APP_LOAD_PDI_FAIL; not a useful apply  

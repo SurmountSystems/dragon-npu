@@ -53,7 +53,7 @@ From shim_test `exec_buf.h` + `elf_io_test_bo_set::init_cmd`:
 | Offline | Both layouts green in `silicon_contract` / GT `kernel_args.json` |
 
 Live residual: both layouts can still yield `ert_state=Error` after aiebu rela — **not** solved offline alone.  
-Env residual trials (`content` size + **`xrt3`**) **CLOSED** (same `APP_LOAD_PDI_FAIL`). Unpatched classic 1688 body may already **EXIST** (CLASS A body match via sibling). Public true post-patch dump research **closed offline** (no live `run_` instr BO API; registry = Transaction/cache only). **Highest-value next = operator C2** under one-shot **`C_UNLOCK=b17b0119`** ([HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md)); unlock **≠** Pass / **≠** `ran_on_npu`. Unpatched CLASS A / mere `diff rc=0` / registry alone **≠** Pass.
+Env residual trials (`content` size + **`xrt3`**) **CLOSED** (same `APP_LOAD_PDI_FAIL`). Unpatched classic 1688 body may already **EXIST** (CLASS A body match via sibling). Public true post-patch dump research **closed offline** (no live `run_` instr BO API; registry = Transaction/cache only). **Highest-value next = gate-only maintain** `b6a66dee` (prior `dd35ae15`): `run_offline_gates` + L3=`N`; `C_UNLOCK=b17b0119` **CONSUMED** — further C needs **new** agent unlock ([HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md)); unlock **≠** Pass / **≠** `ran_on_npu`. Unpatched CLASS A / mere `diff rc=0` / registry alone **≠** Pass.
 
 ## Control packet
 
@@ -89,7 +89,7 @@ DevHeap UVA must be **64 MiB-aligned** (else map_host `0x4000003`).
 |---------|----------------|
 | Raw `.bin` EXEC | `0x3000003` `APP_LOAD_PDI_FAIL` |
 | Unaligned DevHeap UVA | `0x4000003` `INVALID_PARAM` (map_host) |
-| **2026-07-16 C apply** `aiebu_elf=1` `rela_count=12` `qos=100/30` `tiles=32` DevHeap aligned **`bo_size=4096`** + journal `Status 0x4000003` / `Failed cmd … 0x3000003` | **Still `APP_LOAD_PDI_FAIL`** after rela + page pad. Env residual trials **CLOSED**. Unpatched classic body may exist (CLASS A ≠ Pass). Post-patch dump research **closed offline**. **Next:** operator **C2** one-shot `C_UNLOCK=b17b0119` (unlock ≠ Pass); optional recapture logs only. Ban env C. Unpatched A / registry alone ≠ Pass |
+| **2026-07-16 C apply** `aiebu_elf=1` `rela_count=12` `qos=100/30` `tiles=32` DevHeap aligned **`bo_size=4096`** + journal `Status 0x4000003` / `Failed cmd … 0x3000003` | **Still `APP_LOAD_PDI_FAIL`** after rela + page pad. Env residual trials **CLOSED**. Unpatched classic body may exist (CLASS A ≠ Pass). Post-patch dump research **closed offline**. **Next:** gate-only maintain `b6a66dee` (prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**; unlock ≠ Pass); optional recapture logs only. Ban env C. Unpatched A / registry alone ≠ Pass |
 | `ert_state=Completed` + zero OFM | bind/patch residual after wait |
 
 Decode: `0x3000003` = `AIE2_STATUS_APP_LOAD_PDI_FAIL`; `0x4000003` = `AIE2_STATUS_INVALID_PARAM` (overall chain status in job completion log).
@@ -102,10 +102,10 @@ research **closed offline**. **Optional** recapture for logs only (not mandatory
 body green):
 
 ```bash
-# Optional one L3 window (vendor NPU; not pure-direct Pass / not C unlock):
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/silicon_lab_operator.sh capture-instr
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# Optional one L3 window (vendor NPU; not pure-direct Pass / not C unlock; not HV under CONSUMED):
+# sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# bash tools/silicon_lab_operator.sh capture-instr
+# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 # Offline (agent or you):
 bash tools/diff_vendor_instr_parity.sh   # unpatched A = body match only ≠ C-ready
 ```
@@ -116,8 +116,8 @@ Writes `gt_capture/instr_vendor_post_patch.bin` + `vendor_paddrs.json` (schema v
 Transaction/cache image only (not proven live-patched `run_` BO). In
 `silicon_contract_check`: **miss** soft WARN (CONTRACT_OK possible — **≠ Pass**);
 **match** OK as body class only when unpatched.
-**No more env apply spam.** Operator **C2** unlocked once under **`C_UNLOCK=b17b0119`**
-(unlock **≠** Pass) — **not** mere unpatched `diff rc=0` / registry / parity alone.
+**No more env apply spam.** Operator **C2 CONSUMED** under **`C_UNLOCK=b17b0119`**
+(unlock **≠** Pass; further C needs **new** unlock) — **not** mere unpatched `diff rc=0` / registry / parity alone. Gate-only maintain `b6a66dee` (prior `dd35ae15`).
 Further C needs a **new agent unlock** (evidence may justify; never auto-unlocks).
 
 See [HITL_BC.md](./HITL_BC.md), [SILICON_PATH_LAB.md](./SILICON_PATH_LAB.md), [RESIDUAL.md](../RESIDUAL.md).
@@ -131,3 +131,5 @@ bash tools/silicon_contract_check.sh
 ```
 
 Never set `XDNA2_ALLOW_EXEC_CMD=1` in default tests. Never claim Pass from this doc alone.
+
+**Highest-value next (single source of truth / gate-only `b6a66dee`):** maintain `run_offline_gates` green + L3=`N`; prefer stamp-only while A–O closed (prior `dd35ae15`); **ban** invent Track P+; `C_UNLOCK=b17b0119` **CONSUMED** — further C needs new agent unlock. Offline green ≠ C-ready ≠ Pass ≠ `ran_on_npu`.

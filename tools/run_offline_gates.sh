@@ -6,10 +6,11 @@
 #   classic_1688 (hard; refuse 0 matched tests),
 #   bash -n: hitl_c_pass_apply, hitl_c2_once, c3_post_c2_classify,
 #            c4_pass_check, run_offline_gates, classify_last_apply_residual,
-#            silicon_contract_check, test_diff_vendor_parity_offline,
-#            diff_vendor_instr_parity
+#            smoke_tmpdir_root_clamp, silicon_contract_check,
+#            test_diff_vendor_parity_offline, diff_vendor_instr_parity
 #
 # Soft steps (default: report only; never hard-fail the suite):
+#   smoke_tmpdir_root_clamp (TMPDIR=/ and symlink-to-/ → /tmp; always exit 0)
 #   classify_last_apply_residual (always soft unless --require-assets + fixture skip)
 #   c4_pass_check (soft; C4_SKIP on baseline fixture — never invents Pass)
 #   Asset-dependent scripts when lab_instr.elf present:
@@ -167,9 +168,13 @@ run_hard "bash -n c3_post_c2_classify" bash -n tools/c3_post_c2_classify.sh
 run_hard "bash -n c4_pass_check" bash -n tools/c4_pass_check.sh
 run_hard "bash -n run_offline_gates" bash -n tools/run_offline_gates.sh
 run_hard "bash -n classify_last_apply_residual" bash -n tools/classify_last_apply_residual.sh
+run_hard "bash -n smoke_tmpdir_root_clamp" bash -n tools/smoke_tmpdir_root_clamp.sh
 run_hard "bash -n silicon_contract_check" bash -n tools/silicon_contract_check.sh
 run_hard "bash -n test_diff_vendor_parity_offline" bash -n tools/test_diff_vendor_parity_offline.sh
 run_hard "bash -n diff_vendor_instr_parity" bash -n tools/diff_vendor_instr_parity.sh
+
+# --- soft TMPDIR root clamp smoke (always exit 0; never hard-fail) ---
+run_soft "smoke_tmpdir_root_clamp" bash tools/smoke_tmpdir_root_clamp.sh
 
 # --- soft classify + C4 pass audit (fixture may be gitignored) ---
 if [[ -f "$LAST_APPLY" ]] || [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]]; then
@@ -208,8 +213,12 @@ if [[ -f "$ROOT/RESIDUAL.md" ]]; then
       | head -n1 | tr -d '`"*' | tr -d '[:space:]'
   )"
   if [[ -n "${_og_c_unlock}" ]]; then
-    echo "NOTE: ${_og_c_unlock} one-shot present in RESIDUAL (soft; still not_c_ready=1 not_ran_on_npu=1)"
-    echo "NOTE: unlock ≠ Pass; operator C2 only; restore L3=exec_cmd_allow=0 after apply"
+    if grep -qE 'CONSUMED|consumed' "$ROOT/RESIDUAL.md" 2>/dev/null; then
+      echo "NOTE: ${_og_c_unlock} one-shot CONSUMED (soft; further C needs new unlock; still not_c_ready=1 not_ran_on_npu=1)"
+    else
+      echo "NOTE: ${_og_c_unlock} one-shot present in RESIDUAL (soft; still not_c_ready=1 not_ran_on_npu=1)"
+      echo "NOTE: unlock ≠ Pass; operator C2 only; restore L3=exec_cmd_allow=0 after apply"
+    fi
   fi
 fi
 if [[ "$HARD_FAIL" -ne 0 ]]; then

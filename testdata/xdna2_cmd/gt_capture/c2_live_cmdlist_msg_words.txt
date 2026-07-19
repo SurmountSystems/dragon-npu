@@ -1,0 +1,7 @@
+# Live C2 cmdlist slot message (same shot). Research only.
+00000000
+00000000
+04000000
+00000000
+00000070
+00000001

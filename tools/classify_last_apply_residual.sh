@@ -13,23 +13,59 @@
 #   # fish:
 #   set -gx XDNA2_LAB_LAST_APPLY_JSON /path/to.json; bash tools/classify_last_apply_residual.sh
 #
+# Optional research envs (forwarded to the example; ≠ C-ready / ≠ Pass):
+#   XDNA2_LAB_JOURNAL_TEXT=…   inline journal **paste text** (not a path); dual FW
+#                              codes only when hex literals parse; 256 KiB cap
+#   XDNA2_LAB_PRINT_C2_CMDBUF_RESEARCH=1|true
+#                              soft research lines (Tracks F/G/K/L/M/N/O):
+#                                c2_cmdbuf_map= / c2_cmdlist_msg=
+#                                c2_cmdlist_fill_cross_check=
+#                                instr_pdi_load_research= (full staged ELF or SKIP)
+#                                app_load_pdi_partition_research= (public status-name;
+#                                  full C2 pair needs XDNA2_LAB_JOURNAL_TEXT)
+#                                public_pdi_evidence_scan= (Track M closed lock)
+#                                external_public_pdi_evidence_scan= (Track N closed_no_new)
+#                                app_load_maintain_reconfirm= (Track O A–N still closed;
+#                                  compose M+N; no FS/network/XRT walk;
+#                                  ≠ C-ready ≠ silicon progress / not new evidence)
+#                              always invent_pass=0; must be exact 1/true (0/false/empty=off)
+#
 # Soft default (for silicon_contract_check):
 #   - missing fixture → CLASSIFY_SKIP + exit 0
 #   - cargo/example fail → WARN + exit 0
 #   - successful report → CLASSIFY_SOFT_OK + exit 0
 # Never claims C-ready / ran_on_npu. CONTRACT_OK ≠ C-ready.
+# Never sets XDNA2_ALLOW_EXEC_CMD (unset at entry for hygiene).
 #
 # Optional:
 #   --require   exit 2 if no last_apply or example fails (hard offline research)
 set -euo pipefail
 export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
+# Soft classify is offline-only — never inherit a dangerous EXEC allow from the
+# ambient shell (matches c3 / run_offline_gates hygiene).
+unset XDNA2_ALLOW_EXEC_CMD || true
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # Match Rust std::env::temp_dir() on Unix (TMPDIR or /tmp).
+# TMPDIR=/ (or empty after strip) must not become "" and match every absolute path.
+# Resolve symlink-to-/ via realpath when possible; fail-closed if realpath fails or
+# path remains a symlink (never keep unresolved rootlink as allow-root).
+# Soft smoke: bash tools/smoke_tmpdir_root_clamp.sh (also soft in run_offline_gates).
 TMP_ROOT="${TMPDIR:-/tmp}"
-# Strip trailing slash for clean joins.
 TMP_ROOT="${TMP_ROOT%/}"
+if [[ -z "$TMP_ROOT" || "$TMP_ROOT" == "/" ]]; then
+  TMP_ROOT="/tmp"
+fi
+if [[ -d "$TMP_ROOT" ]]; then
+  resolved="$(realpath -m "$TMP_ROOT" 2>/dev/null || true)"
+  if [[ -n "$resolved" ]]; then
+    TMP_ROOT="$resolved"
+  fi
+fi
+if [[ -z "$TMP_ROOT" || "$TMP_ROOT" == "/" || -L "$TMP_ROOT" ]]; then
+  TMP_ROOT="/tmp"
+fi
 
 REQUIRE=0
 IN=""

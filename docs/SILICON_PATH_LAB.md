@@ -1,4 +1,4 @@
-# Silicon path lab (WTS → ctrl → gated EXEC)
+# Silicon path (gate-only `b6a66dee`; prior `dd35ae15`) lab (WTS → ctrl → gated EXEC)
 
 ## Plain English
 
@@ -8,28 +8,30 @@
 
 Packing/layout alone never sets `ran_on_npu`.
 
-## Strategy (offline first; HITL B + optional capture + C2 one-shot unlock)
+## Strategy (offline first; HITL B + optional capture; C2 **CONSUMED** historical)
 
 Default progress is **offline** (contract tests, GT oracle, pure-direct /
 **APP_LOAD** residual). Public true post-patch dump research is **closed offline**.
 Live EXEC is **not** a debugger — see [HITL_BC.md](./HITL_BC.md),
-[HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md) (canonical C sandwich),
-[XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md), [RESIDUAL.md](../RESIDUAL.md).
+[HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md) (canonical C sandwich — **CONSUMED**
+under `b17b0119`), [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md),
+[RESIDUAL.md](../RESIDUAL.md).
 
 | Mode | Who | Command |
 |------|-----|---------|
 | Offline check | anyone | `bash tools/silicon_lab_operator.sh check` (**CONTRACT_OK ≠ Pass** / ≠ unlock alone) |
 | B GT | you once | `bash tools/hitl_b_gt_capture.sh` |
 | Capture | optional | L3 → `capture-instr` → close → `diff` — **optional** logs only (unpatched CLASS A already body-green) |
-| **C2** | **you now** (`C_UNLOCK=b17b0119`) | one-shot recipe: [HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md); unlock **≠** Pass; restore L3; **not** unpatched A / mere `diff rc=0` / registry / offline green alone |
+| **C2** | **CONSUMED / historical** (`C_UNLOCK=b17b0119`) | already ran once; recipe = record-only: [HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md); unlock **≠** Pass; **not** unpatched A / mere `diff rc=0` / registry / offline green alone |
 
 **Never EXEC raw `lab_instr.bin`.** Prefer `lab_instr.elf` (aiebu + rela).  
 **No Pass claim** without OFM allclose on real ioctl + ERT Completed.  
 **Unpatched CLASS A / mere `diff rc=0` = body match only → ≠ Pass.**  
-Further C after this one-shot needs a **new agent unlock** (evidence may justify; never auto-unlocks).
+Further C after the consumed one-shot needs a **new agent unlock** (evidence may justify; never auto-unlocks).
 
-**Highest-value now (SSoT):** operator **C2** under `C_UNLOCK=b17b0119` (unlock ≠ Pass),
-then agent classifies last_apply; maintain pure-direct offline (not capture-golden as P1).
+**Highest-value now (single source of truth):** maintain `run_offline_gates` green + L3=`N` under gate-only
+`b6a66dee` (prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**); offline c3/c4 classify; **not** operator C2
+re-run. Further live C only after **new** unlock. Maintain pure-direct offline (not capture-golden as P1).
 
 ## Operator one-liner helper
 
@@ -92,14 +94,14 @@ After re-apply, `bo_diag` DevHeap `vaddr` should satisfy `vaddr % 0x4000000 == 0
 - Optional always-on: `export XDNA2_LAB_BO_DIAG=1`
 - OFM decide refuse: `ofm_stats=[raw_len=… nonzero_f32=… first_bf16_le=…]` (no fake Pass)
 
-**Pass apply (operator C2 — one-shot `C_UNLOCK=b17b0119`; unlock ≠ Pass):**
+**Pass apply — HISTORICAL / CONSUMED (operator C2 — one-shot `C_UNLOCK=b17b0119`; unlock ≠ Pass):**
 
 Offline `CONTRACT_OK` alone is **not** Pass **and never substitutes for agent unlock**.
 Unpatched `diff` rc=0 / CLASS A is **body match only** → **≠ Pass**. Registry dump =
 Transaction/cache image only (not proven live-patched `run_` BO). INSTR_BO true
 post-patch public path is **closed** — do **not** treat registry mode as a preferred
-C pre-req. Silicon residual is **APP_LOAD**; **C2 unlocked once** under `b17b0119`
-(further C needs **new agent unlock**; evidence may justify, never auto-unlocks).
+C pre-req. Silicon residual is **APP_LOAD**; **C2 CONSUMED** (ran once under `b17b0119`;
+do **not** re-run under this stamp; further C needs **new agent unlock**; evidence may justify, never auto-unlocks).
 Offline work = maintain pure-direct tests / contract. Canonical C sequence:
 [HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md). See [HITL_BC.md](./HITL_BC.md) /
 `RESIDUAL.md`. Do not iterate flags via raw `lab_exec_once` as progress.

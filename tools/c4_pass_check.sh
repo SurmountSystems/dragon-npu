@@ -40,9 +40,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # TMPDIR=/ (or empty after strip) must not become "" and match every absolute path.
+# Resolve symlink-to-/ via realpath when possible; fail-closed if realpath fails or
+# path remains a symlink (never keep unresolved rootlink as allow-root).
+# Soft smoke: bash tools/smoke_tmpdir_root_clamp.sh
 TMP_ROOT="${TMPDIR:-/tmp}"
 TMP_ROOT="${TMP_ROOT%/}"
 if [[ -z "$TMP_ROOT" || "$TMP_ROOT" == "/" ]]; then
+  TMP_ROOT="/tmp"
+fi
+if [[ -d "$TMP_ROOT" ]]; then
+  resolved="$(realpath -m "$TMP_ROOT" 2>/dev/null || true)"
+  if [[ -n "$resolved" ]]; then
+    TMP_ROOT="$resolved"
+  fi
+fi
+if [[ -z "$TMP_ROOT" || "$TMP_ROOT" == "/" || -L "$TMP_ROOT" ]]; then
   TMP_ROOT="/tmp"
 fi
 
