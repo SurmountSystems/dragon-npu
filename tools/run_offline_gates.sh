@@ -5,7 +5,8 @@
 #   fmt, clippy (lib+classify example), pure_direct, silicon_contract,
 #   classic_1688 (hard; refuse 0 matched tests),
 #   bash -n: hitl_c_pass_apply, hitl_c2_once, c3_post_c2_classify,
-#            c4_pass_check, run_offline_gates, classify_last_apply_residual,
+#            c4_pass_check, p5_post_c2_interpret, p6_true_pass_check,
+#            run_offline_gates, classify_last_apply_residual,
 #            smoke_tmpdir_root_clamp, silicon_contract_check,
 #            test_diff_vendor_parity_offline, diff_vendor_instr_parity
 #
@@ -13,6 +14,7 @@
 #   smoke_tmpdir_root_clamp (TMPDIR=/ and symlink-to-/ → /tmp; always exit 0)
 #   classify_last_apply_residual (always soft unless --require-assets + fixture skip)
 #   c4_pass_check (soft; C4_SKIP on baseline fixture — never invents Pass)
+#   p6_true_pass_check (soft; P6_SKIP/P6_NOT_PASS on fixture — ≠ product Pass)
 #   Asset-dependent scripts when lab_instr.elf present:
 #     diff_vendor_instr_parity, test_diff_vendor_parity_offline,
 #     silicon_contract_check — soft skip when assets missing (CI clean checkout)
@@ -156,8 +158,8 @@ echo "BAN: residual_class / CLASSIFY_SOFT_OK / checklist / CONTRACT_OK / CLASS A
 
 # --- hard unit / style ---
 run_hard "cargo fmt --check" cargo fmt -- --check
-run_hard "clippy amd-xdna2 lib+classify+c4" \
-  cargo clippy --features amd-xdna2 --lib --example classify_last_apply --example c4_pass_check -- -D warnings
+run_hard "clippy amd-xdna2 lib+classify+c4+p6" \
+  cargo clippy --features amd-xdna2 --lib --example classify_last_apply --example c4_pass_check --example p6_true_pass_check -- -D warnings
 run_hard_cargo_filter "pure_direct" "pure_direct"
 run_hard_cargo_filter "silicon_contract" "silicon_contract"
 run_hard_cargo_filter "classic_1688" "classic_1688"
@@ -166,6 +168,8 @@ run_hard "bash -n hitl_c_pass_apply" bash -n tools/hitl_c_pass_apply.sh
 run_hard "bash -n hitl_c2_once" bash -n tools/hitl_c2_once.sh
 run_hard "bash -n c3_post_c2_classify" bash -n tools/c3_post_c2_classify.sh
 run_hard "bash -n c4_pass_check" bash -n tools/c4_pass_check.sh
+run_hard "bash -n p5_post_c2_interpret" bash -n tools/p5_post_c2_interpret.sh
+run_hard "bash -n p6_true_pass_check" bash -n tools/p6_true_pass_check.sh
 run_hard "bash -n run_offline_gates" bash -n tools/run_offline_gates.sh
 run_hard "bash -n classify_last_apply_residual" bash -n tools/classify_last_apply_residual.sh
 run_hard "bash -n smoke_tmpdir_root_clamp" bash -n tools/smoke_tmpdir_root_clamp.sh
@@ -176,13 +180,15 @@ run_hard "bash -n diff_vendor_instr_parity" bash -n tools/diff_vendor_instr_pari
 # --- soft TMPDIR root clamp smoke (always exit 0; never hard-fail) ---
 run_soft "smoke_tmpdir_root_clamp" bash tools/smoke_tmpdir_root_clamp.sh
 
-# --- soft classify + C4 pass audit (fixture may be gitignored) ---
+# --- soft classify + C4/P6 pass audit (fixture may be gitignored) ---
 if [[ -f "$LAST_APPLY" ]] || [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]]; then
   run_soft "classify_last_apply_residual" bash tools/classify_last_apply_residual.sh
   run_soft "c4_pass_check" bash tools/c4_pass_check.sh
+  run_soft "p6_true_pass_check" bash tools/p6_true_pass_check.sh
 else
   skip_soft "classify_last_apply_residual (no last_apply fixture; gitignored OK)"
   skip_soft "c4_pass_check (no last_apply fixture; gitignored OK)"
+  skip_soft "p6_true_pass_check (no last_apply fixture; gitignored OK)"
   if [[ "$REQUIRE_ASSETS" -eq 1 ]]; then
     fail_hard "require-assets: classify skipped (no last_apply fixture / XDNA2_LAB_LAST_APPLY_JSON)"
   fi

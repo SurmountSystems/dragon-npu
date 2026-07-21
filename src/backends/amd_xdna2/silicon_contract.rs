@@ -246,6 +246,10 @@ impl SiliconResidualClass {
 }
 
 /// Parsed signals from a timed `detail` string (best-effort, pure).
+///
+/// Research bag of optional tokens — several independent presence flags are
+/// expected (not a state machine).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LastApplyDetailSignals {
     /// `ert_state=N` numeric when present (first `ert_state=` only).
@@ -284,6 +288,14 @@ pub struct LastApplyDetailSignals {
     pub submit_wait_not_ok: bool,
     /// `rela_mode=overwrite|add` when found.
     pub rela_mode: Option<String>,
+    /// `config_cu=0|1` lab CONFIG_CU attach token when present (research; ≠ Pass).
+    pub config_cu: Option<u8>,
+    /// True when detail/status indicates CONFIG_CU attach failed (research only).
+    pub config_cu_failed: bool,
+    /// `pdi_bytes=N` when present (opaque PDI length after lab attach).
+    pub pdi_bytes: Option<u32>,
+    /// `cu_func=N` when present (0–255).
+    pub cu_func: Option<u8>,
 }
 
 /// End of first whitespace/`;`/`,` delimited token.
@@ -371,7 +383,9 @@ pub fn last_apply_bo_gt_content(sig: &LastApplyDetailSignals) -> bool {
 /// Coarse last_apply fingerprint for C3 "no new C2 evidence" detection.
 ///
 /// Compares `status` / `aiebu_elf` / `ert_error` / `ran_on_npu` / `detail` length /
-/// optional top-level `rela_count`. **Not** a full-body hash and **not** new
+/// optional top-level `rela_count` / **`config_cu_present`** (CONFIG_CU attach
+/// signal so a post-P4 sandwich with `config_cu=` is not false C3_SKIP when
+/// other fields coincidentally match). **Not** a full-body hash and **not** new
 /// APP_LOAD research — only detects whether a snapshot matches another (or the
 /// locked baseline shape). Never claims Pass / C-ready / `ran_on_npu`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -388,6 +402,70 @@ pub struct LastApplyEvidenceFingerprint {
     pub detail_len: usize,
     /// Schema-2 top-level `rela_count` when provided (detail rela is not re-parsed).
     pub rela_count: Option<u32>,
+    /// True when status/detail show a lab CONFIG_CU attempt (`config_cu=` /
+    /// `config_cu_failed` / status `config_cu_failed`). Locked baseline = false.
+    pub config_cu_present: bool,
+}
+
+/// True when status/detail carry a lab CONFIG_CU attach signal (research only).
+///
+/// Detects: top-level status `config_cu_failed`, detail `config_cu=…`, or
+/// `config_cu_failed` token / "CONFIG_CU attach failed" phrase. Never invents
+/// Pass / C-ready / `ran_on_npu`.
+#[must_use]
+pub fn last_apply_has_config_cu_signal(status: Option<&str>, detail: Option<&str>) -> bool {
+    if status
+        .map(str::trim)
+        .is_some_and(|s| s.eq_ignore_ascii_case("config_cu_failed"))
+    {
+        return true;
+    }
+    let Some(d) = detail else {
+        return false;
+    };
+    if d.contains("config_cu=") {
+        return true;
+    }
+    // Whole-token `config_cu_failed` (not a longer identifier).
+    if let Some(i) = d.find("config_cu_failed") {
+        let before_ok = i == 0
+            || d.as_bytes()
+                .get(i - 1)
+                .is_some_and(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+        let after = i + "config_cu_failed".len();
+        let after_ok = d
+            .as_bytes()
+            .get(after)
+            .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    // Live fail detail phrase from timed path (no bare token).
+    d.to_ascii_lowercase().contains("config_cu attach failed")
+}
+
+/// True when parsed detail signals show CONFIG_CU attach evidence.
+///
+/// Aligned with [`last_apply_has_config_cu_signal`] / C3 fingerprint `config_cu`
+/// bit: `config_cu=` token and/or `config_cu_failed` only. Bare `pdi_bytes=` /
+/// `cu_func=` alone do **not** set present (lab always emits `config_cu=` with
+/// PDI size; checklist may still print those fields when parsed).
+#[must_use]
+pub fn last_apply_config_cu_present(sig: &LastApplyDetailSignals) -> bool {
+    sig.config_cu.is_some() || sig.config_cu_failed
+}
+
+/// Merge top-level `status` into CONFIG_CU signals (e.g. `config_cu_failed`).
+///
+/// Pure; does not invent Pass. Call after [`parse_last_apply_detail_signals`].
+pub fn merge_last_apply_status_config_cu(status: Option<&str>, sig: &mut LastApplyDetailSignals) {
+    if status
+        .map(str::trim)
+        .is_some_and(|s| s.eq_ignore_ascii_case("config_cu_failed"))
+    {
+        sig.config_cu_failed = true;
+    }
 }
 
 /// Build a coarse fingerprint from last_apply field slices (pure; no I/O).
@@ -400,23 +478,25 @@ pub fn last_apply_evidence_fingerprint(
     detail: Option<&str>,
     rela_count: Option<u32>,
 ) -> LastApplyEvidenceFingerprint {
-    let status = status
+    let status_owned = status
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     LastApplyEvidenceFingerprint {
-        status,
+        status: status_owned,
         aiebu_elf,
         ert_error,
         ran_on_npu,
         detail_len: detail.map_or(0, str::len),
         rela_count,
+        config_cu_present: last_apply_has_config_cu_signal(status, detail),
     }
 }
 
 /// True when two coarse fingerprints match (same C3 evidence identity).
 ///
-/// Equality of status / aiebu / ert / ran_on_npu / detail_len / rela_count only.
+/// Equality of status / aiebu / ert / ran_on_npu / detail_len / rela_count /
+/// `config_cu_present` only.
 #[must_use]
 pub fn last_apply_is_same_fixture_fingerprint(
     a: &LastApplyEvidenceFingerprint,
@@ -1922,10 +2002,11 @@ pub fn profile_instr_payload_after_rela_c2_locked(elf: &[u8]) -> InstrPdiLoadRes
 ///
 /// From [`docs/CONSTRUCTION_MAP_APP_LOAD.md`](../../../docs/CONSTRUCTION_MAP_APP_LOAD.md):
 /// public KMQ path loads **CU/PDI via CONFIG_CU** then peels/patches aiebu
-/// ctrltext for START_NPU. Pure-direct lab only does instruction/ctrltext —
-/// **never** CONFIG_CU. That structural gap is locked here for unit tests;
-/// it is a research hypothesis for residual `0x3000003`, **not** proof and
-/// **not** C-ready / Pass / `ran_on_npu`.
+/// ctrltext for START_NPU. Pure-direct lab default does instruction/ctrltext
+/// only; optional `XDNA2_LAB_PDI_BLOB` may attach CONFIG_CU (research, not
+/// proven). Offline research matrix still locks default `lab_has_cu_pdi_config=
+/// false` so we never invent a closed gap without live evidence. Hypothesis
+/// for residual `0x3000003`, **not** proof / C-ready / Pass / `ran_on_npu`.
 ///
 /// Field bag is intentional research flags (not a product state machine).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1933,7 +2014,8 @@ pub fn profile_instr_payload_after_rela_c2_locked(elf: &[u8]) -> InstrPdiLoadRes
 pub struct ConstructionPathResearch {
     /// True when `elf` peels classic-walkable ctrltext **and** has rela evidence.
     pub lab_has_instr_ctrltext: bool,
-    /// Always **false** for pure-direct lab today (we never CONFIG_CU / load PDI).
+    /// Default pure-direct path: **false** (CONFIG_CU only when lab env set live).
+    /// Offline research never invents true from machinery alone.
     pub lab_has_cu_pdi_config: bool,
     /// Research fact from open driver/shim: production KMQ path has a CU/PDI step.
     pub public_stack_requires_cu_pdi_step: bool,
@@ -2007,11 +2089,13 @@ impl ConstructionPathResearch {
 /// - Empty `elf` → soft skip-ish: no lab instr, gap still **true** (public requires
 ///   CU/PDI; lab never has it).
 /// - Valid aiebu ELF with peelable classic ctrltext + rela → `lab_has_instr_ctrltext`.
-/// - `lab_has_cu_pdi_config` is **always false** (do not invent CONFIG_CU).
+/// - `lab_has_cu_pdi_config` is **false** offline (default path; do not invent
+///   closed gap from optional env machinery alone).
 /// - Always soft; never Pass / C-ready / `ran_on_npu`.
 #[must_use]
 pub fn research_construction_path_lab_vs_public(elf: &[u8]) -> ConstructionPathResearch {
     // Structural research facts from construction map / open driver+shim.
+    // Optional XDNA2_LAB_PDI_BLOB can attach live; offline matrix stays open.
     let public_requires = true;
     let lab_has_cu = false;
     let gap = public_requires && !lab_has_cu;
@@ -2085,7 +2169,8 @@ pub fn research_construction_path_lab_vs_public(elf: &[u8]) -> ConstructionPathR
 /// ctrltext alone. **Not** proof. **Not** Pass / C-ready / `ran_on_npu`.
 ///
 /// Locks the residual matrix from construction map + locked journal class:
-/// - Pure-direct lab is **ctrltext-only** (never CONFIG_CU).
+/// - Pure-direct lab **default** is ctrltext-only (optional env CONFIG_CU not
+///   counted as closed gap offline).
 /// - Production public stack has a CU/PDI step (construction gap open).
 /// - Public FW status **name** `APP_LOAD_PDI_FAIL` (`0x3000003`) implies a
 ///   partition/PDI load step rejected something — status name only, not image
@@ -2097,7 +2182,7 @@ pub fn research_construction_path_lab_vs_public(elf: &[u8]) -> ConstructionPathR
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
 pub struct CuPdiNecessityResearch {
-    /// Pure-direct lab never issues CONFIG_CU / PDI BO (always true today).
+    /// Default lab path is ctrltext-only (true for offline research matrix).
     pub lab_is_ctrltext_only: bool,
     /// Open driver/shim fact: production KMQ path has CU/PDI + CONFIG_CU.
     pub public_has_cu_pdi_step: bool,
@@ -7178,13 +7263,14 @@ pub fn check_research_xclbin_section_markers_stage(
 pub fn load_xclbin_section_markers_text_for_research(
     path: &std::path::Path,
 ) -> Result<String, DirectError> {
+    use std::io::Read;
+
     if !xclbin_section_markers_load_path_is_allowed(path) {
         return Err(DirectError::InvalidArgument(format!(
             "xclbin section markers path refused (confinement/ext/post_patch/symlink): {}",
             path.display()
         )));
     }
-    use std::io::Read;
     let mut f = open_external_ctrltext_nofollow(path).map_err(|e| {
         DirectError::InvalidArgument(format!(
             "xclbin section markers open failed ({}): {e}",
@@ -8641,6 +8727,64 @@ pub fn format_silicon_pass_eval_note(eval: &SiliconPassEval) -> String {
     }
 }
 
+/// SSoT **true product-Pass** criteria checklist (P6 offline readiness).
+///
+/// Always research-only: never invents product Pass / `ran_on_npu` from offline
+/// green. Product Pass remains live `decide_ran_on_npu` / timed path only.
+/// Offline C4 [`SiliconPassEval::PassCandidate`] is **not** product Pass
+/// (`c4_pass_candidate_neq_product_pass=1`).
+///
+/// Always includes honesty:
+/// `invent_pass=0 not_c_ready=1 product_pass_requires_live_decide=1 offline_audit_only=1`.
+#[must_use]
+pub fn format_true_pass_criteria_checklist() -> String {
+    [
+        "true_pass_criteria=1",
+        "product_pass_requires_live_decide=1",
+        "offline_audit_only=1",
+        "invent_pass=0",
+        "not_c_ready=1",
+        "not_ran_on_npu=1",
+        "product_pass=0",
+        "require_ert_completed_or_ok_npu_verified=1",
+        "require_ofm_nonzero_allclose_live=1",
+        "require_real_ioctl=1",
+        "require_json_ran_on_npu_from_product_path=1",
+        "c4_pass_candidate_neq_product_pass=1",
+        "userspace_elf_rela_ok_neq_fw_accept=1",
+        "fw_accept_neq_product_pass=1",
+        "locked_fixture_not_product_pass=1",
+        "allclose_only_via_live_decide_ran_on_npu=1",
+        "p6_criteria_ready_offline=1",
+    ]
+    .join(" ")
+}
+
+/// P6 status note from a C4 offline eval — **never** claims product Pass.
+///
+/// Reuses [`evaluate_silicon_pass_evidence`] results; does not re-gate Pass.
+/// Even [`SiliconPassEval::PassCandidate`] stays
+/// `product_pass=0 invent_pass=0 product_pass_requires_live_decide=1`.
+#[must_use]
+pub fn format_true_pass_p6_note(eval: &SiliconPassEval) -> String {
+    match eval {
+        SiliconPassEval::NotPass { reason } => {
+            format!(
+                "p6_status=not_pass reason={reason} product_pass=0 invent_pass=0 \
+                 not_ran_on_npu=1 not_c_ready=1 product_pass_requires_live_decide=1 \
+                 offline_audit_only=1 locked_fixture_or_snapshot_not_pass=1"
+            )
+        }
+        SiliconPassEval::PassCandidate { .. } => {
+            "p6_status=offline_candidate_only product_pass=0 snapshot_pass_candidate=1 \
+             invent_pass=0 not_ran_on_npu=1 not_c_ready=1 \
+             product_pass_requires_live_decide=1 offline_audit_only=1 \
+             c4_pass_candidate_neq_product_pass=1"
+                .to_string()
+        }
+    }
+}
+
 /// True when a research note/checklist string contains an exact whitespace token.
 #[must_use]
 pub fn residual_note_has_exact_token(note: &str, token: &str) -> bool {
@@ -8875,6 +9019,56 @@ fn parse_last_apply_app_load_tokens(detail: &str, s: &mut LastApplyDetailSignals
             s.rela_mode = Some(tok.to_string());
         }
     }
+    // Lab CONFIG_CU attach tokens (research; attach alone ≠ Pass / ≠ residual class change).
+    if let Some(tok) = detail_first_token_after(detail, "config_cu=") {
+        s.config_cu = match tok.as_bytes() {
+            [b'1', rest @ ..] if rest.first().is_none_or(|b| !b.is_ascii_digit()) => Some(1),
+            [b'0', rest @ ..] if rest.first().is_none_or(|b| !b.is_ascii_digit()) => Some(0),
+            _ => {
+                // Accept small decimal cu flag (still research-only).
+                let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
+                if num_end > 0 {
+                    tok[..num_end].parse::<u8>().ok()
+                } else {
+                    None
+                }
+            }
+        };
+    }
+    if let Some(tok) = detail_first_token_after(detail, "pdi_bytes=") {
+        s.pdi_bytes = parse_detail_size_bytes_token(tok);
+    }
+    if let Some(tok) = detail_first_token_after(detail, "cu_func=") {
+        let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
+        if num_end > 0 {
+            if let Ok(n) = tok[..num_end].parse::<u8>() {
+                s.cu_func = Some(n);
+            }
+        }
+    }
+    // Failed attach: bare token or live timed-path phrase.
+    if let Some(i) = detail.find("config_cu_failed") {
+        let before_ok = i == 0
+            || detail
+                .as_bytes()
+                .get(i - 1)
+                .is_some_and(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+        let after = i + "config_cu_failed".len();
+        let after_ok = detail
+            .as_bytes()
+            .get(after)
+            .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+        if before_ok && after_ok {
+            s.config_cu_failed = true;
+        }
+    }
+    if !s.config_cu_failed
+        && detail
+            .to_ascii_lowercase()
+            .contains("config_cu attach failed")
+    {
+        s.config_cu_failed = true;
+    }
 }
 
 /// Offline userspace-vs-FW checklist from last_apply signals (research only).
@@ -8980,6 +9174,7 @@ pub fn format_app_load_offline_checklist_ex(
         sig.layout.as_deref(),
         &["count4", "xrt3"],
     );
+    append_checklist_config_cu_tokens(&mut parts, class, sig);
     // Submit / OFM layer (userspace saw FW reject, not ioctl hang)
     if sig.submit_wait_not_ok {
         parts.push("submit_wait_not_ok=1".to_string());
@@ -9022,6 +9217,33 @@ pub fn format_app_load_offline_checklist_ex(
         parts.push("checklist_public_pdi_image_decode=0".to_string());
     }
     parts.join(" ")
+}
+
+/// Lab CONFIG_CU attach honesty tokens (P5; attach alone ≠ Pass / ≠ class invent).
+fn append_checklist_config_cu_tokens(
+    parts: &mut Vec<String>,
+    class: SiliconResidualClass,
+    sig: &LastApplyDetailSignals,
+) {
+    let cu_present = last_apply_config_cu_present(sig);
+    parts.push(format!("config_cu_present={}", u8::from(cu_present)));
+    parts.push(format!(
+        "config_cu_failed={}",
+        u8::from(sig.config_cu_failed)
+    ));
+    if let Some(v) = sig.config_cu {
+        parts.push(format!("config_cu={v}"));
+    }
+    if let Some(n) = sig.pdi_bytes {
+        parts.push(format!("pdi_bytes={n}"));
+    }
+    if let Some(f) = sig.cu_func {
+        parts.push(format!("cu_func={f}"));
+    }
+    // Note only: CONFIG_CU + still locked APP_LOAD (wrong PDI / multi-CU / ctrltext).
+    if cu_present && !sig.config_cu_failed && class.is_locked_app_load_after_aiebu() {
+        parts.push("config_cu_attached_still_app_load=1".into());
+    }
 }
 
 /// Allowlist instr BO type tokens (token integrity; unknown → `other`).
@@ -10785,6 +11007,10 @@ mod tests {
         assert_eq!(fp.ert_error, Some(true));
         assert_eq!(fp.ran_on_npu, Some(false));
         assert_eq!(fp.rela_count, Some(12));
+        assert!(
+            !fp.config_cu_present,
+            "locked baseline detail must not invent config_cu_present"
+        );
         let fp2 = last_apply_evidence_fingerprint(
             Some("ert_cmd_error"),
             Some(true),
@@ -10816,6 +11042,72 @@ mod tests {
         assert!(
             !last_apply_is_same_fixture_fingerprint(&fp, &fp_diff),
             "detail_len change alone must mark different C3 evidence fingerprint"
+        );
+        // P5: config_cu= on detail must not false C3_SKIP vs locked baseline
+        // (length may also change — covered next with equal-len isolation).
+        let detail_cu = format!(
+            "{detail} config_cu=1 pdi_bytes=283840 cu_func=0 invent_pass=0 not_ran_on_npu=1"
+        );
+        let fp_cu = last_apply_evidence_fingerprint(
+            Some("ert_cmd_error"),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(detail_cu.as_str()),
+            Some(12),
+        );
+        assert!(fp_cu.config_cu_present);
+        assert!(
+            !last_apply_is_same_fixture_fingerprint(&fp, &fp_cu),
+            "config_cu= detail must not false C3_SKIP vs locked baseline"
+        );
+        // Equal detail_len isolation: only config_cu_present bit differs
+        // (regression: dropping the bit from FP equality must fail this).
+        let pad11 = "zzzzzzzzzzz"; // same len as "config_cu=1"
+        assert_eq!(pad11.len(), "config_cu=1".len());
+        let detail_eq_base = format!("{detail} {pad11}");
+        let detail_eq_cu = format!("{detail} config_cu=1");
+        assert_eq!(
+            detail_eq_base.len(),
+            detail_eq_cu.len(),
+            "isolation pair must share detail_len"
+        );
+        let fp_eq_base = last_apply_evidence_fingerprint(
+            Some("ert_cmd_error"),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(detail_eq_base.as_str()),
+            Some(12),
+        );
+        let fp_eq_cu = last_apply_evidence_fingerprint(
+            Some("ert_cmd_error"),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(detail_eq_cu.as_str()),
+            Some(12),
+        );
+        assert_eq!(fp_eq_base.detail_len, fp_eq_cu.detail_len);
+        assert!(!fp_eq_base.config_cu_present);
+        assert!(fp_eq_cu.config_cu_present);
+        assert!(
+            !last_apply_is_same_fixture_fingerprint(&fp_eq_base, &fp_eq_cu),
+            "equal detail_len + config_cu=1 must still differ via config_cu_present bit"
+        );
+        // Status-only fail path still marks evidence.
+        let fp_fail = last_apply_evidence_fingerprint(
+            Some("config_cu_failed"),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some("XDNA2_LAB_PDI_BLOB set but CONFIG_CU attach failed (invent_pass=0)"),
+            None,
+        );
+        assert!(fp_fail.config_cu_present);
+        assert!(
+            !last_apply_is_same_fixture_fingerprint(&fp, &fp_fail),
+            "config_cu_failed status must differ from locked baseline FP"
         );
         // Still locked APP_LOAD class on the longer detail (rela preserved).
         assert!(last_apply_matches_locked_app_load_baseline(
@@ -10916,7 +11208,104 @@ mod tests {
                 last_apply_evidence_fingerprint(status, aiebu, ert_error, ran, detail, rela);
             assert!(last_apply_is_same_fixture_fingerprint(&fp_fix, &fp_fix));
             assert_eq!(fp_fix.ran_on_npu, Some(false));
+            assert!(
+                !fp_fix.config_cu_present,
+                "repo fixture last_apply must have config_cu_present=false (pre-P4 sandwich)"
+            );
+            if let Some(d) = detail {
+                let sig = parse_last_apply_detail_signals(d);
+                assert!(!last_apply_config_cu_present(&sig));
+                assert!(!sig.config_cu_failed);
+                assert_eq!(sig.config_cu, None);
+            }
         }
+    }
+
+    /// P5: parse CONFIG_CU detail tokens + checklist honesty (≠ Pass / ≠ class invent).
+    #[test]
+    fn parse_last_apply_config_cu_signals_and_checklist() {
+        // No tokens → absent.
+        let bare = parse_last_apply_detail_signals(
+            "ert_state=5(Error) aiebu_elf=1 rela_count=12 aiebu_rela_patched ran_on_npu=false",
+        );
+        assert_eq!(bare.config_cu, None);
+        assert!(!bare.config_cu_failed);
+        assert_eq!(bare.pdi_bytes, None);
+        assert_eq!(bare.cu_func, None);
+        assert!(!last_apply_config_cu_present(&bare));
+        assert!(!last_apply_has_config_cu_signal(
+            Some("ert_cmd_error"),
+            Some("ert_state=5(Error) aiebu_elf=1 rela_count=12")
+        ));
+
+        // Lab success token string (matches LabConfigCuAttach::detail_token shape).
+        let ok_detail = "EXEC_CMD+WAIT seq=0 ert_state=5(Error) aiebu_elf=1 rela_count=12 \
+            aiebu_rela_patched layout=xrt3; \
+            config_cu=1 pdi_bytes=283840 cu_bo=7 cu_func=0 invent_pass=0 not_ran_on_npu=1; \
+            ofm_stats=[raw_nonzero_bytes=0]; ran_on_npu=false";
+        let ok = parse_last_apply_detail_signals(ok_detail);
+        assert_eq!(ok.config_cu, Some(1));
+        assert!(!ok.config_cu_failed);
+        assert_eq!(ok.pdi_bytes, Some(283_840));
+        assert_eq!(ok.cu_func, Some(0));
+        assert!(last_apply_config_cu_present(&ok));
+        assert!(last_apply_has_config_cu_signal(
+            Some("ert_cmd_error"),
+            Some(ok_detail)
+        ));
+        // Residual class still APP_LOAD when aiebu+rela+ert_error (CONFIG_CU alone ≠ new class).
+        let class = classify_last_apply_residual(
+            Some("ert_cmd_error"),
+            Some(ok_detail),
+            Some(true),
+            Some(true),
+        );
+        assert_eq!(class, SiliconResidualClass::AppLoadPdiFailAfterAiebu);
+        let checklist = format_app_load_offline_checklist(class, &ok);
+        assert!(checklist.contains("config_cu_present=1"));
+        assert!(checklist.contains("config_cu_failed=0"));
+        assert!(checklist.contains("config_cu=1"));
+        assert!(checklist.contains("pdi_bytes=283840"));
+        assert!(checklist.contains("cu_func=0"));
+        assert!(checklist.contains("config_cu_attached_still_app_load=1"));
+        assert!(checklist.contains("not_c_ready=1"));
+        assert!(checklist.contains("not_ran_on_npu=1"));
+        assert!(checklist.contains("invent_pass=0"));
+
+        // Fail path: status + phrase (no config_cu= token).
+        let fail_detail = "XDNA2_LAB_PDI_BLOB set but CONFIG_CU attach failed (fail-closed; invent_pass=0 not_ran_on_npu=1): io";
+        let mut fail = parse_last_apply_detail_signals(fail_detail);
+        assert!(fail.config_cu_failed);
+        assert_eq!(fail.config_cu, None);
+        merge_last_apply_status_config_cu(Some("config_cu_failed"), &mut fail);
+        assert!(fail.config_cu_failed);
+        assert!(last_apply_config_cu_present(&fail));
+        let checklist_fail =
+            format_app_load_offline_checklist(SiliconResidualClass::NotPassNoErtError, &fail);
+        assert!(checklist_fail.contains("config_cu_present=1"));
+        assert!(checklist_fail.contains("config_cu_failed=1"));
+        assert!(!checklist_fail.contains("config_cu_attached_still_app_load=1"));
+        assert!(checklist_fail.contains("invent_pass=0"));
+
+        // Align present vs signal: bare pdi_bytes= alone is not CONFIG_CU present.
+        let bare_pdi = parse_last_apply_detail_signals("pdi_bytes=283840 cu_func=0 invent_pass=0");
+        assert_eq!(bare_pdi.pdi_bytes, Some(283_840));
+        assert_eq!(bare_pdi.cu_func, Some(0));
+        assert_eq!(bare_pdi.config_cu, None);
+        assert!(!bare_pdi.config_cu_failed);
+        assert!(
+            !last_apply_config_cu_present(&bare_pdi),
+            "pdi_bytes alone must not set config_cu_present (align with fingerprint bit)"
+        );
+        assert!(!last_apply_has_config_cu_signal(
+            Some("ert_cmd_error"),
+            Some("pdi_bytes=283840 cu_func=0")
+        ));
+        // Longer identifier must not whole-token match config_cu_failed.
+        assert!(!last_apply_has_config_cu_signal(
+            None,
+            Some("my_config_cu_failed_extra=1")
+        ));
     }
 
     #[test]
@@ -10961,6 +11350,14 @@ mod tests {
             assert!(sig.submit_wait_not_ok);
             assert_eq!(sig.rela_mode.as_deref(), Some("overwrite"));
             assert!(sig.fw_status_code.is_none());
+            // Pre-CONFIG_CU sandwich fixture: no lab config_cu tokens.
+            assert_eq!(sig.config_cu, None);
+            assert!(!sig.config_cu_failed);
+            assert!(!last_apply_config_cu_present(&sig));
+            let checklist = format_app_load_offline_checklist(class, &sig);
+            assert!(checklist.contains("config_cu_present=0"));
+            assert!(checklist.contains("config_cu_failed=0"));
+            assert!(!checklist.contains("config_cu_attached_still_app_load=1"));
             let ck = format_app_load_offline_checklist(class, &sig);
             assert!(residual_note_has_exact_token(
                 &ck,
@@ -11964,6 +12361,128 @@ mod tests {
                 reason: "status_not_pass"
             }
         );
+    }
+
+    /// P6: SSoT true-Pass criteria checklist always honest + key requirement tokens.
+    #[test]
+    fn true_pass_criteria_checklist_always_honest() {
+        let c = format_true_pass_criteria_checklist();
+        for tok in [
+            "true_pass_criteria=1",
+            "invent_pass=0",
+            "not_c_ready=1",
+            "not_ran_on_npu=1",
+            "product_pass=0",
+            "product_pass_requires_live_decide=1",
+            "offline_audit_only=1",
+            "require_ert_completed_or_ok_npu_verified=1",
+            "require_ofm_nonzero_allclose_live=1",
+            "require_real_ioctl=1",
+            "require_json_ran_on_npu_from_product_path=1",
+            "c4_pass_candidate_neq_product_pass=1",
+            "userspace_elf_rela_ok_neq_fw_accept=1",
+            "fw_accept_neq_product_pass=1",
+            "locked_fixture_not_product_pass=1",
+            "allclose_only_via_live_decide_ran_on_npu=1",
+            "p6_criteria_ready_offline=1",
+        ] {
+            assert!(
+                residual_note_has_exact_token(&c, tok),
+                "missing exact token {tok} in checklist: {c}"
+            );
+        }
+        // Never invent product success tokens.
+        assert!(!residual_note_has_exact_token(&c, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&c, "product_pass=1"));
+        assert!(!residual_note_has_exact_token(&c, "ran_on_npu=1"));
+        assert!(!c.contains("ran_on_npu=true"));
+    }
+
+    /// P6 note from NotPass (locked fixture shape) never product Pass.
+    #[test]
+    fn true_pass_p6_note_not_pass_is_honest() {
+        let eval = SiliconPassEval::NotPass {
+            reason: "json_ran_on_npu_false",
+        };
+        let note = format_true_pass_p6_note(&eval);
+        assert!(residual_note_has_exact_token(&note, "p6_status=not_pass"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "reason=json_ran_on_npu_false"
+        ));
+        assert!(residual_note_has_exact_token(&note, "product_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "offline_audit_only=1"));
+        assert!(!note.contains("product_pass=1"));
+        assert!(!note.contains("ran_on_npu=true"));
+    }
+
+    /// P6 note from offline PassCandidate still requires live decide (≠ product Pass).
+    #[test]
+    fn true_pass_p6_note_candidate_still_not_product_pass() {
+        let eval = SiliconPassEval::PassCandidate {
+            notes: "offline_audit_only=1 product_pass_requires_live_decide=1 invent_pass=0"
+                .to_string(),
+        };
+        let note = format_true_pass_p6_note(&eval);
+        assert!(residual_note_has_exact_token(
+            &note,
+            "p6_status=offline_candidate_only"
+        ));
+        assert!(residual_note_has_exact_token(&note, "product_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "snapshot_pass_candidate=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "c4_pass_candidate_neq_product_pass=1"
+        ));
+        // Candidate path reuses C4 evaluator; checklist still distinct SSoT.
+        let checklist = format_true_pass_criteria_checklist();
+        assert!(residual_note_has_exact_token(
+            &checklist,
+            "c4_pass_candidate_neq_product_pass=1"
+        ));
+    }
+
+    /// P6 note from real evaluate path on synthetic candidate stays product_pass=0.
+    #[test]
+    fn true_pass_p6_note_from_evaluate_candidate() {
+        let detail = "EXEC_CMD+WAIT seq=0 ert_state=4(Completed) aiebu_elf=1 rela_count=12; \
+            ofm_stats=[raw_len=512 raw_nonzero_bytes=42]; ran_on_npu=true";
+        let ev = silicon_pass_evidence_from_last_apply(
+            Some(true),
+            Some("ok_npu_verified"),
+            Some(detail),
+            Some(false),
+            Some(true),
+        );
+        let eval = evaluate_silicon_pass_evidence(&ev);
+        assert!(eval.is_pass_candidate());
+        let note = format_true_pass_p6_note(&eval);
+        assert!(residual_note_has_exact_token(
+            &note,
+            "p6_status=offline_candidate_only"
+        ));
+        assert!(residual_note_has_exact_token(&note, "product_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        // C4 note and P6 note agree: offline only.
+        let c4 = format_silicon_pass_eval_note(&eval);
+        assert!(residual_note_has_exact_token(&c4, "offline_audit_only=1"));
+        assert!(residual_note_has_exact_token(&note, "offline_audit_only=1"));
     }
 
     #[test]

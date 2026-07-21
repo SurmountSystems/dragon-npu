@@ -97,6 +97,15 @@ cargo bench --features amd-xdna2 --bench xdna2_direct
 
 Benches **never** enable EXEC_CMD and never claim `ran_on_npu` GEMM Pass.
 
+## NPU access privileges (product)
+
+NPU access is a **normal device node** (`/dev/accel/accel0`). **Install may need
+admin once** (driver, firmware, udev/group). **Day-to-day inference does not
+need sudo.** Temporary root is only for lab research gates on hardened modules
+(see [docs/XDNA2_NEVER_AGAIN.md](docs/XDNA2_NEVER_AGAIN.md) § Product vs lab
+privileges). Device type **KMQ** (`device_type=0` on this host) means the kernel
+owns the queue — **not** “users must be root.”
+
 ## Garuda / zen + hardened amdxdna (lab hosts)
 
 On Garuda (or Arch zen) with Ryzen AI / XDNA2:

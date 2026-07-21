@@ -10,7 +10,9 @@
 #      order: explicit argv → env → repo baseline (if present) → newest temp
 #      only when no baseline. Explicit/env never overridden by temp discovery.
 #   2) Detect new evidence by **fingerprint equality** vs locked baseline file
-#      (status|aiebu|ert|ran|detail_len|rela). Path alone ≠ evidence.
+#      (status|aiebu|ert|ran|detail_len|rela|config_cu). Path alone ≠ evidence.
+#      config_cu bit: status config_cu_failed / detail config_cu= / attach-failed
+#      phrase → so post-P4 CONFIG_CU sandwich is not false C3_SKIP.
 #      same fingerprint → C3_SKIP same_body_as_baseline; FP differs → C3_EVIDENCE=1
 #      even if residual class is still locked APP_LOAD (annotate
 #      shape_still_locked_app_load=1). Never force skip when FP differs.
@@ -160,7 +162,7 @@ path_load_allowed() {
 }
 
 # Secure JSON helpers: O_NOFOLLOW open + size cap (never follow final symlink).
-# Prints fingerprint: status|aiebu|ert|ran|detail_len|rela
+# Prints fingerprint: status|aiebu|ert|ran|detail_len|rela|config_cu
 # Exit 0 ok; 1 parse/shape false; 2 I/O or refuse.
 _python_read_json() {
   local mode="$1" f="$2"
@@ -233,7 +235,31 @@ def b(v):
 
 if mode == "fingerprint":
     rela_s = "" if rela is None else str(rela)
-    print("|".join([status_s, b(aiebu), b(ert), b(ran), str(len(detail)), rela_s]))
+    # P5: config_cu bit — post-P4 sandwich must not false C3_SKIP vs baseline.
+    # Align with Rust last_apply_has_config_cu_signal (whole-token config_cu_failed).
+    def whole_token(d, tok):
+        i = 0
+        while True:
+            j = d.find(tok, i)
+            if j < 0:
+                return False
+            before_ok = j == 0 or (not d[j - 1].isalnum() and d[j - 1] != "_")
+            after = j + len(tok)
+            after_ok = after >= len(d) or (not d[after].isalnum() and d[after] != "_")
+            if before_ok and after_ok:
+                return True
+            i = j + 1
+
+    cu = "0"
+    if status_s.lower() == "config_cu_failed":
+        cu = "1"
+    elif "config_cu=" in detail:
+        cu = "1"
+    elif whole_token(detail, "config_cu_failed"):
+        cu = "1"
+    elif "config_cu attach failed" in detail.lower():
+        cu = "1"
+    print("|".join([status_s, b(aiebu), b(ert), b(ran), str(len(detail)), rela_s, cu]))
     sys.exit(0)
 
 if mode == "locked_shape":
@@ -497,7 +523,8 @@ fi
 if [[ "$EVIDENCE" -eq 0 ]]; then
   echo "C3_SKIP no_new_c2_evidence reason=$REASON not_c_ready=1 not_ran_on_npu=1"
   echo "NOTE: Offline APP_LOAD signal matrix CLOSED for same fixture — not new research."
-  echo "NOTE: C2 one-shot consumed; further C needs new agent unlock + offline delta (see RESIDUAL)."
+  echo "NOTE: C3_SKIP ≠ unlock consume. See RESIDUAL.md top Unlock row for active vs already-used stamp."
+  echo "NOTE: Further live C after the active stamp is used needs a new agent unlock + offline delta."
   if [[ "$NO_CLASSIFY" -eq 0 ]]; then
     echo "--- soft classify (feedback only; ≠ C-ready) ---"
     set +e

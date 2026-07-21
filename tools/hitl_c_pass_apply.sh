@@ -5,14 +5,17 @@
 # single-shot npu_direct_bench, always restores exec_cmd_allow=0.
 #
 # Policy: run only when agent explicitly says ready. See RESIDUAL.md.
-# SSoT unlock line (soft NOTE only — never hard-blocks apply, even when CONSUMED):
-#   Active: C_UNLOCK=<impl> one-shot; restore L3; ≠ ran_on_npu until Pass
-#   Consumed: C_UNLOCK=<impl> CONSUMED — further C needs new agent unlock + offline delta
-# IMPL b17b0119: C_UNLOCK=b17b0119 one-shot **CONSUMED** (operator C2 2026-07-18).
-#   Historical only — not active open season. Further C needs a **new** agent unlock.
-#   Standing policy: CONSUMED is messaging honesty only (soft NOTE); it does NOT
-#   refuse --assume-l3-already-open. Operator owns L3; hitl_c2_once prints
-#   non-executable HISTORICAL sandwich when consumed (see that script).
+# SSoT unlock: first C_UNLOCK=… line in RESIDUAL.md (soft NOTE only — never
+# hard-blocks apply, even when CONSUMED). Soft-parse matches hitl_c2_once.sh:
+#   Active: first match without CONSUMED on that line → one-shot (P4:
+#           C_UNLOCK=3a70fabf for one CONFIG_CU + XDNA2_LAB_PDI_BLOB sandwich).
+#   Consumed: CONSUMED on first line / same stamp → historical; further C needs
+#             a new agent unlock + offline delta after this one-shot is used.
+# Historical: C_UNLOCK=b17b0119 CONSUMED (operator C2 2026-07-18) — do not reopen.
+# Standing policy: CONSUMED is messaging honesty only (soft NOTE); it does NOT
+# refuse --assume-l3-already-open. Operator owns L3; hitl_c2_once prints
+# executable sandwich when active, HISTORICAL record-only when consumed.
+# Unlock ≠ Pass ≠ ran_on_npu ≠ permanent open season. CONFIG_CU attach alone ≠ Pass.
 # L3 = amdxdna exec_cmd_allow (driver). Userspace ALLOW = XDNA2_ALLOW_EXEC_CMD
 # (Cargo double-gate). Leave neither open; unlock is not permanent either.
 # SSoT: vendor classic body often EXISTS (unpatched CLASS A offline).
@@ -25,9 +28,12 @@
 #
 # Fish-safe: run with bash.
 #
-# Usage (active unlock only — under CONSUMED do not open L3; see offline refuse
-# path / new agent unlock; C_UNLOCK=b17b0119 is CONSUMED — future unlock only):
-#   # Recommended when unlock is active: open L3 yourself, then:
+# Usage (when RESIDUAL first C_UNLOCK= is active — P4 C_UNLOCK=3a70fabf):
+#   # CONFIG_CU pre-step (optional env; default off):
+#   # bash tools/operator_app_load_kit.sh a-prep
+#   # export XDNA2_LAB_PDI_BLOB=/path/from/a-prep
+#   # export XDNA2_LAB_CU_FUNC=0
+#   # Recommended: open L3 yourself, then:
 #   sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 #   bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 #   sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'

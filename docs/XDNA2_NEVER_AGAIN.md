@@ -37,6 +37,29 @@ XDNA2_ALLOW_EXEC_CMD=1 cargo run --features amd-xdna2,xdna2-dangerous-exec-cmd -
 
 Legacy `XDNA2_TRY_SUBMIT` is **fully ignored** (retired). Userspace only the double gate above can enable EXEC_CMD from dragon-npu; a lab L3 module adds a third gate.
 
+## Product vs lab privileges (who needs root?)
+
+**KMQ (kernel-mode queue) is not “sudo.”** On this host the NPU reports
+`device_type=0` (KMQ): the **kernel driver** owns the submit path. That is a
+device contract, not a privilege model. End users still use a normal device node.
+
+| Who | When | Needs root? | What |
+|-----|------|-------------|------|
+| **Admin** | Install once | **Yes** (or package manager) | Driver/module, firmware, udev/group so `/dev/accel/accel0` is openable (often group `render`) |
+| **Product user** | Every day | **No** | Open device, create hwctx, run when product works — **no** per-run `sudo` |
+| **Lab operator** | Supervised research only | **Temporary** | Flip L3 `exec_cmd_allow=1` on **hardened** modules only; restore `=0` after; L1 still needs feature + `XDNA2_ALLOW_EXEC_CMD=1` |
+| **Agent default** | Offline Track A | **No** | No casual sudo; no default ALLOW; no invent `ran_on_npu` |
+
+| Confusion | Truth |
+|-----------|--------|
+| “KMQ means users need sudo” | **False.** KMQ = queue ownership in the driver. Privilege = udev + who may load modules. |
+| “Lab L3 is the product path” | **False.** Stock/distro modules have **no** `exec_cmd_allow`. L3 is hardened-lab only. |
+| “Open L1 for product builds” | **False.** Default product builds keep `xdna2-dangerous-exec-cmd` **OFF**. |
+| “`umq_bo` on CREATE_HWCTX means UMQ device” | **False.** Field may be 0 on KMQ; UMQ is other generations (`device_type` ≠ 0). |
+
+Packaging tree (DKMS vs upstream): [`XDNA2_PACKAGING.md`](./XDNA2_PACKAGING.md).
+Lab enable order: [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md).
+
 ### Secondary backends and `xrt-bridge` (Phase 9)
 
 - Features `intel-vpu`, `qualcomm-hexagon`, and `xrt-bridge` are **honest stubs /

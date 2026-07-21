@@ -6,6 +6,16 @@ Place working **public-stack** post-patch ctrltext (and optionally notes about
 CU/PDI) here when you have a stack that completes EXEC (ERT Completed + useful
 OFM). Bins under this directory are gitignored; this PROVENANCE note is tracked.
 
+**Operator shortcuts (prefer these over hand-copying env names):**
+
+```bash
+bash tools/operator_app_load_kit.sh              # overview A+B
+bash tools/operator_external_capture.sh          # checklist + status
+bash tools/operator_external_capture.sh --install /path/to/ctrltext.bin
+# edit this file's capture table, then:
+bash tools/operator_external_capture.sh --compare
+```
+
 ## Why this directory exists
 
 Lab residual is FW `APP_LOAD_PDI_FAIL` (`0x3000003`) after userspace aiebu+rela

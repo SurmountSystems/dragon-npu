@@ -21,11 +21,26 @@ firmware accepts — then diff that against what we submit.
 
 ---
 
+## Mini glossary (so this doc is readable)
+
+| Term | Plain meaning |
+|------|----------------|
+| **KMQ** | **Kernel Mode Queue.** This host’s `device_type=0`: the **kernel** owns the submit path. XRT/shim uses ioctls (`shim/kmq/`). **Not** “needs sudo.” |
+| **UMQ** | **User Mode Queue.** Other NPU generations in the driver tree. **Not** this laptop’s bind path. Do not “switch to UMQ” on Strix NPU4. |
+| **`umq_bo` field** | Optional buffer handle on CREATE_HWCTX; may be **0** on KMQ. ≠ “running as UMQ device.” |
+| **xclbin** | Container for an NPU app image (includes PDI). |
+| **PDI** | Opaque app/partition blob inside the xclbin; public stack registers it on the hardware context. |
+| **CU** | Compute unit (one programmed slot the xclbin defines). |
+| **CONFIG_CU** | Ioctl after create-context: “this CU uses that PDI buffer.” Lab: optional via `XDNA2_LAB_PDI_BLOB` (default off). |
+| **ctrltext** | Per-job tile program (what we peel from `lab_instr.elf`). |
+| **START_NPU** | The run-this-job command (instruction buffer + I/O buffers). |
+| **Privilege (product)** | Admin installs driver/udev **once**; product users open `/dev/accel` **without** sudo. Lab L3 flip is research-only — see [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md) § Product vs lab privileges. |
+
 ## Two different “loadable” things (easy to conflate)
 
 | Piece | What it is | Who builds it in the public stack | Do we send it? |
 |-------|------------|-------------------------------------|----------------|
-| **CU / PDI** | Per-compute-unit app image from **xclbin** | XRT shim: copy PDI into BO → **CONFIG_HWCTX / CONFIG_CU** → driver mailbox `MSG_OP_CONFIG_CU` with PDI device address | **No** — pure-direct never loads xclbin PDIs |
+| **CU / PDI** | Per-compute-unit app image from **xclbin** | XRT shim (KMQ = kernel-queue path): copy PDI into a buffer → **CONFIG_HWCTX / CONFIG_CU** → driver tells firmware the PDI address | **Optional** — default off; set `XDNA2_LAB_PDI_BLOB` for opaque CONFIG_CU (research; wrong overlay OK for machinery) |
 | **Instruction / ctrltext** | Tile control program for one job (classic txn after aiebu) | DD txn dump → **aiebu-asm** → ELF → peel `.ctrltext` → patch `.rela.dyn` with buffer paddrs → **START_NPU** `instruction_buffer` | **Yes** — this is what `lab_instr.elf` + Rust rela patch do |
 
 The error name says “load PDI,” but on a live EXEC it can fire when the
@@ -88,8 +103,8 @@ Sources (local trees on this machine):
 ```
 
 Shim test `elf_io` path implements steps 6–8 explicitly via
-`aiebu::aiebu_assembler` and `patch_ctrl_code`. Production KMQ hwctx with
-xclbin implements steps 1–4.
+`aiebu::aiebu_assembler` and `patch_ctrl_code`. Production path (KMQ =
+kernel-mode queue / normal XRT→driver path) with an xclbin does steps 1–4.
 
 ---
 
@@ -99,7 +114,12 @@ xclbin implements steps 1–4.
 1. CREATE_HWCTX (tiles=32, QoS gops/fps non-zero)  — no xclbin, no CU list
         │
         ▼
-2. (skip) CONFIG_CU / PDI register  — ctx has no cus → driver config_cu no-op
+2. Optional lab CONFIG_CU (default **off**):
+     if XDNA2_LAB_PDI_BLOB=/path/to/opaque.pdi is set:
+       CREATE_BO(Dev) + write opaque bytes + CONFIG_HWCTX(CONFIG_CU)
+     else: skip (historical path — never CONFIG_CU)
+     Operator dump: bash tools/dump_xclbin_pdi.sh --print-env
+     Kit: bash tools/operator_app_load_kit.sh a-prep
         │
         ▼
 3. Stage: DD dump → lab_instr.bin (1688 B classic v0.1, gen4, 8×6 class)
@@ -149,7 +169,7 @@ silicon corpus is **`silicon_lab/lab_instr.elf`**.
 | Rela overwrite vs add | XRT patch_ctrl_code | overwrite default; add trial closed | Closed |
 | QoS non-zero / tiles | Required | 100/30, tiles=32 | Closed soft residual |
 | DevHeap 64 MiB align | Required | OK on live path | Closed (map_host) |
-| **CU/PDI from xclbin + CONFIG_CU** | **Yes on production KMQ** | **Never** | **Open construction hypothesis** |
+| **CU/PDI from xclbin + CONFIG_CU** | **Yes on production path (KMQ = kernel-queue XRT)** | **Optional** via `XDNA2_LAB_PDI_BLOB` (default off; host AIE2P dump OK for machinery, may be wrong CU for mladf) | **Machinery landed; live proof still open** |
 | Full ELF in instr BO vs peeled ctrltext | Shim peels ctrltext | Peel ctrltext | Match shim test shape |
 | Separate CTRL BO + meta size=6 patch | Yes in DD/meta | Yes (lab residual vs full XRT fidelity) | Partial; not proven root of 0x3000003 |
 | Generation path aie2 msg vs aie4 | Host 1022:17f0 Strix | Same silicon; aie2-style status codes observed | Generation **catalog** closed; still worth noting aie4 enums differ on newer FW paths |
@@ -169,18 +189,32 @@ silicon corpus is **`silicon_lab/lab_instr.elf`**.
 
 ---
 
+## Operator tools (A + B)
+
+| Track | Command | What it does |
+|-------|---------|--------------|
+| A prep | `bash tools/dump_xclbin_pdi.sh --print-env` | Dump opaque PDI; print `XDNA2_LAB_PDI_BLOB=` |
+| A+B kit | `bash tools/operator_app_load_kit.sh` | Overview + status both tracks |
+| B status | `bash tools/operator_external_capture.sh --status` | Capture dir ready? |
+| B install | `… --install /path/ctrltext.bin` | Safe copy into `external_known_good/` |
+| B compare | `… --compare` | Soft classify with external path |
+
+Live apply under active one-shot **`C_UNLOCK=3a70fabf`** (CONFIG_CU + PDI path);
+never reopen consumed `b17b0119`. Attach CONFIG_CU ≠ Pass.
+
 ## Highest-value next offline questions (named, not track letters)
 
-1. **PDI / CONFIG_CU necessity**  
-   Can we extract, offline, a CU PDI blob from a public xclbin / XRT path that
-   successfully runs mladf (or any matmul) on this silicon class — and document
-   size/header — without claiming Pass?
+1. **PDI / CONFIG_CU live effect**  
+   With `XDNA2_LAB_PDI_BLOB` set from host overlay dump, does one supervised
+   live apply change journal status vs locked `0x3000003`? Use active one-shot
+   `C_UNLOCK=3a70fabf`; unlock ≠ Pass; wrong overlay may still `0x3000003`.
+   Then capture mladf-related PDI or path B if still failing.
 
-2. **Known-good instruction BO capture**  
+2. **Known-good instruction BO capture (path B)**  
    From a higher-level run that succeeds (Ryzen AI / ORT / DD execute), capture
-   the **post-patch ctrltext** (or instr BO) and byte-diff vs our patched 1688.
-   Prefer public tooling (shim dump, DD tests) over reopening L3 under consumed
-   unlock.
+   the **post-patch ctrltext** (or instr BO) and soft-compare via
+   `tools/operator_external_capture.sh`. Prefer public tooling over reopening
+   L3 under consumed unlock.
 
 3. **Triton-XDNA / mlir-aie artifacts**  
    Secondary: what does a successful open matmul hand to XRT (`aie.xclbin` /

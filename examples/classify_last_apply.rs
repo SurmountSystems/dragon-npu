@@ -40,11 +40,13 @@ use dragon_npu::backends::amd_xdna2::{
     export_ctrltext_fingerprint_research, format_app_load_offline_checklist,
     format_app_load_offline_checklist_ex, format_c2_cmdlist_msg_research_note,
     format_external_known_good_operator_extract_checklist, format_silicon_residual_class_note,
-    last_apply_bo_gt_content, last_apply_has_rela_evidence, last_apply_load_path_is_allowed,
-    last_apply_start_npu_matches_content, last_apply_temp_root, load_external_ctrltext_for_compare,
-    load_external_ctrltext_from_env, parse_journal_fw_status_pair, parse_last_apply_detail_signals,
-    profile_instr_payload_after_rela_c2_locked, read_external_known_good_provenance_text,
-    read_lab_file_capped, rebuild_c2_live_start_npu_cmd_bo, reconfirm_app_load_tracks_a_n_closed,
+    last_apply_bo_gt_content, last_apply_config_cu_present, last_apply_has_rela_evidence,
+    last_apply_load_path_is_allowed, last_apply_start_npu_matches_content, last_apply_temp_root,
+    load_external_ctrltext_for_compare, load_external_ctrltext_from_env,
+    merge_last_apply_status_config_cu, parse_journal_fw_status_pair,
+    parse_last_apply_detail_signals, profile_instr_payload_after_rela_c2_locked,
+    read_external_known_good_provenance_text, read_lab_file_capped,
+    rebuild_c2_live_start_npu_cmd_bo, reconfirm_app_load_tracks_a_n_closed,
     research_app_load_bag_feed_dry_run_scorecard_ex, research_app_load_e2e_fixture_path,
     research_app_load_extract_bag_scorecard_pipeline_ex,
     research_app_load_offline_progress_scorecard, research_app_load_partition_id_field_map,
@@ -148,7 +150,7 @@ fn run() -> Result<(), u8> {
         .and_then(|n| usize::try_from(n).ok());
 
     let class = classify_last_apply_residual_ex(status, detail, aiebu, ert_error, rela_count_field);
-    let sig = merge_sig(detail, rela_count_field);
+    let sig = merge_sig(detail, rela_count_field, status);
     let note = format_silicon_residual_class_note(class, sig.as_ref());
     print_report(
         &path,
@@ -170,6 +172,7 @@ fn run() -> Result<(), u8> {
 fn merge_sig(
     detail: Option<&str>,
     rela_count_field: Option<usize>,
+    status: Option<&str>,
 ) -> Option<dragon_npu::backends::amd_xdna2::LastApplyDetailSignals> {
     let mut sig = detail.map(parse_last_apply_detail_signals);
     if let Some(ref mut s) = sig {
@@ -178,11 +181,21 @@ fn merge_sig(
                 s.rela_count = Some(n);
             }
         }
+        merge_last_apply_status_config_cu(status, s);
     } else if let Some(n) = rela_count_field.filter(|&n| n > 0) {
-        sig = Some(dragon_npu::backends::amd_xdna2::LastApplyDetailSignals {
+        let mut s = dragon_npu::backends::amd_xdna2::LastApplyDetailSignals {
             rela_count: Some(n),
             ..Default::default()
-        });
+        };
+        merge_last_apply_status_config_cu(status, &mut s);
+        sig = Some(s);
+    } else if status
+        .map(str::trim)
+        .is_some_and(|s| s.eq_ignore_ascii_case("config_cu_failed"))
+    {
+        let mut s = dragon_npu::backends::amd_xdna2::LastApplyDetailSignals::default();
+        merge_last_apply_status_config_cu(status, &mut s);
+        sig = Some(s);
     }
     sig
 }
@@ -232,6 +245,21 @@ fn print_sig_detail(
     }
     if let Some(ref mode) = s.rela_mode {
         println!("rela_mode={mode}");
+    }
+    // P5 CONFIG_CU research tokens (attach alone ≠ Pass).
+    println!(
+        "config_cu_present={}",
+        u8::from(last_apply_config_cu_present(s))
+    );
+    println!("config_cu_failed={}", u8::from(s.config_cu_failed));
+    if let Some(v) = s.config_cu {
+        println!("config_cu={v}");
+    }
+    if let Some(n) = s.pdi_bytes {
+        println!("pdi_bytes={n}");
+    }
+    if let Some(f) = s.cu_func {
+        println!("cu_func={f}");
     }
     if let Some(r) = s.ran_on_npu {
         println!("detail_ran_on_npu={r}");

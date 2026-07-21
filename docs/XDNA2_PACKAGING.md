@@ -9,6 +9,22 @@ fail-fast / `exec_cmd_allow`). Complements
 installed, and verified** on the machine. Agents do not claim reboot-proof
 without the post-reboot checklist.
 
+## Product vs lab privileges
+
+| Role | Privilege | Notes |
+|------|-----------|--------|
+| **Admin once** | Root / package install | Module, firmware, udev so `/dev/accel` is group-usable |
+| **Product user always** | **No sudo** | Open/hwctx/run as normal user after install |
+| **Lab only** | Temporary root for `exec_cmd_allow` | Hardened L3 only; restore off; see [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md) |
+
+**Do not ship** “sudo every inference.” If shipping the hardened module long-term,
+product hosts either set `exec_cmd_allow=1` at **install** (admin once) or use
+upstream without L3. That choice is packaging policy — not a per-run password.
+
+**Device type (KMQ):** Strix NPU4-class hosts report `device_type=0` (kernel-mode
+queue). That is **not** a reason to require root for users. See NEVER_AGAIN
+privilege table + construction map glossary.
+
 ## Decision tree
 
 ```text

@@ -1995,11 +1995,7 @@ impl DirectSubmission for RealDirectSubmission {
             };
             // SAFETY: param_val points at param_buf for the full ioctl (XRT parity).
             let ret = unsafe {
-                ioctl::ioctl(
-                    self.fd,
-                    ioctl::DRM_IOCTL_AMDXDNA_CONFIG_HWCTX,
-                    &raw mut req,
-                )
+                ioctl::ioctl(self.fd, ioctl::DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &raw mut req)
             };
             // Keep buffer live across ioctl evaluation.
             drop(param_buf);
@@ -2994,12 +2990,12 @@ pub fn pack_hwctx_param_config_cu(entries: &[(u32, u8)]) -> Result<Vec<u8>, Dire
             "pack_hwctx_param_config_cu refuses empty CU list".into(),
         ));
     }
-    if entries.len() > u16::MAX as usize {
-        return Err(DirectError::InvalidArgument(format!(
+    let n = u16::try_from(entries.len()).map_err(|_| {
+        DirectError::InvalidArgument(format!(
             "pack_hwctx_param_config_cu: {} CUs exceeds u16 num_cus",
             entries.len()
-        )));
-    }
+        ))
+    })?;
     let total = AMDXDNA_HWCTX_PARAM_CONFIG_CU_HEADER_SIZE
         .checked_add(entries.len().saturating_mul(AMDXDNA_CU_CONFIG_SIZE))
         .ok_or_else(|| {
@@ -3011,7 +3007,6 @@ pub fn pack_hwctx_param_config_cu(entries: &[(u32, u8)]) -> Result<Vec<u8>, Dire
         )));
     }
     let mut buf = vec![0u8; total];
-    let n = entries.len() as u16;
     buf[0..2].copy_from_slice(&n.to_le_bytes());
     // pad[3] of u16 already zero at bytes 2..8
     for (i, &(cu_bo, cu_func)) in entries.iter().enumerate() {
@@ -3078,6 +3073,14 @@ impl LabConfigCuAttach {
 pub struct LabPdiBoGuard<'a> {
     submission: &'a dyn DirectSubmission,
     handle: Option<u32>,
+}
+
+impl std::fmt::Debug for LabPdiBoGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LabPdiBoGuard")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> LabPdiBoGuard<'a> {
@@ -4560,7 +4563,7 @@ pub fn timed_matmul_direct(
         if let Ok(tok) = diag_config_cu.try_borrow() {
             if !tok.is_empty() && !r.detail.contains("config_cu=") {
                 if r.detail.is_empty() {
-                    r.detail = tok.clone();
+                    r.detail.clone_from(&tok);
                 } else {
                     r.detail = format!("{tok}; {}", r.detail);
                 }
@@ -6563,6 +6566,138 @@ mod tests {
     fn buffer_types_have_correct_values() {
         assert_eq!(BufferType::Shmem as u32, 1);
         assert_eq!(BufferType::Cmd as u32, 4);
+    }
+
+    #[test]
+    fn config_cu_uapi_sizes_match_public_header() {
+        assert_eq!(
+            core::mem::size_of::<amdxdna_cu_config>(),
+            AMDXDNA_CU_CONFIG_SIZE
+        );
+        assert_eq!(AMDXDNA_CU_CONFIG_SIZE, 8);
+        assert_eq!(AMDXDNA_HWCTX_PARAM_CONFIG_CU_HEADER_SIZE, 8);
+        assert_eq!(
+            core::mem::size_of::<amdxdna_drm_config_hwctx>(),
+            AMDXDNA_DRM_CONFIG_HWCTX_SIZE
+        );
+        assert_eq!(AMDXDNA_DRM_CONFIG_HWCTX_SIZE, 24);
+        assert_eq!(DRM_AMDXDNA_HWCTX_CONFIG_CU, 0);
+        assert_eq!(AMDXDNA_CONFIG_HWCTX_PARAM_VAL_MAX, 4096);
+    }
+
+    #[test]
+    fn pack_amdxdna_cu_config_layout() {
+        let b = pack_amdxdna_cu_config(0x1234_5678, 7);
+        assert_eq!(&b[0..4], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(b[4], 7);
+        assert_eq!(&b[5..8], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn pack_hwctx_param_config_cu_one_and_two() {
+        let one = pack_hwctx_param_config_cu(&[(42, 0)]).expect("one cu");
+        assert_eq!(one.len(), 8 + 8);
+        assert_eq!(u16::from_le_bytes([one[0], one[1]]), 1);
+        assert_eq!(&one[2..8], &[0; 6]);
+        assert_eq!(&one[8..12], &42u32.to_le_bytes());
+        assert_eq!(one[12], 0);
+
+        let two = pack_hwctx_param_config_cu(&[(1, 0), (2, 3)]).expect("two");
+        assert_eq!(two.len(), 8 + 16);
+        assert_eq!(u16::from_le_bytes([two[0], two[1]]), 2);
+        assert_eq!(two[8 + 8 + 4], 3); // second cu_func
+    }
+
+    #[test]
+    fn pack_hwctx_param_config_cu_refuses_empty() {
+        let e = pack_hwctx_param_config_cu(&[]).unwrap_err();
+        assert!(e.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn stub_config_hwctx_cu_accepts_packed_list() {
+        let stub = StubDirectSubmission::new(-1);
+        stub.config_hwctx_cu(0, 1, &[(99, 0)]).expect("stub config");
+        let empty = stub.config_hwctx_cu(0, 1, &[]);
+        assert!(empty.is_err());
+    }
+
+    #[test]
+    fn lab_config_cu_attach_detail_token_honesty() {
+        let a = LabConfigCuAttach {
+            pdi_bo: 7,
+            pdi_bytes: 283_840,
+            cu_func: 0,
+        };
+        let t = a.detail_token();
+        assert!(t.contains("config_cu=1"));
+        assert!(t.contains("pdi_bytes=283840"));
+        assert!(t.contains("invent_pass=0"));
+        assert!(t.contains("not_ran_on_npu=1"));
+    }
+
+    /// Serialize tests that mutate `XDNA2_LAB_PDI_BLOB` / `XDNA2_LAB_CU_FUNC`.
+    fn lab_pdi_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_lab_attach_config_cu_unset_is_none() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_PDI_BLOB);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::remove_var(ENV_LAB_PDI_BLOB);
+        }
+        let stub = StubDirectSubmission::new(-1);
+        let r = try_lab_attach_config_cu_from_env(&stub, 0, 1).expect("ok");
+        assert!(r.is_none());
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_PDI_BLOB, v),
+                None => std::env::remove_var(ENV_LAB_PDI_BLOB),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_lab_attach_config_cu_stub_with_temp_blob() {
+        let _guard = lab_pdi_env_test_lock();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("dragon_npu_pdi_test_{}.bin", std::process::id()));
+        std::fs::write(&path, [0xAAu8; 64]).expect("write temp pdi");
+        let prev = std::env::var_os(ENV_LAB_PDI_BLOB);
+        let prev_f = std::env::var_os(ENV_LAB_CU_FUNC);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::set_var(ENV_LAB_PDI_BLOB, &path);
+            std::env::set_var(ENV_LAB_CU_FUNC, "0");
+        }
+        let stub = StubDirectSubmission::new(-1);
+        let r = try_lab_attach_config_cu_from_env(&stub, 0, 1)
+            .expect("attach")
+            .expect("some");
+        assert_eq!(r.pdi_bytes, 64);
+        assert_eq!(r.cu_func, 0);
+        let _ = stub.destroy_buffer(0, r.pdi_bo);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_PDI_BLOB, v),
+                None => std::env::remove_var(ENV_LAB_PDI_BLOB),
+            }
+            match prev_f {
+                Some(v) => std::env::set_var(ENV_LAB_CU_FUNC, v),
+                None => std::env::remove_var(ENV_LAB_CU_FUNC),
+            }
+        }
     }
 
     #[test]

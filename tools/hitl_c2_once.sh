@@ -2,13 +2,15 @@
 # Operator C2 one-shot helper — prep + exact sandwich + optional apply.
 #
 # IMPL de4d9fa4: C2 live blocked on operator sudo when L3 closed.
-# Unlock SSoT: C_UNLOCK=… from RESIDUAL.md (soft NOTE only — never hard-blocks
-# prep/print/apply). IMPL b17b0119: C_UNLOCK=b17b0119 one-shot **CONSUMED**
-# (operator C2 2026-07-18). Soft NOTE must say CONSUMED when RESIDUAL marks it —
-# not active open season. When CONSUMED, printed sandwich L3/apply lines are
-# comment-only HISTORICAL record (non-executable); further C needs a **new**
-# agent unlock + offline delta. Never invent a stamp. CONSUMED never hard-blocks
-# --apply-if-l3-open (standing soft-NOTE policy; operator still owns L3).
+# Unlock SSoT: first C_UNLOCK=… line in RESIDUAL.md (soft NOTE only — never
+# hard-blocks prep/print/apply). Active stamp is whatever RESIDUAL first-match
+# presents without CONSUMED on that line (P4: C_UNLOCK=3a70fabf one-shot for
+# CONFIG_CU sandwich). When the first match is marked CONSUMED (or stamp appears
+# CONSUMED elsewhere), printed sandwich L3/apply lines are comment-only
+# HISTORICAL (non-executable); further C needs a **new** agent unlock + offline
+# delta. Historical b17b0119 (operator C2 2026-07-18) remains CONSUMED mid-file.
+# Never invent a stamp. CONSUMED never hard-blocks --apply-if-l3-open (standing
+# soft-NOTE policy; operator still owns L3).
 #
 # What this does (default = safe offline prep, NO L3 open, NO EXEC):
 #   1) Soft NOTE if RESIDUAL has C_UNLOCK= (active vs CONSUMED)
@@ -42,12 +44,13 @@
 #   # same refuse (exit 1) when L3 closed
 #
 # After operator sandwich: restore L3, then:
-#   bash tools/c3_post_c2_classify.sh          # soft; C3_SKIP if no new evidence
+#   bash tools/p5_post_c2_interpret.sh         # P5: classify+C3+C4 one-shot (≠ Pass)
+#   # or: bash tools/c3_post_c2_classify.sh    # soft; C3_SKIP if no new evidence
 #   # bash tools/c3_post_c2_classify.sh --require-new  # hard research (exit 2 if no new)
-#   bash tools/c4_pass_check.sh                # soft; C4_SKIP without PassCandidate
-#   # bash tools/c4_pass_check.sh --require-pass   # exit 2 if not offline PassCandidate
+#   # bash tools/c4_pass_check.sh              # soft; C4_SKIP without PassCandidate
 #   bash tools/run_offline_gates.sh
 #   # paste last_apply / journal for agent C3 / offline PassCandidate audit (≠ product Pass)
+#   # Mark C_UNLOCK=3a70fabf CONSUMED only if sandwich actually ran (new last_apply)
 #
 # Exit:
 #   0  prep/print ok (or rare Pass path via hitl_c when L3 open)
@@ -208,6 +211,8 @@ set -gx PATH /usr/bin \$HOME/.local/bin \$PATH
 EOF
   else
     echo "======== OPERATOR C2 SANDWICH (you run; agent does not) ========"
+    echo "NOTE: P4 CONFIG_CU path — run a-prep + export PDI env before L3 (comments below)."
+    echo "NOTE: CONFIG_CU attach alone ≠ Pass ≠ ran_on_npu (wrong overlay may still 0x3000003)."
     echo ""
     echo "--- bash ---"
     cat <<EOF
@@ -215,6 +220,12 @@ cd ${ROOT}
 export PATH="/usr/bin:\${HOME}/.local/bin:\${PATH}"
 # optional: export XDNA2_LAB_BO_DIAG=1
 # never leave sticky: unset XDNA2_ALLOW_EXEC_CMD
+
+# CONFIG_CU pre-step (P4 unlock intent; default off until exported):
+# bash tools/operator_app_load_kit.sh a-prep
+# export XDNA2_LAB_PDI_BLOB=/path/from/a-prep   # host path printed by a-prep; do not invent
+# export XDNA2_LAB_CU_FUNC=0   # optional; default 0
+# honesty: attach alone ≠ Pass ≠ ran_on_npu
 
 # ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
 sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
@@ -230,6 +241,12 @@ set -gx PATH /usr/bin \$HOME/.local/bin \$PATH
 # optional: set -gx XDNA2_LAB_BO_DIAG 1
 # never leave sticky: set -e XDNA2_ALLOW_EXEC_CMD
 
+# CONFIG_CU pre-step (P4 unlock intent; default off until exported):
+# bash tools/operator_app_load_kit.sh a-prep
+# set -gx XDNA2_LAB_PDI_BLOB /path/from/a-prep   # host path printed by a-prep; do not invent
+# set -gx XDNA2_LAB_CU_FUNC 0   # optional; default 0
+# honesty: attach alone ≠ Pass ≠ ran_on_npu
+
 # ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
 sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
@@ -243,6 +260,9 @@ EOF
   echo ""
   echo "======== POST-C2 (after sandwich; no L3 needed) ========"
   cat <<'EOF'
+# P5 one-shot interpret (classify + C3 + C4 + P6; ≠ Pass ≠ auto-CONSUME unlock):
+bash tools/p5_post_c2_interpret.sh
+# or step-by-step:
 # C3 pipeline (soft classify + new-evidence detect; ≠ C-ready / ≠ Pass):
 bash tools/c3_post_c2_classify.sh
 # hard research if you expect a fresh C2 shot:
@@ -253,6 +273,10 @@ bash tools/c3_post_c2_classify.sh
 # C4 offline PassCandidate audit (≠ invent product Pass; always not_c_ready=1):
 bash tools/c4_pass_check.sh
 # bash tools/c4_pass_check.sh --require-pass   # exit 2 if not PassCandidate
+
+# P6 true product-Pass criteria (offline readiness; still ≠ product Pass):
+bash tools/p6_true_pass_check.sh
+# bash tools/p6_true_pass_check.sh --require-pass  # exit 2 if not offline candidate
 
 # Offline gates (≠ C-ready):
 bash tools/run_offline_gates.sh
@@ -266,6 +290,7 @@ bash tools/run_offline_gates.sh
 #   - cat /sys/module/amdxdna/parameters/exec_cmd_allow   # prove restored 0/N
 # Honesty: C3 without new last_apply → C3_SKIP ≠ silicon progress
 #          C4_SKIP / C4_PASS_CANDIDATE offline ≠ invent product Pass
+#          P6_SKIP / P6_NOT_PASS / P6_OFFLINE_CANDIDATE ≠ product Pass
 EOF
   echo "==============================================================="
 }

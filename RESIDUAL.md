@@ -16,16 +16,23 @@
 | | |
 |--|--|
 | **What is broken** | Firmware still rejects the instruction load (`0x3000003` APP_LOAD_PDI_FAIL) after userspace ELF+rela looks OK. |
-| **What is missing** | A **real** capture from a working public stack under `testdata/xdna2_cmd/external_known_good/` (plus honest PROVENANCE). Right now that dir has PROVENANCE only — **no** `.bin` payload. |
-| **What is not missing** | Offline research helpers already exist (extract dry-run, capture-dir checks, soft compare). Running them again without new bytes does **not** advance silicon. |
-| **Unlock** | `C_UNLOCK=b17b0119` was used once and is **CONSUMED**. Do not reopen execute-allow under it. |
-| **Pass?** | **No.** Not product Pass. Not `ran_on_npu`. |
-| **Who acts next** | **Human:** place real capture bytes + PROVENANCE in the external known-good dir (see extract checklist). **Agent:** idle on this residual until that lands **or** the user asks for a named offline code change. Do **not** re-run empty `/implement`. |
+| **What changed offline** | **P6 true-Pass criteria ready offline** (`4520851d`): SSoT checklist + `bash tools/p6_true_pass_check.sh` (cites C4; locked fixture → `P6_NOT_PASS` / `P6_SKIP`; never invents product Pass). P5 interpret still available (`68eeaaf6`: classify + C3 + C4 + P6). Lab still **optionally** issues `CONFIG_HWCTX(CONFIG_CU)` when `XDNA2_LAB_PDI_BLOB` is set (default off). **Not** proven to fix load; **not** a silicon Pass claim. |
+| **What is still missing for Pass** | Live firmware accept + non-zero OFM allclose via product `decide_ran_on_npu`. External working-stack ctrltext under `testdata/xdna2_cmd/external_known_good/` still **absent**. Operator has **not** yet run the CONFIG_CU sandwich. Offline criteria codified ≠ Pass. |
+| **Operator tools** | Kit: `bash tools/operator_app_load_kit.sh` (A prep + B capture). After sandwich: `bash tools/p5_post_c2_interpret.sh` then `bash tools/p6_true_pass_check.sh`. Do not re-spin empty implement. |
+| **Unlock** | **Active one-shot** `C_UNLOCK=3a70fabf` for **one** CONFIG_CU + `XDNA2_LAB_PDI_BLOB` L3 sandwich (P4 agent unlock). Unlock ≠ Pass ≠ permanent open ≠ `ran_on_npu`. Prior unlock `b17b0119` already used (historical — do not reopen under it). |
+| **Pass?** | **No.** Not product Pass. Not `ran_on_npu`. CONFIG_CU attach alone ≠ Pass. Offline C4/P6 ≠ invent Pass. |
+| **Who acts next** | **Human (live CONFIG_CU, unlocked once):** `bash tools/operator_app_load_kit.sh a-prep` → export `XDNA2_LAB_PDI_BLOB` (optional `XDNA2_LAB_CU_FUNC=0`) → one L3 sandwich via `bash tools/hitl_c2_once.sh` / recipe → **restore L3** → `bash tools/p5_post_c2_interpret.sh` → `bash tools/p6_true_pass_check.sh` → share last_apply + journal. Mark unlock used only after real sandwich. **Human (capture, optional):** when a public stack works, `b-steps` → `b-install` + PROVENANCE → `b-compare` under `testdata/xdna2_cmd/external_known_good/`. **Agent:** offline interpret only until new evidence; **no** live apply; **no** invent Pass; **no** reopen under already-used `b17b0119`. |
+| **Sudo?** | **Product users: no** (admin installs driver/udev once). **Lab only:** temporary root to flip hardened `exec_cmd_allow` then restore. KMQ ≠ sudo — see `docs/XDNA2_NEVER_AGAIN.md` § Product vs lab privileges. |
 | **Local refuse** | `gt_capture/instr_post_patch.bin` and VE2 `validate.xclbin` are **not** accepted as the known-good AIE2 capture. |
 
-**LIVE bookkeeping stamp:** `588c1c72` — named offline code (extract + capture-dir
-status helpers). **Not** a live unlock. **Not** Pass. Capture **bytes still absent**.
-Last empty reconfirm stamp (historical, do not repeat): `fcec5772`.
+**LIVE bookkeeping:** P4 agent unlock **`C_UNLOCK=3a70fabf`** (one-shot) for a
+CONFIG_CU + PDI-blob L3 sandwich — **still active** (operator sandwich not run).
+P6 true-Pass criteria offline ready (`4520851d`); P5 interpret path landed
+(`68eeaaf6`). Named offline path already landed (optional `XDNA2_LAB_PDI_BLOB` →
+CONFIG_HWCTX(CONFIG_CU); kit `a-prep` / path B capture). Unlock **≠** Pass **≠**
+`ran_on_npu`. Capture **bytes still absent**. Empty reconfirm stamps remain
+**frozen**. Prior `b17b0119` already used (history below). Formal plan: residual
+close + product no-sudo.
 
 **Prior research stamps (index only):** `2b01425e` (capture-dir + feed + dry-run
 compose); `d2e287ab` (lab export fingerprint feed); `6033158a` (ctrltext compare
@@ -37,21 +44,27 @@ Research offline only. Loading a research external file ≠ product known-good.
 Section names / sha match / helper “complete” alone **never** close the firmware
 residual. VE2 xclbin ≠ AIE2 known-good.
 
-### LIVE — research helpers for capture compare (`588c1c72`)
+### Prior LIVE — research helpers for capture compare (`588c1c72`)
+
+> **Historical framing:** Unlock state **superseded** by top plain status /
+> active **`C_UNLOCK=3a70fabf`** (P4). This stamp did **not** mint unlock.
+> “No second unlock” below was true **at `588c1c72` only** — do not read as
+> current product unlock policy.
 
 | Check | Result | 2nd C / Pass? |
 |-------|--------|---------------|
 | **Policy** | Empty reconfirm stamps **frozen**. Empty-folder implement **frozen**. `588c1c72` = named offline helpers only (bytes still absent). | **No** |
 | **Silicon** | Unchanged: userspace ELF+rela OK; firmware **APP_LOAD_PDI_FAIL** `0x3000003`. | **No** |
-| **Unlock** | `C_UNLOCK=b17b0119` **CONSUMED**. Do not open execute-allow under it. This stamp did **not** mint unlock. | **No** |
+| **Unlock (at stamp)** | `C_UNLOCK=b17b0119` **CONSUMED**. This stamp did **not** mint unlock. Current active unlock = top Unlock row (P4 one-shot). | **No** (then) |
 | **Capture dir** | No working-stack known-good `.bin` offline under `testdata/xdna2_cmd/external_known_good/`. Soft/helpers report blocked-on-external-bytes (section names without bytes still blocked). Local post_patch refused. VE2 xclbin refused (`platform_not_aie2`). | **No** |
 | **Code surface** | `AppLoadExtractBagScorecardPipeline` / `research_app_load_extract_bag_scorecard_pipeline` (+ variants) — composes extract dry-run + capture-dir check + soft status. Alone does **not** close residual. Soft always: invent Pass off, not C-ready, not `ran_on_npu`, not product known-good. | **No** (research) |
 | **Docs** | CONSTRUCTION_MAP; PROVENANCE template in capture dir; this file + PLAN + AGENTS. | **No** |
-| **Next work** | **Human** places real bytes + PROVENANCE → then soft compare. Offline unit tests ≠ Pass ≠ unlock. Agent: **no empty implement loop**. | **No** until real bytes |
+| **Next work (then)** | **Human** places real bytes + PROVENANCE → then soft compare. Offline unit tests ≠ Pass ≠ unlock. Agent: **no empty implement loop**. | **No** until real bytes |
 
-**Conclusion:** Offline helpers landed. Capture **bytes** still **absent**. Residual
-still firmware load reject. **No** Pass. **No** second unlock. Do not re-spin
-empty implement.
+**Conclusion (historical `588c1c72`):** Offline helpers landed. Capture **bytes**
+still **absent**. Residual still firmware load reject. **No** Pass. At this stamp
+there was **no** second unlock; **later** P4 issued active `C_UNLOCK=3a70fabf`
+(see top plain status). Do not re-spin empty implement.
 
 ### Prior — bag + feed + dry-run composition scorecard (`2b01425e`)
 
@@ -151,16 +164,17 @@ PDI → CONFIG_CU → aiebu ELF → peel/patch ctrltext → START_NPU. Our lab:
 CREATE_HWCTX only → aiebu ELF → peel/patch → START_NPU (no PDI). Userspace
 ELF+rela still OK; residual still FW `0x3000003`. Map + TDD **≠** Pass / **≠** unlock.
 
-**Highest-value next:** Follow operator extract checklist → place working-stack
-ctrltext under `testdata/xdna2_cmd/external_known_good/` + fill PROVENANCE
-(research-ready) → soft `XDNA2_LAB_EXTERNAL_CTRLTEXT` +
-`compare_external_ctrltext_to_lab_export` / dry-run / composition scorecard /
-extract pipeline → named payload/path delta if actionable → only then new
-host-minted `C_UNLOCK`.
-**Not** gate-only stamp. **Not** status-name Track P. Match alone ≠ residual closed.
-Bag-drop complete + e2e fixture research alone ≠ residual closed (stamp `8e898123`).
-Progress scorecard alone ≠ residual closed (stamp `9cdfe8d0`).
-Extract pipeline alone ≠ residual closed (stamp `588c1c72`).
+**Highest-value next (LIVE — mirrors single-table SSoT below; P5 `68eeaaf6`):**
+(1) **Operator:** one CONFIG_CU sandwich under **active** unlock in top Unlock
+row → restore L3 → `bash tools/p5_post_c2_interpret.sh` → share last_apply.
+Unlock ≠ Pass ≠ `ran_on_npu`. Mark unlock used only after real sandwich (not
+from locked-fixture C3_SKIP). (2) **Optional:** place working-stack ctrltext
+under `testdata/xdna2_cmd/external_known_good/` + PROVENANCE → soft compare.
+(3) **Agent:** offline interpret only until new evidence. Canonical Priority
+table: “Highest-value next (single table — single source of truth)” mid-file.
+**Not** gate-only stamp. **Not** “only then new C_UNLOCK” while top Unlock is
+still active. Match / bag-drop / extract / P5 alone ≠ residual closed.
+
 
 ### Prior — extract recipe + PROVENANCE field checks + CU/PDI necessity (`f06d5b38`)
 
@@ -1355,45 +1369,57 @@ Superseded for LIVE by `695e5ad0` export/compare. Residual still FW `0x3000003`.
 | last_apply | **2026-07-18** live C2 — `ert_cmd_error` `ran_on_npu=false` aiebu=1 rela=12 layout=xrt3 |
 | C3 pipeline | **`C3_SKIP`** same residual body FP as locked baseline |
 | C4 pipeline | **`C4_SKIP`** no Pass |
-| HITL C | One-shot **CONSUMED**; further C needs **new unlock** |
-| C2 live | **Done** — lab rc=4; L3 restored; residual APP_LOAD |
-| Pass? | **No** — need ERT Completed + non-zero OFM allclose + `ran_on_npu=true` |
+| P6 pipeline | **Criteria ready offline** (`4520851d`); locked fixture → **`P6_NOT_PASS` / `P6_SKIP`** (≠ product Pass) |
+| HITL C | **Active** one-shot **`C_UNLOCK=3a70fabf`** (CONFIG_CU + PDI); unlock ≠ Pass |
+| HITL C prior | Prior `C_UNLOCK=b17b0119` **CONSUMED** (historical only; do not reopen) |
+| C2 live (historical) | **Done** under `b17b0119` — lab rc=4; L3 restored; residual APP_LOAD |
+| Pass? | **No** — need live ERT Completed + non-zero OFM allclose + `ran_on_npu=true` (product decide) |
 | Tracks A–O | **Closed** (`a_n_closed_no_new`); no new external public known-good bytes |
 
 ### Highest-value next (single table — single source of truth)
 
 | Priority | Action | Who |
 |----------|--------|-----|
-| **1** | Follow operator extract checklist; obtain known-good **external** ctrltext and/or CU PDI bytes offline; place under `testdata/xdna2_cmd/external_known_good/` + research-ready PROVENANCE; confirm bag-drop complete; feed via `XDNA2_LAB_EXTERNAL_CTRLTEXT` / `load_external_ctrltext_for_compare` → `compare_external_ctrltext_to_lab_export` / dry-run with lab export auto-feed / bag+feed+dry-run scorecard / extract→bag→scorecard pipeline (match ≠ residual closed; pipeline alone ≠ close; scorecard alone ≠ close; dry-run alone ≠ close; feed alone ≠ close; extract alone ≠ close; bag absent or markers-only → `blocked_on_external_bytes=1`) | agent / operator offline |
-| **2** | Maintain `bash tools/run_offline_gates.sh` green; keep L3=`N`; ALLOW unset; **no** empty gate-only mill stamps | agent |
-| **3** | Public APP_LOAD depth **only** with **new** external public evidence. Else do **not** invent Track P+ | agent |
-| **4** | **Another live C only after new agent unlock** + offline delta (one-shot `b17b0119` **CONSUMED** 2026-07-18; `588c1c72` / `2b01425e` / `d2e287ab` / `6033158a` / `9cdfe8d0` / `8e898123` / `2c4b96bf` / `a5787723` / `7a5ab864` / `ac20bc3f` / `f06d5b38` / `fec9c58b` / `695e5ad0` / `045739e1` / A–O + gate-only `fcec5772` **did not** issue a second unlock) | agent then operator |
-| **5** | Optional capture-instr logs only (true post-patch public path **closed**; not P0) | operator optional |
-| **ban** | Env C spam; invent vendor / private PDI decode; L3 from agent; claim Pass; second C without new unlock; re-open INSTR_BO as P0; invent Track P+; prop_count=15 invent; treat pure-direct post_patch as known-good; treat VE2 xclbin as AIE2 known-good; invent partition_id from journal; treat section-offset map / body bounds / bag-drop complete / e2e fixture / progress scorecard / compare dry-run / lab export feed / bag+feed+dry-run scorecard / extract→bag→scorecard pipeline as residual closed | all |
+| **1** | **One live CONFIG_CU sandwich under active `C_UNLOCK=3a70fabf`:** `bash tools/operator_app_load_kit.sh a-prep` → export `XDNA2_LAB_PDI_BLOB` (optional `XDNA2_LAB_CU_FUNC=0`) → L3 sandwich via `bash tools/hitl_c2_once.sh` / recipe → **restore L3** → `bash tools/p5_post_c2_interpret.sh` → `bash tools/p6_true_pass_check.sh` → share last_apply + journal. Unlock ≠ Pass ≠ `ran_on_npu`. CONFIG_CU attach alone ≠ Pass. Mark unlock used only after real sandwich (not from locked-fixture C3_SKIP / P6_SKIP). | **operator** (agent does not open L3) |
+| **2** | Offline: after any new last_apply / capture bytes, interpret with P5 + P6 (`p5_post_c2_interpret` / classify + C3 + C4 + `p6_true_pass_check`). True product Pass only on live decide (ERT Completed + OFM allclose). If still `0x3000003` with `config_cu=1` → wrong PDI / multi-CU / ctrltext residual (named next delta only if justified). | agent offline |
+| **3** | Optional / parallel: obtain known-good **external** ctrltext under `testdata/xdna2_cmd/external_known_good/` + PROVENANCE; soft compare / extract checklist (match ≠ residual closed; capture dir empty → blocked-on-external-bytes) | agent / operator offline |
+| **4** | Maintain `bash tools/run_offline_gates.sh` green; keep L3=`N` when not in sandwich; ALLOW unset; **no** empty gate-only mill stamps | agent |
+| **5** | Public APP_LOAD depth **only** with **new** external public evidence. Else do **not** invent Track P+ | agent |
+| **ban** | Env C spam; invent vendor / private PDI decode; L3 from agent; claim Pass; reopen under already-used `b17b0119`; further live C after `3a70fabf` is used without a **new** unlock; re-open INSTR_BO as P0; invent Track P+; prop_count=15 invent; treat pure-direct post_patch as known-good; treat VE2 xclbin as AIE2 known-good; invent partition_id from journal; treat section-offset map / body bounds / bag-drop complete / e2e fixture / progress scorecard / compare dry-run / lab export feed / bag+feed+dry-run scorecard / extract→bag→scorecard pipeline / P5 interpret alone as residual closed; auto-mark `3a70fabf` used without sandwich evidence | all |
 
-**C policy (honesty):** `C_UNLOCK=b17b0119` is **CONSUMED** (operator C2 2026-07-18). Further C requires a **new agent unlock** + offline delta. Evidence never auto-unlocks. Unpatched CLASS A, registry BO, parity green, `CONTRACT_OK`, soft residual_class / CLASSIFY_SOFT_OK / checklist, and `OFFLINE_GATES_OK` **never** unlock C and **never** equal Pass. Under CONSUMED: record-only sandwich; **no** must-open-L3; hitl_c L3-closed refuse stays offline-only.
+**C policy (honesty):** **Active** one-shot **`C_UNLOCK=3a70fabf`** for **one** CONFIG_CU + `XDNA2_LAB_PDI_BLOB` L3 sandwich (P4). Unlock ≠ Pass ≠ permanent open ≠ `ran_on_npu`. After this one-shot is used, further C needs a **new** agent unlock + offline delta. Evidence never auto-unlocks. Unpatched CLASS A, registry BO, parity green, `CONTRACT_OK`, soft residual_class / CLASSIFY_SOFT_OK / checklist, and `OFFLINE_GATES_OK` **never** unlock C and **never** equal Pass. Active sandwich = executable L3 lines from `hitl_c2_once --print-only`; agent still never opens L3.
+
+**C policy (historical prior):** `C_UNLOCK=b17b0119` **CONSUMED** (operator C2 2026-07-18) — do **not** reopen under that prior stamp.
 
 ```bash
-# HISTORICAL / CONSUMED record-only — do NOT open L3 under b17b0119
-# bash tools/hitl_c2_once.sh --print-only
-# Offline path under CONSUMED:
+# Active unlock — operator CONFIG_CU path (print only; agent does not apply):
+# bash tools/operator_app_load_kit.sh a-prep
+# export XDNA2_LAB_PDI_BLOB=…   # path from a-prep; optional XDNA2_LAB_CU_FUNC=0
+bash tools/hitl_c2_once.sh --print-only   # expect active C_UNLOCK=3a70fabf + executable L3 lines
+# Operator live (not agent): open L3 → hitl_c --assume-l3-already-open → restore L3
+# Offline anytime (≠ unlock / ≠ Pass) — P5 one-shot preferred after sandwich:
+bash tools/p5_post_c2_interpret.sh
+# P6 true-Pass criteria (offline readiness; locked fixture → P6_SKIP / P6_NOT_PASS):
+bash tools/p6_true_pass_check.sh
+# or step-by-step:
 bash tools/c3_post_c2_classify.sh
 bash tools/c4_pass_check.sh
 bash tools/run_offline_gates.sh
-# Future unlock only (not under CONSUMED):
-# sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-# bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
-# sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
+# HISTORICAL only — do NOT open L3 under b17b0119:
+# (record) C_UNLOCK=b17b0119 already used
 ```
 
 ### Self-runnable gates (agent offline now)
 
 **One-shot:** `bash tools/run_offline_gates.sh` → `OFFLINE_GATES_OK` (hard unit/style + soft classify/assets; **≠ C-ready**).
 
-| Script / test | Expect (offline / LIVE `588c1c72`) |
+| Script / test | Expect (offline / LIVE `4520851d` P6) |
 |---------------|----------------------------------------|
 | `bash tools/run_offline_gates.sh` | **0** `hard_fail=0` soft green `OFFLINE_GATES_OK` (≠ Pass ≠ unlock ≠ `ran_on_npu`) |
-| `cargo test --features amd-xdna2 --lib fingerprint_` | **0** export + compare + corpus locks |
+| `cargo test --features amd-xdna2 --lib true_pass` | **0** P6 criteria checklist + p6 note honesty (≠ product Pass) |
+| `cargo test --features amd-xdna2 --lib c4_pass` | **0** C4 evaluate_silicon_pass_evidence gates |
+| `cargo test --features amd-xdna2 --lib config_cu` | **0** parse CONFIG_CU signals + checklist + fingerprint bit (P5) |
+| `cargo test --features amd-xdna2 --lib fingerprint_` | **0** export + compare + corpus locks + C3 fixture FP |
 | `cargo test --features amd-xdna2 --lib external_known_good` | **0** confinement + load + refuse post_patch + PROVENANCE fields + bag-drop + extract checklist |
 | `cargo test --features amd-xdna2 --lib bag_drop` | **0** fail-closed bag-drop completeness |
 | `cargo test --features amd-xdna2 --lib app_load_e2e_fixture` | **0** soft e2e fixture path (residual_not_closed + honesty) |
@@ -1410,10 +1436,13 @@ bash tools/run_offline_gates.sh
 | `cargo test --features amd-xdna2 --lib xclbin_` | **0** extract dry-run + VE2 refuse + markers + section-offset map + body bounds |
 | `cargo test --features amd-xdna2 --lib journal_failed_cmd` | **0** pure failed_cmd / chain_status token parsers |
 | `cargo test --features amd-xdna2 --lib construction_path` | **0** path-gap locks |
-| `bash tools/classify_last_apply_residual.sh` | **0** soft; `app_load_pdi_fail_after_aiebu` + `not_c_ready=1 not_ran_on_npu=1 invent_pass=0` |
+| `bash tools/classify_last_apply_residual.sh` | **0** soft; `app_load_pdi_fail_after_aiebu` + `config_cu_present=0` + `not_c_ready=1 not_ran_on_npu=1 invent_pass=0` |
+| `bash tools/c3_post_c2_classify.sh` | **0** `C3_SKIP` baseline (locked fixture; config_cu bit 0) |
 | `bash tools/c4_pass_check.sh` | **0** `C4_SKIP` (`json_ran_on_npu_false`) |
-| `bash tools/hitl_c2_once.sh --print-only` | **0** CONSUMED note; HISTORICAL record-only sandwich |
-| `bash tools/hitl_c_pass_apply.sh --assume-l3-already-open` when L3=N | **exit 1** (`hitl_c_rc=1` / `exit=1`); offline-only under CONSUMED |
+| `bash tools/p6_true_pass_check.sh` | **0** `P6_NOT_PASS` / `P6_SKIP` on locked fixture; criteria tokens; invent_pass=0 |
+| `bash tools/p5_post_c2_interpret.sh` | **0** soft; `P5_INTERPRET_OK` / soft warn; locked fixture → C3_SKIP + C4_SKIP + P6_SKIP |
+| `bash tools/hitl_c2_once.sh --print-only` | **0**; NOTE `C_UNLOCK=3a70fabf one-shot (active)`; sandwich header **not** HISTORICAL; L3/apply lines **executable** (not only `# (record only)`). After this one-shot is used, Expect flips back to HISTORICAL (mark stamp used in Unlock row). |
+| `bash tools/hitl_c_pass_apply.sh --assume-l3-already-open` when L3=N | **exit 1** (`hitl_c_rc=1` / `exit=1`); fail-closed when L3 closed (agent does not open L3) |
 | `bash tools/smoke_tmpdir_root_clamp.sh` | **0** TMPDIR=/ fail-closed clamp |
 | L3 / ALLOW | `exec_cmd_allow=N`; `XDNA2_ALLOW_EXEC_CMD` unset |
 
@@ -1440,6 +1469,7 @@ bash tools/run_offline_gates.sh
 
 Tracks A–E, F–J, K, L, M, N, O conclusions — **historical**. O token `a_n_closed_no_new`. M `new_public_pdi_fields=0`. N `closed_no_new`. No new external public known-good bytes on disk yet. Then `695e5ad0` export/compare; `fec9c58b` load/confinement; `f06d5b38` recipe + PROVENANCE + CU/PDI necessity; `ac20bc3f` residual axis + xclbin extract; `7a5ab864` CU/PDI section identity + partition-id; `a5787723` section-offset map; `2c4b96bf` body bounds + journal tokens; `8e898123` soft e2e fixture + bag-drop; `9cdfe8d0` progress scorecard + extract checklist; `6033158a` external ctrltext compare dry-run + `blocked_on_external_bytes`; `d2e287ab` lab export fingerprint auto-feed into dry-run; `2b01425e` bag+feed+dry-run composition scorecard; LIVE named delta `588c1c72` (extract→bag→scorecard pipeline; markers without bytes still `blocked_on_external_bytes=1`). Empty gate-only mill still frozen. Do **not** invent Track P+ / PDI layout / INSTR_BO as P0.
 
-**Highest-value next (historical O/M/N; then `695e5ad0` / `fec9c58b` / `f06d5b38` / `ac20bc3f` / `7a5ab864` / `a5787723` / `2c4b96bf` / `8e898123` / `9cdfe8d0` / `6033158a` / `d2e287ab` / `2b01425e`; superseded for LIVE by `588c1c72`):** Prefer external known-good capture under `external_known_good/` + research-ready PROVENANCE + bag-drop complete + confined compare / composition scorecard / extract pipeline; not empty gate-only mill.
+**Highest-value next (historical O/M/N; then research stamps through `588c1c72`; superseded for LIVE by P4 unlock + P5 `68eeaaf6`):** Was capture-first “only then new C_UNLOCK”; **superseded** — top Unlock row is active one-shot; next = CONFIG_CU sandwich → `p5_post_c2_interpret` (see single-table SSoT). Optional external capture remains parallel, not a gate before the active unlock.
 
-*(Highest-value single source of truth = single Priority table under “Highest-value next (single table — single source of truth)” above — LIVE stamp `588c1c72`.)*
+*(Highest-value single source of truth = single Priority table under “Highest-value next (single table — single source of truth)” above — LIVE = top plain status + P5 `68eeaaf6`; not historical `588c1c72` alone.)*
+

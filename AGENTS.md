@@ -72,6 +72,82 @@
    without OFM allclose on real ioctl + ERT Completed.
 5. Prefer **aiebu ELF** EXEC; refuse silent raw `lab_instr.bin`.
 
+Latest Turn (IMPL `4520851d` — P6 true-Pass criteria offline readiness):
+- **Named offline delta:** SSoT `format_true_pass_criteria_checklist` /
+  `format_true_pass_p6_note` (reuse C4 `evaluate_silicon_pass_evidence`); helper
+  `tools/p6_true_pass_check.sh` + example; wire into p5 / hitl_c2 POST-C2 /
+  `run_offline_gates` bash -n + soft. Locked fixture → `P6_NOT_PASS` / `P6_SKIP`.
+  Offline PassCandidate still `product_pass=0 product_pass_requires_live_decide=1`.
+- **Unlock still active:** `C_UNLOCK=3a70fabf` (operator sandwich **not** run;
+  do **not** mark used). Prior `b17b0119` historical CONSUMED only.
+- **Honesty:** residual still FW `0x3000003`; **no** Pass; **no** `ran_on_npu`;
+  criteria ready offline ≠ silicon Pass; soft always
+  `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 product_pass_requires_live_decide=1`.
+- **Operator next:** a-prep → PDI env → L3 sandwich → restore L3 →
+  `bash tools/p5_post_c2_interpret.sh` → `bash tools/p6_true_pass_check.sh` →
+  share last_apply. Agent offline only.
+
+Latest Turn (IMPL `68eeaaf6` — P5 post-C2 offline interpret pipeline):
+- **Named offline delta:** parse CONFIG_CU signals from last_apply detail
+  (`config_cu` / `config_cu_failed` / `pdi_bytes` / `cu_func`); checklist tokens
+  `config_cu_present=` / `config_cu_attached_still_app_load=`; C3 fingerprint
+  bit so post-P4 sandwich is not false C3_SKIP; helper
+  `tools/p5_post_c2_interpret.sh` (classify + C3 + C4; never L3/ALLOW).
+- **Unlock still active:** `C_UNLOCK=3a70fabf` (operator sandwich **not** run;
+  do **not** mark used). Prior `b17b0119` historical CONSUMED only.
+- **Honesty:** residual still FW `0x3000003`; **no** Pass; **no** `ran_on_npu`;
+  CONFIG_CU attach alone ≠ Pass; locked fixture still C3_SKIP / C4_SKIP /
+  `config_cu_present=0`. Soft always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1`.
+- **Operator next:** a-prep → PDI env → L3 sandwich → restore L3 →
+  `bash tools/p5_post_c2_interpret.sh` → share last_apply. Agent offline only.
+  (P6 criteria: Latest Turn `4520851d` above.)
+
+Latest Turn (P4 agent unlock — `C_UNLOCK=3a70fabf` one-shot CONFIG_CU sandwich):
+- **Agent unlock only** (not live apply): host-minted **`C_UNLOCK=3a70fabf`**
+  for **one** L3 sandwich that uses optional `XDNA2_LAB_PDI_BLOB` →
+  CONFIG_HWCTX(CONFIG_CU). Unlock **≠** Pass **≠** `ran_on_npu` **≠** permanent
+  open season.
+- **SSoT:** `RESIDUAL.md` top Unlock row first `C_UNLOCK=` = `3a70fabf` (active;
+  line must not say CONSUMED). Prior `b17b0119` remains historical CONSUMED
+  mid-file / docs. Recipe + HITL_BC + CONSTRUCTION_MAP + `hitl_c2_once` header
+  aligned. Verify: `bash tools/hitl_c2_once.sh --print-only` → active stamp +
+  **executable** L3 lines (not all `# (record only)`).
+- **Operator next:** `bash tools/operator_app_load_kit.sh a-prep` → export
+  `XDNA2_LAB_PDI_BLOB` (optional `XDNA2_LAB_CU_FUNC=0`) → sandwich via
+  `hitl_c2_once` / `docs/HITL_C_APP_LOAD_RECIPE.md` → **restore L3** → share
+  last_apply. Agent does **not** open L3 / ALLOW / live apply.
+- **Still No:** product Pass; invent capture bytes; reopen under `b17b0119`;
+  empty reconfirm loops. Capture dir still may be empty offline.
+  (P5 interpret pipeline: Latest Turn `68eeaaf6` above.)
+
+Latest Turn (formal plan approved + P2 privilege/residual docs):
+- **Plan workflow:** explore → draft → approve → implement. Canonical plan:
+  session `plan.md` + workspace `.agents/plans/plan-app-load-residual-product.md`.
+  Phases P0–P6: residual close + product no-sudo; Colibri deferred follow-on.
+- **P2 landed (docs only):** product vs lab privilege tables in
+  `docs/XDNA2_NEVER_AGAIN.md` + `docs/XDNA2_PACKAGING.md`; README admin-once;
+  RESIDUAL sudo row; CONSTRUCTION_MAP KMQ/UMQ/`umq_bo` + privilege glossary.
+- **Not done (at that turn):** invent Pass; second unlock; live apply; empty
+  reconfirm. Capture bytes still absent; `C_UNLOCK=b17b0119` still **CONSUMED**.
+- **Next then:** human capture (P3) and/or new unlock CONFIG_CU shot (P4) —
+  **P4 unlock landed** as Latest Turn above.
+
+Latest Turn (named offline: CONFIG_CU + operator A/B tools — **gates green**):
+- **Path A:** pack `CONFIG_CU` uAPI; lab optional `XDNA2_LAB_PDI_BLOB` after
+  CREATE_HWCTX → opaque PDI BO + `CONFIG_HWCTX(CONFIG_CU)` (default off).
+  `tools/dump_xclbin_pdi.sh` dumps host AIE2P PDI (283840 B smoke) + prints env.
+- **Path B:** polished capture kit — `tools/operator_external_capture.sh`
+  (status/install/compare) + umbrella `tools/operator_app_load_kit.sh`.
+- **Gates:** `cargo test --lib config_cu` 6 ok; clippy `-D` amd-xdna2 lib;
+  fmt; bash -n tools; kit overview + dump smoke; env tests locked vs races.
+- Offline research matrix still `lab_has_cu_pdi_config=false` (do not invent
+  closed gap without live evidence). CONFIG_CU attach alone ≠ Pass.
+- Honesty: machinery ≠ Pass; wrong overlay may still `0x3000003`; capture dir
+  still empty. (Unlock status superseded by P4 Latest Turn: `C_UNLOCK=3a70fabf`.)
+- Empty implement / empty reconfirm still frozen (rules §6–9).
+- **Next (human, at that turn):** path B capture and/or live path A after unlock
+  — **P4 unlock landed** as Latest Turn above.
+
 Latest Turn (docs — plain language + no empty implement loops; rules §6–9):
 - Standing rules rewritten for **chat-first English**, real paths over nicknames,
   and a **hard stop** on empty `/implement` / reconfirm loops (rule 9).
