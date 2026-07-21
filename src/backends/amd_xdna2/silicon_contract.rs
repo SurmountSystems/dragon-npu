@@ -12,10 +12,11 @@
 //! Note: `0x106` in [`aie2_fw_status_name`] is a **MSG_OP** (map_host), not APP status.
 
 use super::direct::{
-    MAX_INSTRUCTION_BLOB_BYTES, TimedOpResult, build_ert_start_npu_cmd_bo,
+    DirectError, MAX_INSTRUCTION_BLOB_BYTES, TimedOpResult, build_ert_start_npu_cmd_bo,
     build_ert_start_npu_cmd_bo_with_kernel_args,
 };
 use super::lab_io::{LabKernelArgLayout, pack_start_npu_kernel_args_with_ctrl_layout};
+use super::mladf_pack::MAX_MLADF_LAB_FILE_BYTES;
 use super::txn::{
     InstructionBlobKind, LabRelaMode, classify_instruction_blob, format_dynsym_report,
     is_aiebu_elf_ctrltext, parse_elf32_dynsym, parse_elf32_rela_dyn,
@@ -520,27 +521,20 @@ impl JournalFwStatusPair {
 
 /// Parse journal (or multi-line) text for Failed-cmd + Status hex codes.
 ///
-/// **Never** invents codes: only literal `0x…` after known prefixes.
+/// **Never** invents codes: only literal `0x…` on lines that match the pure
+/// token helpers ([`parse_failed_cmd_status_token`] /
+/// [`parse_chain_status_token`]). First match wins per field.
 #[must_use]
 pub fn parse_journal_fw_status_pair(text: &str) -> JournalFwStatusPair {
     let mut out = JournalFwStatusPair::default();
     for line in text.lines() {
-        let l = line.trim();
-        let ll = l.to_ascii_lowercase();
-        if out.failed_cmd_status.is_none()
-            && (ll.contains("failed cmd") || ll.contains("failed_cmd"))
-        {
-            if let Some(c) = first_hex_status_token(l) {
+        if out.failed_cmd_status.is_none() {
+            if let Some(c) = parse_failed_cmd_status_token(line) {
                 out.failed_cmd_status = Some(c);
             }
         }
-        // Standalone Status 0x… (not the Failed cmd line's "status 0x")
-        if out.chain_status.is_none()
-            && ll.contains("status 0x")
-            && !ll.contains("failed cmd")
-            && !ll.contains("failed_cmd")
-        {
-            if let Some(c) = first_hex_status_token(l) {
+        if out.chain_status.is_none() {
+            if let Some(c) = parse_chain_status_token(line) {
                 out.chain_status = Some(c);
             }
         }
@@ -548,9 +542,56 @@ pub fn parse_journal_fw_status_pair(text: &str) -> JournalFwStatusPair {
     out
 }
 
-/// First `0x` / `0X` hex u32-ish token on a line (truncates to low 32 bits if longer).
+/// Pure single-line parser: Failed-cmd status hex when the line is a failed-cmd
+/// journal line.
+///
+/// Accepts `failed cmd` / `failed_cmd` (case-insensitive). Returns the first
+/// `0x…` token on that line only. **Never** invents codes from unrelated text.
+///
+/// Stamp `2c4b96bf` unit surface (with multi-line pair parse).
 #[must_use]
-fn first_hex_status_token(line: &str) -> Option<u32> {
+pub fn parse_failed_cmd_status_token(line: &str) -> Option<u32> {
+    let l = line.trim();
+    if l.is_empty() {
+        return None;
+    }
+    let ll = l.to_ascii_lowercase();
+    if !(ll.contains("failed cmd") || ll.contains("failed_cmd")) {
+        return None;
+    }
+    first_hex_status_token(l)
+}
+
+/// Pure single-line parser: chain/completion `Status 0x…` when the line is **not**
+/// a Failed-cmd line.
+///
+/// Requires a `status 0x` / `status 0X` substring and excludes failed-cmd lines so
+/// the primary load-reject code is not double-counted as chain status.
+///
+/// Stamp `2c4b96bf` unit surface (with multi-line pair parse).
+#[must_use]
+pub fn parse_chain_status_token(line: &str) -> Option<u32> {
+    let l = line.trim();
+    if l.is_empty() {
+        return None;
+    }
+    let ll = l.to_ascii_lowercase();
+    if ll.contains("failed cmd") || ll.contains("failed_cmd") {
+        return None;
+    }
+    if !ll.contains("status 0x") {
+        return None;
+    }
+    first_hex_status_token(l)
+}
+
+/// First `0x` / `0X` hex u32-ish token on a line (truncates to low 32 bits if longer).
+///
+/// Public pure helper for journal research; **never** invents a code without a
+/// literal hex token. Prefer [`parse_failed_cmd_status_token`] /
+/// [`parse_chain_status_token`] for typed line roles.
+#[must_use]
+pub fn first_hex_status_token(line: &str) -> Option<u32> {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i + 2 < bytes.len() {
@@ -1874,6 +1915,5396 @@ pub fn profile_instr_payload_after_rela_c2_locked(elf: &[u8]) -> InstrPdiLoadRes
 }
 
 // ---------------------------------------------------------------------------
+// Construction path research — lab (instr-only START_NPU) vs public (CU/PDI)
+// ---------------------------------------------------------------------------
+
+/// Offline research: lab construction path vs working public stack (no Pass).
+///
+/// From [`docs/CONSTRUCTION_MAP_APP_LOAD.md`](../../../docs/CONSTRUCTION_MAP_APP_LOAD.md):
+/// public KMQ path loads **CU/PDI via CONFIG_CU** then peels/patches aiebu
+/// ctrltext for START_NPU. Pure-direct lab only does instruction/ctrltext —
+/// **never** CONFIG_CU. That structural gap is locked here for unit tests;
+/// it is a research hypothesis for residual `0x3000003`, **not** proof and
+/// **not** C-ready / Pass / `ran_on_npu`.
+///
+/// Field bag is intentional research flags (not a product state machine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ConstructionPathResearch {
+    /// True when `elf` peels classic-walkable ctrltext **and** has rela evidence.
+    pub lab_has_instr_ctrltext: bool,
+    /// Always **false** for pure-direct lab today (we never CONFIG_CU / load PDI).
+    pub lab_has_cu_pdi_config: bool,
+    /// Research fact from open driver/shim: production KMQ path has a CU/PDI step.
+    pub public_stack_requires_cu_pdi_step: bool,
+    /// `public_stack_requires_cu_pdi_step && !lab_has_cu_pdi_config` (always true today).
+    pub construction_gap_cu_pdi: bool,
+    /// Peeled ctrltext length when aiebu ELF present (else `None`).
+    pub lab_ctrltext_len: Option<usize>,
+    /// `.rela.dyn` entry count when parseable (else `None`).
+    pub lab_rela_count: Option<usize>,
+    /// Stable research detail token (`elf_empty_skip`, `classic_ctrltext_ok`, …).
+    pub detail: String,
+}
+
+impl Default for ConstructionPathResearch {
+    fn default() -> Self {
+        // Honesty-safe defaults: gap open (public requires, lab has no CU/PDI).
+        Self {
+            lab_has_instr_ctrltext: false,
+            lab_has_cu_pdi_config: false,
+            public_stack_requires_cu_pdi_step: true,
+            construction_gap_cu_pdi: true,
+            lab_ctrltext_len: None,
+            lab_rela_count: None,
+            detail: "default_gap_open".into(),
+        }
+    }
+}
+
+impl ConstructionPathResearch {
+    /// Soft research note (always honesty trio; never invent Pass / C-ready).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "construction_path_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!(
+                "construction_gap_cu_pdi={}",
+                u8::from(self.construction_gap_cu_pdi)
+            ),
+            format!("lab_has_instr={}", u8::from(self.lab_has_instr_ctrltext)),
+            // Always 0 for pure-direct lab — do not invent CONFIG_CU.
+            format!(
+                "lab_has_cu_pdi_config={}",
+                u8::from(self.lab_has_cu_pdi_config)
+            ),
+            format!(
+                "public_stack_cu_pdi_step={}",
+                u8::from(self.public_stack_requires_cu_pdi_step)
+            ),
+        ];
+        if let Some(n) = self.lab_ctrltext_len {
+            parts.push(format!("lab_ctrltext_len={n}"));
+        }
+        if let Some(n) = self.lab_rela_count {
+            parts.push(format!("lab_rela_count={n}"));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Research pure-direct lab construction path vs public CU/PDI + CONFIG_CU stack.
+///
+/// - Empty `elf` → soft skip-ish: no lab instr, gap still **true** (public requires
+///   CU/PDI; lab never has it).
+/// - Valid aiebu ELF with peelable classic ctrltext + rela → `lab_has_instr_ctrltext`.
+/// - `lab_has_cu_pdi_config` is **always false** (do not invent CONFIG_CU).
+/// - Always soft; never Pass / C-ready / `ran_on_npu`.
+#[must_use]
+pub fn research_construction_path_lab_vs_public(elf: &[u8]) -> ConstructionPathResearch {
+    // Structural research facts from construction map / open driver+shim.
+    let public_requires = true;
+    let lab_has_cu = false;
+    let gap = public_requires && !lab_has_cu;
+
+    if elf.is_empty() {
+        return ConstructionPathResearch {
+            lab_has_instr_ctrltext: false,
+            lab_has_cu_pdi_config: lab_has_cu,
+            public_stack_requires_cu_pdi_step: public_requires,
+            construction_gap_cu_pdi: gap,
+            lab_ctrltext_len: None,
+            lab_rela_count: None,
+            detail: "elf_empty_skip".into(),
+        };
+    }
+
+    if !is_aiebu_elf_ctrltext(elf) {
+        // Non-aiebu / non-ELF: do not report `lab_rela_count=0` (that reads as
+        // "ELF with empty rela table"). Leave `None` until aiebu ctrltext path.
+        return ConstructionPathResearch {
+            lab_has_instr_ctrltext: false,
+            lab_has_cu_pdi_config: lab_has_cu,
+            public_stack_requires_cu_pdi_step: public_requires,
+            construction_gap_cu_pdi: gap,
+            lab_ctrltext_len: None,
+            lab_rela_count: None,
+            detail: "not_aiebu_elf_ctrltext".into(),
+        };
+    }
+
+    let rela_count = parse_elf32_rela_dyn(elf).ok().map(|r| r.len());
+    // Belt-and-suspenders: after `is_aiebu_elf_ctrltext`, peel should Ok-slice;
+    // keep branch if peel API later returns Err without panicking on OOB.
+    let Ok(peeled) = super::txn::instruction_payload_bytes(elf) else {
+        return ConstructionPathResearch {
+            lab_has_instr_ctrltext: false,
+            lab_has_cu_pdi_config: lab_has_cu,
+            public_stack_requires_cu_pdi_step: public_requires,
+            construction_gap_cu_pdi: gap,
+            lab_ctrltext_len: None,
+            lab_rela_count: rela_count,
+            detail: "ctrltext_peel_failed".into(),
+        };
+    };
+    let profile = profile_instr_payload_bytes(&peeled);
+    let has_rela = rela_count.is_some_and(|n| n > 0);
+    let lab_instr = profile.classic_walk_ok && has_rela;
+    let detail = if lab_instr {
+        "classic_ctrltext_ok".into()
+    } else if profile.classic_walk_ok {
+        "classic_walk_ok_no_rela".into()
+    } else {
+        "ctrltext_not_classic_walkable".into()
+    };
+    ConstructionPathResearch {
+        lab_has_instr_ctrltext: lab_instr,
+        lab_has_cu_pdi_config: lab_has_cu,
+        public_stack_requires_cu_pdi_step: public_requires,
+        construction_gap_cu_pdi: gap,
+        lab_ctrltext_len: Some(peeled.len()),
+        lab_rela_count: rela_count,
+        detail,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CU/PDI necessity residual matrix (ctrltext-only vs CONFIG_CU identity)
+// ---------------------------------------------------------------------------
+
+/// Soft research: why FW `APP_LOAD_PDI_FAIL` may need CU/PDI identity, not
+/// ctrltext alone. **Not** proof. **Not** Pass / C-ready / `ran_on_npu`.
+///
+/// Locks the residual matrix from construction map + locked journal class:
+/// - Pure-direct lab is **ctrltext-only** (never CONFIG_CU).
+/// - Production public stack has a CU/PDI step (construction gap open).
+/// - Public FW status **name** `APP_LOAD_PDI_FAIL` (`0x3000003`) implies a
+///   partition/PDI load step rejected something — status name only, not image
+///   decode.
+/// - External ctrltext **sha match** alone **never** closes the FW residual
+///   offline (match ≠ Pass; lab may still lack CU/PDI).
+///
+/// Field bag is intentional research flags (not a product state machine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct CuPdiNecessityResearch {
+    /// Pure-direct lab never issues CONFIG_CU / PDI BO (always true today).
+    pub lab_is_ctrltext_only: bool,
+    /// Open driver/shim fact: production KMQ path has CU/PDI + CONFIG_CU.
+    pub public_has_cu_pdi_step: bool,
+    /// Construction gap open (`public && !lab_has_cu`).
+    pub construction_gap_open: bool,
+    /// Caller/journal says residual class or code is APP_LOAD_PDI_FAIL.
+    pub fw_name_app_load_pdi_fail: bool,
+    /// Research compare reported external ctrltext sha match (optional input).
+    pub external_ctrltext_sha_match: bool,
+    /// Always **false**: sha match alone does not close FW residual / invent Pass.
+    pub ctrltext_match_alone_closes_fw_residual: bool,
+    /// Open **hypothesis** (gap + FW name): CU/PDI identity may still be required.
+    /// Not proven root cause; never unlocks C or claims Pass.
+    pub cu_pdi_identity_may_be_required: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for CuPdiNecessityResearch {
+    fn default() -> Self {
+        // Honesty-safe: gap open, match never closes residual, no invent Pass.
+        Self {
+            lab_is_ctrltext_only: true,
+            public_has_cu_pdi_step: true,
+            construction_gap_open: true,
+            fw_name_app_load_pdi_fail: false,
+            external_ctrltext_sha_match: false,
+            ctrltext_match_alone_closes_fw_residual: false,
+            cu_pdi_identity_may_be_required: false,
+            detail: "default_gap_open_no_fw_flag".into(),
+        }
+    }
+}
+
+impl CuPdiNecessityResearch {
+    /// Soft research note (always honesty trio; never invent Pass / C-ready).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "cu_pdi_necessity_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            format!(
+                "lab_is_ctrltext_only={}",
+                u8::from(self.lab_is_ctrltext_only)
+            ),
+            format!(
+                "public_has_cu_pdi_step={}",
+                u8::from(self.public_has_cu_pdi_step)
+            ),
+            format!(
+                "construction_gap_open={}",
+                u8::from(self.construction_gap_open)
+            ),
+            format!(
+                "fw_name_app_load_pdi_fail={}",
+                u8::from(self.fw_name_app_load_pdi_fail)
+            ),
+            format!(
+                "external_ctrltext_sha_match={}",
+                u8::from(self.external_ctrltext_sha_match)
+            ),
+            // Always 0 in soft notes — ignore field mutation (same honesty pattern
+            // as invent_pass=0 / not_c_ready=1). Constructors also lock the field.
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            format!(
+                "cu_pdi_identity_may_be_required={}",
+                u8::from(self.cu_pdi_identity_may_be_required)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Research CU/PDI necessity residual matrix from construction path + FW flag.
+///
+/// - `construction` from [`research_construction_path_lab_vs_public`].
+/// - `fw_app_load_residual`: residual class / journal is APP_LOAD_PDI_FAIL
+///   (caller-supplied; never invents journal codes).
+/// - `external_ctrltext_sha_match`: optional soft compare result (research only).
+/// - Always `ctrltext_match_alone_closes_fw_residual=false`.
+/// - `cu_pdi_identity_may_be_required` only when gap open **and** FW residual.
+/// - Soft only; never Pass / C-ready / second unlock.
+#[must_use]
+pub fn research_cu_pdi_necessity_for_app_load(
+    construction: &ConstructionPathResearch,
+    fw_app_load_residual: bool,
+    external_ctrltext_sha_match: bool,
+) -> CuPdiNecessityResearch {
+    let lab_ctrltext_only = !construction.lab_has_cu_pdi_config;
+    let public_step = construction.public_stack_requires_cu_pdi_step;
+    let gap = construction.construction_gap_cu_pdi;
+    // Open hypothesis only — not proof that missing CONFIG_CU causes 0x3000003.
+    let may_need = gap && fw_app_load_residual;
+    let detail = if external_ctrltext_sha_match && fw_app_load_residual {
+        "sha_match_fw_residual_still_open"
+    } else if fw_app_load_residual && gap {
+        "gap_open_fw_app_load"
+    } else if gap {
+        "gap_open_no_fw_flag"
+    } else {
+        "no_gap"
+    };
+    CuPdiNecessityResearch {
+        lab_is_ctrltext_only: lab_ctrltext_only,
+        public_has_cu_pdi_step: public_step,
+        construction_gap_open: gap,
+        fw_name_app_load_pdi_fail: fw_app_load_residual,
+        external_ctrltext_sha_match,
+        // Hard lock: research match never invents residual close / Pass.
+        ctrltext_match_alone_closes_fw_residual: false,
+        cu_pdi_identity_may_be_required: may_need,
+        detail: detail.into(),
+    }
+}
+
+/// Convenience: CU/PDI necessity for locked APP_LOAD residual + construction gap.
+///
+/// Uses empty-ELF construction path (gap still open) + `fw_app_load_residual=true`.
+/// Optional sha_match for honesty when research compare matches failing corpus.
+#[must_use]
+pub fn research_cu_pdi_necessity_c2_locked(
+    external_ctrltext_sha_match: bool,
+) -> CuPdiNecessityResearch {
+    let construction = research_construction_path_lab_vs_public(&[]);
+    research_cu_pdi_necessity_for_app_load(&construction, true, external_ctrltext_sha_match)
+}
+
+// ---------------------------------------------------------------------------
+// APP_LOAD residual axis matrix (partition vs CU/PDI vs ctrltext-only)
+// ---------------------------------------------------------------------------
+
+/// Soft residual **axis** matrix for FW `APP_LOAD_PDI_FAIL` (`0x3000003`).
+///
+/// Relates partition status-name surface, CU/PDI construction gap, and lab
+/// ctrltext-only path. **Not** proof of root cause. **Not** Pass / C-ready /
+/// `ran_on_npu`.
+///
+/// Locks the offline interpretation matrix (stamp `ac20bc3f`):
+/// - Public FW name maps via [`aie2_fw_status_name`] only (no PDI image decode).
+/// - Partition surface remains [`PUBLIC_PARTITION_SURFACE_TOKEN`] (`status_name_only`).
+/// - Lab is ctrltext-only; public stack has a CU/PDI step → construction gap open.
+/// - Ctrltext sha match alone **never** closes residual (hard lock).
+/// - Partition status name alone **never** proves CU/PDI root cause (hard lock).
+///
+/// Field bag is intentional research flags (not a product state machine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct AppLoadResidualAxisMatrix {
+    /// Residual class and/or journal maps to APP_LOAD_PDI_FAIL name surface.
+    pub axis_fw_status_name_app_load: bool,
+    /// Partition load surface depth is status_name_only (always true from builders).
+    pub axis_partition_surface_status_name_only: bool,
+    /// Pure-direct lab never issues CONFIG_CU (ctrltext / START_NPU only).
+    pub axis_lab_ctrltext_only: bool,
+    /// Production public stack has CU/PDI + CONFIG_CU construction step.
+    pub axis_public_cu_pdi_step: bool,
+    /// Construction gap open (`public step && !lab CU`).
+    pub axis_construction_gap_open: bool,
+    /// Open hypothesis: CU/PDI identity may still be required (gap + FW residual).
+    pub axis_cu_pdi_identity_hypothesis_open: bool,
+    /// Optional research external ctrltext sha match (compare helper).
+    pub axis_external_ctrltext_sha_match: bool,
+    /// Always **false**: sha match alone does not close FW residual / invent Pass.
+    pub ctrltext_match_alone_closes_fw_residual: bool,
+    /// Always **false**: status-name surface alone does not prove root cause.
+    pub partition_name_alone_proves_root_cause: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for AppLoadResidualAxisMatrix {
+    fn default() -> Self {
+        // Honesty-safe: gap open, never invent close/Pass, no FW flag assumed.
+        Self {
+            axis_fw_status_name_app_load: false,
+            axis_partition_surface_status_name_only: true,
+            axis_lab_ctrltext_only: true,
+            axis_public_cu_pdi_step: true,
+            axis_construction_gap_open: true,
+            axis_cu_pdi_identity_hypothesis_open: false,
+            axis_external_ctrltext_sha_match: false,
+            ctrltext_match_alone_closes_fw_residual: false,
+            partition_name_alone_proves_root_cause: false,
+            detail: "default_gap_open_no_fw_flag".into(),
+        }
+    }
+}
+
+impl AppLoadResidualAxisMatrix {
+    /// Soft research note (always honesty trio; never invent Pass / C-ready).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "app_load_residual_axis_matrix".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            format!(
+                "axis_fw_status_name_app_load={}",
+                u8::from(self.axis_fw_status_name_app_load)
+            ),
+            // Always status_name_only surface — force soft token (ignore bag mutation).
+            "axis_partition_surface_status_name_only=1".into(),
+            format!(
+                "axis_lab_ctrltext_only={}",
+                u8::from(self.axis_lab_ctrltext_only)
+            ),
+            format!(
+                "axis_public_cu_pdi_step={}",
+                u8::from(self.axis_public_cu_pdi_step)
+            ),
+            format!(
+                "axis_construction_gap_open={}",
+                u8::from(self.axis_construction_gap_open)
+            ),
+            format!(
+                "axis_cu_pdi_identity_hypothesis_open={}",
+                u8::from(self.axis_cu_pdi_identity_hypothesis_open)
+            ),
+            format!(
+                "axis_external_ctrltext_sha_match={}",
+                u8::from(self.axis_external_ctrltext_sha_match)
+            ),
+            // Hard-forced honesty locks (ignore field mutation in soft notes).
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            "partition_name_alone_proves_root_cause=0".into(),
+            format!(
+                "partition_surface_public={}",
+                PUBLIC_PARTITION_SURFACE_TOKEN
+            ),
+        ];
+        // Emit FW code/name only when the FW axis is actually open — never invent
+        // APP_LOAD_PDI_FAIL narrative from gap-alone / no-fw-flag paths.
+        if self.axis_fw_status_name_app_load {
+            parts.push(format!("fw_code=0x{AIE2_FW_APP_LOAD_PDI_FAIL:x}"));
+            parts.push(format!(
+                "fw_name={}",
+                aie2_fw_status_name(AIE2_FW_APP_LOAD_PDI_FAIL)
+            ));
+        } else {
+            parts.push("fw_code=absent".into());
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Build residual axis matrix from partition research + CU/PDI necessity bags.
+///
+/// - Surface tokens always status_name_only / match-alone=0 / name-alone≠proof.
+/// - `axis_fw_status_name_app_load` from partition class/pair **or** necessity FW flag.
+/// - Soft only; never Pass / C-ready / second unlock.
+#[must_use]
+pub fn research_app_load_residual_axis_matrix(
+    partition: &AppLoadPdiPartitionResearch,
+    necessity: &CuPdiNecessityResearch,
+) -> AppLoadResidualAxisMatrix {
+    let fw_name = partition.class_app_load_after_aiebu
+        || partition.c2_app_load_pair
+        || partition.failed_cmd_status == Some(AIE2_FW_APP_LOAD_PDI_FAIL)
+        || necessity.fw_name_app_load_pdi_fail;
+    let detail = if necessity.external_ctrltext_sha_match && fw_name {
+        "sha_match_fw_residual_axes_open"
+    } else if fw_name && necessity.construction_gap_open {
+        "gap_open_fw_app_load_axes"
+    } else if necessity.construction_gap_open {
+        "gap_open_no_fw_flag"
+    } else {
+        "no_gap"
+    };
+    AppLoadResidualAxisMatrix {
+        axis_fw_status_name_app_load: fw_name,
+        // Always status_name_only from research constructors — never invent decode.
+        axis_partition_surface_status_name_only: true,
+        axis_lab_ctrltext_only: necessity.lab_is_ctrltext_only,
+        axis_public_cu_pdi_step: necessity.public_has_cu_pdi_step,
+        axis_construction_gap_open: necessity.construction_gap_open,
+        axis_cu_pdi_identity_hypothesis_open: necessity.cu_pdi_identity_may_be_required,
+        axis_external_ctrltext_sha_match: necessity.external_ctrltext_sha_match,
+        ctrltext_match_alone_closes_fw_residual: false,
+        partition_name_alone_proves_root_cause: false,
+        detail: detail.into(),
+    }
+}
+
+/// Convenience: locked C2 APP_LOAD residual + construction gap axis matrix.
+///
+/// Uses Track L c2-locked partition (userspace content green) + CU/PDI necessity
+/// with `fw_app_load_residual=true`. Optional sha_match for honesty when research
+/// compare matches failing corpus — still never closes residual.
+#[must_use]
+pub fn research_app_load_residual_axis_matrix_c2_locked(
+    external_ctrltext_sha_match: bool,
+) -> AppLoadResidualAxisMatrix {
+    let partition = research_app_load_pdi_partition_c2_locked(true);
+    let necessity = research_cu_pdi_necessity_c2_locked(external_ctrltext_sha_match);
+    research_app_load_residual_axis_matrix(&partition, &necessity)
+}
+
+// ---------------------------------------------------------------------------
+// Xclbin extract research dry-run (public markers only; VE2 refuse)
+// ---------------------------------------------------------------------------
+
+/// Public AXLF magic (`xclbin2` + NUL). Research marker only — not a full decoder.
+pub const XCLBIN2_MAGIC: &[u8; 8] = b"xclbin2\0";
+
+/// Public section **name** markers from docs / `xclbinutil --info` text.
+///
+/// Scan is case-sensitive on these tokens as printed by XRT tools. This is **not**
+/// a private PDI layout map and does **not** decode section bodies.
+pub const XCLBIN_RESEARCH_SECTION_MARKERS: &[&str] = &[
+    "AIE_PARTITION",
+    "BITSTREAM",
+    "MEM_TOPOLOGY",
+    "IP_LAYOUT",
+    "CONNECTIVITY",
+    "BUILD_METADATA",
+    "EMBEDDED_METADATA",
+    "SYSTEM_METADATA",
+    "GROUP_CONNECTIVITY",
+    "GROUP_TOPOLOGY",
+];
+
+/// Soft xclbin extract **dry-run** (public markers only; VE2 refuse).
+///
+/// Validates magic + section-list research markers without treating VE2 /
+/// NOT_AIE2 fixtures as AIE2 known-good and without inventing a PDI field map.
+/// **Not** Pass / C-ready / `ran_on_npu`.
+///
+/// Stamp `ac20bc3f`: prepare offline extract path for when a working public
+/// AIE2 xclbin exists; unit-lock refuse of VE2 edge `validate.xclbin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct XclbinExtractResearchDryRun {
+    /// First 8 bytes match [`XCLBIN2_MAGIC`].
+    pub magic_xclbin2: bool,
+    /// Count of public section name markers found in inspect/info text (capped).
+    pub section_marker_count: u8,
+    /// Text listed `AIE_PARTITION` (public name only).
+    pub has_aie_partition_marker: bool,
+    /// Platform claim / path marks VE2 or NOT_AIE2 known-good refuse.
+    pub platform_not_aie2_known_good: bool,
+    /// Research placement candidate for AIE2 external bag (never product Pass).
+    /// Always **false** when VE2/NOT_AIE2; also false without working-stack claim.
+    pub eligible_as_aie2_external_known_good: bool,
+    /// Always **true**: no private PDI layout invent.
+    pub do_not_invent_pdi_layout: bool,
+    /// Always **false**: public image decode remains closed.
+    pub public_pdi_image_decode: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for XclbinExtractResearchDryRun {
+    fn default() -> Self {
+        Self {
+            magic_xclbin2: false,
+            section_marker_count: 0,
+            has_aie_partition_marker: false,
+            platform_not_aie2_known_good: false,
+            eligible_as_aie2_external_known_good: false,
+            do_not_invent_pdi_layout: true,
+            public_pdi_image_decode: false,
+            detail: "default_no_input".into(),
+        }
+    }
+}
+
+impl XclbinExtractResearchDryRun {
+    /// Soft research note (always honesty trio; never invent Pass / product known-good).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "xclbin_extract_research_dry_run".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            format!("magic_xclbin2={}", u8::from(self.magic_xclbin2)),
+            format!("section_marker_count={}", self.section_marker_count),
+            format!(
+                "has_aie_partition_marker={}",
+                u8::from(self.has_aie_partition_marker)
+            ),
+            format!(
+                "platform_not_aie2_known_good={}",
+                u8::from(self.platform_not_aie2_known_good)
+            ),
+            // Eligible is research bag candidate only — soft always product=0.
+            format!(
+                "eligible_as_aie2_external_known_good={}",
+                u8::from(self.eligible_as_aie2_external_known_good)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// True when `bytes` begin with public AXLF magic [`XCLBIN2_MAGIC`].
+#[must_use]
+pub fn xclbin_magic_is_xclbin2(bytes: &[u8]) -> bool {
+    bytes.len() >= XCLBIN2_MAGIC.len() && bytes[..XCLBIN2_MAGIC.len()] == *XCLBIN2_MAGIC
+}
+
+/// Scan inspect/info **text** for public section name markers (no binary decode).
+///
+/// Returns distinct markers from [`XCLBIN_RESEARCH_SECTION_MARKERS`] found as
+/// substrings. Empty / whitespace text → empty list.
+#[must_use]
+pub fn scan_xclbin_section_markers_from_text(text: &str) -> Vec<&'static str> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for m in XCLBIN_RESEARCH_SECTION_MARKERS {
+        if t.contains(m) {
+            found.push(*m);
+        }
+    }
+    found
+}
+
+/// True when platform claim / path / PROVENANCE marks **not** AIE2 known-good.
+///
+/// Matches (ascii-lower) whole-token or documented markers:
+/// - `not_aie2_known_good` / `not_aie2_known_good=1`
+/// - `ve2_edge` / `ve2_latency` / path-ish `ve2`
+/// - `claim=not_known_good_for_aie2`
+///
+/// Case-insensitive. Does **not** invent AIE2 eligibility from absence alone.
+#[must_use]
+pub fn platform_claim_is_not_aie2_known_good(claim: &str) -> bool {
+    let lower = claim.to_ascii_lowercase();
+    if lower.trim().is_empty() {
+        return false;
+    }
+    // Prefer exact-token honesty for product-ish keys; substrings for known markers.
+    if lower.contains("not_aie2_known_good")
+        || lower.contains("not_known_good_for_aie2")
+        || lower.contains("ve2_edge")
+        || lower.contains("ve2_latency")
+        || lower.contains("shim_ve2")
+    {
+        return true;
+    }
+    // Whole-token `ve2` (avoid matching random substrings like "carve2").
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| tok == "ve2")
+}
+
+/// True when claim marks a **working public AIE2** research source (still not Pass).
+///
+/// Requires **both** a positive working/source-stack marker **and** an AIE2-ish
+/// whole-token (`xrt` / `aie2` / `npu4` / `strix`). Bare single-token `xrt`
+/// alone does **not** qualify (avoids over-flipping eligibility on thin claims).
+/// Must **not** be NOT_AIE2/VE2 refuse. Research eligibility only — never Pass.
+#[must_use]
+pub fn platform_claim_is_working_public_aie2_research(claim: &str) -> bool {
+    if platform_claim_is_not_aie2_known_good(claim) {
+        return false;
+    }
+    let lower = claim.to_ascii_lowercase();
+    let has_working = lower.contains("working public")
+        || lower.contains("working_public")
+        || lower.contains("public stack")
+        || lower.contains("source stack")
+        || lower.contains("ryzen ai")
+        || lower.contains("dynamicdispatch");
+    // Whole-token xrt / aie2 (not substring of larger opaque words alone).
+    let has_aie2ish = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| tok == "xrt" || tok == "aie2" || tok == "npu4" || tok == "strix");
+    // Both required: refuse bare "xrt" / "aie2" without working/source-stack context.
+    has_working && has_aie2ish
+}
+
+/// Research dry-run for xclbin extract markers (public text + magic only).
+///
+/// - `header_bytes`: optional leading bytes for magic check (may be empty).
+/// - `section_or_info_text`: optional `xclbinutil --info` / sections paste.
+/// - `platform_claim`: optional PROVENANCE / path / PLATFORM line (VE2 refuse).
+/// - Never invents PDI layout. Never product known-good / Pass / C-ready.
+/// - `eligible_as_aie2_external_known_good` only when magic + AIE_PARTITION marker
+///   + working public AIE2 claim and **not** NOT_AIE2/VE2.
+#[must_use]
+pub fn research_xclbin_extract_dry_run(
+    header_bytes: &[u8],
+    section_or_info_text: Option<&str>,
+    platform_claim: Option<&str>,
+) -> XclbinExtractResearchDryRun {
+    let magic = xclbin_magic_is_xclbin2(header_bytes);
+    let markers = section_or_info_text
+        .map(scan_xclbin_section_markers_from_text)
+        .unwrap_or_default();
+    // Public marker set is tiny; min(255) makes truncation impossible.
+    #[allow(clippy::cast_possible_truncation)]
+    let marker_count = markers.len().min(255) as u8;
+    let has_aie = markers.contains(&"AIE_PARTITION");
+    let claim = platform_claim.unwrap_or("").trim();
+    let not_aie2 = !claim.is_empty() && platform_claim_is_not_aie2_known_good(claim);
+    let working = !claim.is_empty() && platform_claim_is_working_public_aie2_research(claim);
+    // Research bag candidate only — still product_known_good=0 in soft notes.
+    let eligible = magic && has_aie && working && !not_aie2;
+    let detail = if not_aie2 {
+        "refuse_not_aie2_or_ve2"
+    } else if header_bytes.is_empty() && section_or_info_text.is_none() && claim.is_empty() {
+        "default_no_input"
+    } else if !magic && !header_bytes.is_empty() {
+        "magic_not_xclbin2"
+    } else if eligible {
+        "research_eligible_not_product_pass"
+    } else if magic && has_aie {
+        "markers_ok_awaiting_working_stack_claim"
+    } else if magic {
+        "magic_ok_markers_incomplete"
+    } else {
+        "awaiting_bytes_or_markers"
+    };
+    XclbinExtractResearchDryRun {
+        magic_xclbin2: magic,
+        section_marker_count: marker_count,
+        has_aie_partition_marker: has_aie,
+        platform_not_aie2_known_good: not_aie2,
+        eligible_as_aie2_external_known_good: eligible,
+        do_not_invent_pdi_layout: true,
+        public_pdi_image_decode: false,
+        detail: detail.into(),
+    }
+}
+
+/// Locked refuse path for staged VE2 edge `validate.xclbin` research fixtures.
+///
+/// Uses VE2 PLATFORM claim + optional magic from provided header bytes.
+/// Always `eligible_as_aie2_external_known_good=false` and
+/// `platform_not_aie2_known_good=true`. Soft only; never invent Pass.
+#[must_use]
+pub fn research_xclbin_extract_ve2_fixture_refused(
+    header_bytes: &[u8],
+    section_or_info_text: Option<&str>,
+) -> XclbinExtractResearchDryRun {
+    research_xclbin_extract_dry_run(
+        header_bytes,
+        section_or_info_text,
+        Some("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1 claim=not_known_good_for_aie2_17f0"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Pure CU/PDI section identity (public xclbin section **names** only)
+// ---------------------------------------------------------------------------
+
+/// Public xclbin section **names** that form the CU/PDI identity surface.
+///
+/// From docs / `xclbinutil --info` only — **not** a PDI body layout map.
+/// - `AIE_PARTITION` — partition table / load surface name
+/// - `BITSTREAM` — public name for the bitstream/PDI payload section
+///
+/// Presence of these names is research identity for extract recipes. It is
+/// **not** product known-good, Pass, or residual closed.
+pub const XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS: &[&str] = &["AIE_PARTITION", "BITSTREAM"];
+
+/// Public topology / connectivity section names (not CU/PDI identity alone).
+pub const XCLBIN_TOPOLOGY_SECTION_MARKERS: &[&str] = &[
+    "MEM_TOPOLOGY",
+    "IP_LAYOUT",
+    "CONNECTIVITY",
+    "GROUP_CONNECTIVITY",
+    "GROUP_TOPOLOGY",
+];
+
+/// Public metadata section names (build / embed / system — not CU/PDI identity).
+pub const XCLBIN_METADATA_SECTION_MARKERS: &[&str] =
+    &["BUILD_METADATA", "EMBEDDED_METADATA", "SYSTEM_METADATA"];
+
+/// Kind of a public xclbin section **name** for CU/PDI identity research.
+///
+/// Classifies documented section tokens only. Does **not** decode section bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XclbinSectionKind {
+    /// CU/PDI identity surface (`AIE_PARTITION` / `BITSTREAM`).
+    CuPdiIdentity,
+    /// Memory / IP / connectivity topology.
+    Topology,
+    /// Build / embedded / system metadata.
+    Metadata,
+    /// Not in the public research marker tables.
+    Unknown,
+}
+
+/// Classify a public section **name** (exact match against research marker tables).
+///
+/// Case-sensitive to match `xclbinutil` print tokens. Unknown / empty →
+/// [`XclbinSectionKind::Unknown`].
+#[must_use]
+pub fn classify_xclbin_section_kind(name: &str) -> XclbinSectionKind {
+    let t = name.trim();
+    if t.is_empty() {
+        return XclbinSectionKind::Unknown;
+    }
+    if XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS.contains(&t) {
+        return XclbinSectionKind::CuPdiIdentity;
+    }
+    if XCLBIN_TOPOLOGY_SECTION_MARKERS.contains(&t) {
+        return XclbinSectionKind::Topology;
+    }
+    if XCLBIN_METADATA_SECTION_MARKERS.contains(&t) {
+        return XclbinSectionKind::Metadata;
+    }
+    XclbinSectionKind::Unknown
+}
+
+/// Soft research: which public xclbin section **names** form CU/PDI identity.
+///
+/// Advances extract recipe readiness without inventing PDI body layout or Pass.
+/// Stamp `7a5ab864`: pure section-name / kind unit locks only.
+///
+/// Honesty:
+/// - Name surface only — `do_not_invent_pdi_layout=1` / `public_pdi_image_decode=0`
+/// - Section identity alone **never** closes FW residual
+/// - VE2 / NOT_AIE2 still refused as product known-good (caller dry-run)
+/// - Always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 product_known_good=0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct CuPdiSectionIdentityResearch {
+    /// Public `AIE_PARTITION` name marker present.
+    pub has_aie_partition: bool,
+    /// Public `BITSTREAM` name marker present.
+    pub has_bitstream: bool,
+    /// Count of CU/PDI identity markers found (capped).
+    pub cu_pdi_identity_marker_count: u8,
+    /// Count of topology markers found (capped).
+    pub topology_marker_count: u8,
+    /// Count of metadata markers found (capped).
+    pub metadata_marker_count: u8,
+    /// True when ≥1 CU/PDI identity name is present (name surface only).
+    pub has_cu_pdi_identity_surface: bool,
+    /// Always **false**: section names alone never close FW residual / invent Pass.
+    pub section_identity_alone_closes_fw_residual: bool,
+    /// Always **true**: no private PDI layout invent.
+    pub do_not_invent_pdi_layout: bool,
+    /// Always **false**: public image decode remains closed.
+    pub public_pdi_image_decode: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for CuPdiSectionIdentityResearch {
+    fn default() -> Self {
+        Self {
+            has_aie_partition: false,
+            has_bitstream: false,
+            cu_pdi_identity_marker_count: 0,
+            topology_marker_count: 0,
+            metadata_marker_count: 0,
+            has_cu_pdi_identity_surface: false,
+            section_identity_alone_closes_fw_residual: false,
+            do_not_invent_pdi_layout: true,
+            public_pdi_image_decode: false,
+            detail: "default_no_markers".into(),
+        }
+    }
+}
+
+impl CuPdiSectionIdentityResearch {
+    /// Soft research note (always honesty trio; never invent Pass / product known-good).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "cu_pdi_section_identity_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            "section_identity_alone_closes_fw_residual=0".into(),
+            format!("has_aie_partition={}", u8::from(self.has_aie_partition)),
+            format!("has_bitstream={}", u8::from(self.has_bitstream)),
+            format!(
+                "cu_pdi_identity_marker_count={}",
+                self.cu_pdi_identity_marker_count
+            ),
+            format!("topology_marker_count={}", self.topology_marker_count),
+            format!("metadata_marker_count={}", self.metadata_marker_count),
+            format!(
+                "has_cu_pdi_identity_surface={}",
+                u8::from(self.has_cu_pdi_identity_surface)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Research CU/PDI section identity from already-scanned public markers.
+///
+/// Markers should come from [`scan_xclbin_section_markers_from_text`] (or the
+/// same public name table). Names are **trimmed** before kind classify and
+/// identity flags (consistent with [`classify_xclbin_section_kind`]). Never
+/// invents section bodies / PDI layout / Pass.
+#[must_use]
+pub fn research_cu_pdi_section_identity_from_markers(
+    markers: &[&str],
+) -> CuPdiSectionIdentityResearch {
+    let mut has_aie = false;
+    let mut has_bs = false;
+    let mut cu_n = 0_u8;
+    let mut topo_n = 0_u8;
+    let mut meta_n = 0_u8;
+    let mut saw_any_nonempty = false;
+    for m in markers {
+        let t = m.trim();
+        if t.is_empty() {
+            continue;
+        }
+        saw_any_nonempty = true;
+        match classify_xclbin_section_kind(t) {
+            XclbinSectionKind::CuPdiIdentity => {
+                cu_n = cu_n.saturating_add(1);
+                // Use trimmed token (same as classify) so padded markers stay consistent.
+                if t == "AIE_PARTITION" {
+                    has_aie = true;
+                }
+                if t == "BITSTREAM" {
+                    has_bs = true;
+                }
+            }
+            XclbinSectionKind::Topology => {
+                topo_n = topo_n.saturating_add(1);
+            }
+            XclbinSectionKind::Metadata => {
+                meta_n = meta_n.saturating_add(1);
+            }
+            XclbinSectionKind::Unknown => {}
+        }
+    }
+    let has_surface = has_aie || has_bs;
+    let detail = if !saw_any_nonempty {
+        "default_no_markers"
+    } else if has_aie && has_bs {
+        "cu_pdi_identity_surface_aie_and_bitstream"
+    } else if has_aie {
+        "cu_pdi_identity_surface_aie_partition_only"
+    } else if has_bs {
+        "cu_pdi_identity_surface_bitstream_only"
+    } else if topo_n > 0 || meta_n > 0 {
+        "topology_or_metadata_only_no_cu_pdi_identity"
+    } else {
+        "markers_unclassified"
+    };
+    CuPdiSectionIdentityResearch {
+        has_aie_partition: has_aie,
+        has_bitstream: has_bs,
+        cu_pdi_identity_marker_count: cu_n,
+        topology_marker_count: topo_n,
+        metadata_marker_count: meta_n,
+        has_cu_pdi_identity_surface: has_surface,
+        section_identity_alone_closes_fw_residual: false,
+        do_not_invent_pdi_layout: true,
+        public_pdi_image_decode: false,
+        detail: detail.into(),
+    }
+}
+
+/// Research CU/PDI section identity from `xclbinutil --info` / sections paste text.
+///
+/// Empty / whitespace text → default no-markers bag. Soft only; never Pass.
+#[must_use]
+pub fn research_cu_pdi_section_identity_from_text(text: &str) -> CuPdiSectionIdentityResearch {
+    let markers = scan_xclbin_section_markers_from_text(text);
+    research_cu_pdi_section_identity_from_markers(&markers)
+}
+
+// ---------------------------------------------------------------------------
+// Pure BITSTREAM / AIE_PARTITION section-offset map (public axlf layout)
+// ---------------------------------------------------------------------------
+
+/// Public `axlf_section_kind` value for `BITSTREAM` (`xrt/detail/xclbin.h`).
+pub const AXLF_SECTION_KIND_BITSTREAM: u32 = 0;
+
+/// Public `axlf_section_kind` value for `AIE_PARTITION` (`xrt/detail/xclbin.h`).
+pub const AXLF_SECTION_KIND_AIE_PARTITION: u32 = 32;
+
+/// Size of public `struct axlf_section_header` (natural alignment; 40 bytes).
+///
+/// Layout (little-endian, 64-bit host natural align as shipped in XRT headers):
+/// - `m_sectionKind` @ 0 (`u32`)
+/// - `m_sectionName` @ 4 (`[u8; 16]`)
+/// - pad 4 @ 20 (align `u64`)
+/// - `m_sectionOffset` @ 24 (`u64`)
+/// - `m_sectionSize` @ 32 (`u64`)
+pub const AXLF_SECTION_HEADER_SIZE: usize = 40;
+
+/// Size of public `struct axlf_header` (152 bytes including trailing pad).
+pub const AXLF_HEADER_SIZE: usize = 152;
+
+/// Absolute file offset of `axlf.m_header` (after magic / signature / keyBlock / uniqueId).
+///
+/// `8 + 4 + 28 + 256 + 8 = 304`.
+pub const AXLF_M_HEADER_ABS_OFFSET: usize = 304;
+
+/// Absolute file offset of `axlf.m_header.m_numSections` (`m_header` + 144).
+pub const AXLF_NUM_SECTIONS_ABS_OFFSET: usize = AXLF_M_HEADER_ABS_OFFSET + 144;
+
+/// Absolute file offset of the first `axlf_section_header` (`m_header` + 152).
+pub const AXLF_FIRST_SECTION_HEADER_ABS_OFFSET: usize = AXLF_M_HEADER_ABS_OFFSET + AXLF_HEADER_SIZE;
+
+/// Cap on section headers walked offline (research; full XRT max is larger).
+pub const AXLF_MAX_SECTIONS_WALK: u32 = 256;
+
+/// Parsed public `axlf_section_header` fields (offset/size only — no body decode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxlfSectionHeaderFields {
+    /// `m_sectionKind` (public enum value).
+    pub kind: u32,
+    /// `m_sectionName` as UTF-8 lossy, cut at first NUL (not whitespace-trimmed).
+    /// Trailing spaces without a NUL remain. Kind detection uses `m_sectionKind` only.
+    pub name: String,
+    /// `m_sectionOffset` — file offset of section **data** (not header).
+    pub offset: u64,
+    /// `m_sectionSize` — section data byte length.
+    pub size: u64,
+}
+
+/// Soft research: file offsets of public BITSTREAM / AIE_PARTITION sections.
+///
+/// Stamp `a5787723`: pure public axlf section-header field map only.
+/// Does **not** decode PDI/bitstream bodies. Does **not** invent product
+/// known-good / Pass / residual closed.
+///
+/// Honesty:
+/// - Offset map alone **never** closes FW residual
+/// - Always `do_not_invent_pdi_layout=1` / `public_pdi_image_decode=0`
+/// - Always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 product_known_good=0`
+/// - VE2 / NOT_AIE2 fixtures may parse cleanly and still are **not** AIE2 known-good
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct CuPdiSectionOffsetMapResearch {
+    /// First 8 bytes match [`XCLBIN2_MAGIC`].
+    pub magic_xclbin2: bool,
+    /// `m_numSections` when header long enough to read.
+    pub num_sections: Option<u32>,
+    /// How many section headers were successfully parsed (capped walk).
+    pub section_headers_parsed: u32,
+    /// File offset of first `BITSTREAM` section data when present.
+    pub bitstream_offset: Option<u64>,
+    /// Size of first `BITSTREAM` section data when present.
+    pub bitstream_size: Option<u64>,
+    /// File offset of first `AIE_PARTITION` section data when present.
+    pub aie_partition_offset: Option<u64>,
+    /// Size of first `AIE_PARTITION` section data when present.
+    pub aie_partition_size: Option<u64>,
+    /// True when a BITSTREAM section header was found.
+    pub has_bitstream_section: bool,
+    /// True when an AIE_PARTITION section header was found.
+    pub has_aie_partition_section: bool,
+    /// True when ≥1 of BITSTREAM / AIE_PARTITION section headers is present.
+    pub has_cu_pdi_offset_surface: bool,
+    /// Always **false**: offset map alone never closes FW residual / invent Pass.
+    pub section_offset_map_alone_closes_fw_residual: bool,
+    /// Always **true**: no private PDI layout invent.
+    pub do_not_invent_pdi_layout: bool,
+    /// Always **false**: public image decode remains closed.
+    pub public_pdi_image_decode: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for CuPdiSectionOffsetMapResearch {
+    fn default() -> Self {
+        Self {
+            magic_xclbin2: false,
+            num_sections: None,
+            section_headers_parsed: 0,
+            bitstream_offset: None,
+            bitstream_size: None,
+            aie_partition_offset: None,
+            aie_partition_size: None,
+            has_bitstream_section: false,
+            has_aie_partition_section: false,
+            has_cu_pdi_offset_surface: false,
+            section_offset_map_alone_closes_fw_residual: false,
+            do_not_invent_pdi_layout: true,
+            public_pdi_image_decode: false,
+            detail: "default_empty_bytes".into(),
+        }
+    }
+}
+
+impl CuPdiSectionOffsetMapResearch {
+    /// Soft research note (always honesty trio; never invent Pass / product known-good).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "cu_pdi_section_offset_map_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            "section_offset_map_alone_closes_fw_residual=0".into(),
+            format!("magic_xclbin2={}", u8::from(self.magic_xclbin2)),
+            format!("section_headers_parsed={}", self.section_headers_parsed),
+            format!(
+                "has_bitstream_section={}",
+                u8::from(self.has_bitstream_section)
+            ),
+            format!(
+                "has_aie_partition_section={}",
+                u8::from(self.has_aie_partition_section)
+            ),
+            format!(
+                "has_cu_pdi_offset_surface={}",
+                u8::from(self.has_cu_pdi_offset_surface)
+            ),
+        ];
+        match self.num_sections {
+            Some(n) => parts.push(format!("num_sections={n}")),
+            None => parts.push("num_sections=absent".into()),
+        }
+        match self.bitstream_offset {
+            Some(o) => parts.push(format!("bitstream_offset={o}")),
+            None => parts.push("bitstream_offset=absent".into()),
+        }
+        match self.bitstream_size {
+            Some(s) => parts.push(format!("bitstream_size={s}")),
+            None => parts.push("bitstream_size=absent".into()),
+        }
+        match self.aie_partition_offset {
+            Some(o) => parts.push(format!("aie_partition_offset={o}")),
+            None => parts.push("aie_partition_offset=absent".into()),
+        }
+        match self.aie_partition_size {
+            Some(s) => parts.push(format!("aie_partition_size={s}")),
+            None => parts.push("aie_partition_size=absent".into()),
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Map public `axlf_section_kind` numeric values to research name tokens.
+///
+/// Covers the CU/PDI identity pair + the topology/metadata scan set. Unknown
+/// kinds → `None` (still parseable as raw headers; no invent of private names).
+#[must_use]
+pub fn axlf_section_kind_public_name(kind: u32) -> Option<&'static str> {
+    match kind {
+        AXLF_SECTION_KIND_BITSTREAM => Some("BITSTREAM"),
+        2 => Some("EMBEDDED_METADATA"),
+        6 => Some("MEM_TOPOLOGY"),
+        7 => Some("CONNECTIVITY"),
+        8 => Some("IP_LAYOUT"),
+        14 => Some("BUILD_METADATA"),
+        22 => Some("SYSTEM_METADATA"),
+        26 => Some("GROUP_TOPOLOGY"),
+        27 => Some("GROUP_CONNECTIVITY"),
+        AXLF_SECTION_KIND_AIE_PARTITION => Some("AIE_PARTITION"),
+        _ => None,
+    }
+}
+
+/// Parse one public `axlf_section_header` (40 bytes, natural align LE).
+///
+/// Returns `None` when `bytes` is shorter than [`AXLF_SECTION_HEADER_SIZE`].
+/// Does **not** validate that offset/size lie inside a parent file.
+#[must_use]
+pub fn parse_axlf_section_header(bytes: &[u8]) -> Option<AxlfSectionHeaderFields> {
+    if bytes.len() < AXLF_SECTION_HEADER_SIZE {
+        return None;
+    }
+    let kind = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // name @ 4..20 (16 bytes); trim at first NUL.
+    let name_raw = &bytes[4..20];
+    let name_end = name_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name_raw.len());
+    let name = String::from_utf8_lossy(&name_raw[..name_end]).into_owned();
+    // offset @ 24, size @ 32 (4-byte pad at 20..24 for u64 align).
+    let offset = u64::from_le_bytes([
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+    ]);
+    let size = u64::from_le_bytes([
+        bytes[32], bytes[33], bytes[34], bytes[35], bytes[36], bytes[37], bytes[38], bytes[39],
+    ]);
+    Some(AxlfSectionHeaderFields {
+        kind,
+        name,
+        offset,
+        size,
+    })
+}
+
+/// Read `m_numSections` from a buffer that includes the axlf header prefix.
+///
+/// Requires `bytes.len() >= AXLF_NUM_SECTIONS_ABS_OFFSET + 4`.
+#[must_use]
+pub fn parse_axlf_num_sections(bytes: &[u8]) -> Option<u32> {
+    let off = AXLF_NUM_SECTIONS_ABS_OFFSET;
+    if bytes.len() < off + 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        bytes[off],
+        bytes[off + 1],
+        bytes[off + 2],
+        bytes[off + 3],
+    ]))
+}
+
+/// Walk public section headers after a valid xclbin2 magic + header prefix.
+///
+/// Stops at `min(num_sections, AXLF_MAX_SECTIONS_WALK)` or when bytes run out.
+/// Empty / non-magic → empty list. Soft research only.
+#[must_use]
+pub fn walk_axlf_section_headers(bytes: &[u8]) -> Vec<AxlfSectionHeaderFields> {
+    if !xclbin_magic_is_xclbin2(bytes) {
+        return Vec::new();
+    }
+    let Some(num) = parse_axlf_num_sections(bytes) else {
+        return Vec::new();
+    };
+    let walk = num.min(AXLF_MAX_SECTIONS_WALK) as usize;
+    let mut out = Vec::with_capacity(walk.min(16));
+    let mut off = AXLF_FIRST_SECTION_HEADER_ABS_OFFSET;
+    for _ in 0..walk {
+        if off + AXLF_SECTION_HEADER_SIZE > bytes.len() {
+            break;
+        }
+        if let Some(h) = parse_axlf_section_header(&bytes[off..off + AXLF_SECTION_HEADER_SIZE]) {
+            out.push(h);
+        }
+        off += AXLF_SECTION_HEADER_SIZE;
+    }
+    out
+}
+
+/// Research BITSTREAM / AIE_PARTITION **file offsets** from public axlf bytes.
+///
+/// Pure offline TDD surface (stamp `a5787723`). Parses section **headers** only
+/// — never decodes section bodies / invents PDI layout / product known-good.
+///
+/// - Empty bytes → `detail=default_empty_bytes`
+/// - Non-xclbin2 magic → `detail=magic_not_xclbin2`
+/// - Magic OK but truncated before num_sections → `detail=header_truncated`
+/// - Headers walked but neither CU/PDI kind present → `detail=no_cu_pdi_section_headers`
+/// - BITSTREAM and/or AIE_PARTITION found → offset/size filled; detail names surface
+///
+/// Soft only; always `section_offset_map_alone_closes_fw_residual=false`.
+#[must_use]
+pub fn research_xclbin_cu_pdi_section_offset_map(bytes: &[u8]) -> CuPdiSectionOffsetMapResearch {
+    if bytes.is_empty() {
+        return CuPdiSectionOffsetMapResearch::default();
+    }
+    if !xclbin_magic_is_xclbin2(bytes) {
+        return CuPdiSectionOffsetMapResearch {
+            magic_xclbin2: false,
+            detail: "magic_not_xclbin2".into(),
+            ..CuPdiSectionOffsetMapResearch::default()
+        };
+    }
+    let Some(num) = parse_axlf_num_sections(bytes) else {
+        return CuPdiSectionOffsetMapResearch {
+            magic_xclbin2: true,
+            detail: "header_truncated".into(),
+            ..CuPdiSectionOffsetMapResearch::default()
+        };
+    };
+    let headers = walk_axlf_section_headers(bytes);
+    #[allow(clippy::cast_possible_truncation)]
+    let parsed = headers.len().min(u32::MAX as usize) as u32;
+    let mut bs_off = None;
+    let mut bs_sz = None;
+    let mut aie_off = None;
+    let mut aie_sz = None;
+    for h in &headers {
+        if h.kind == AXLF_SECTION_KIND_BITSTREAM && bs_off.is_none() {
+            bs_off = Some(h.offset);
+            bs_sz = Some(h.size);
+        }
+        if h.kind == AXLF_SECTION_KIND_AIE_PARTITION && aie_off.is_none() {
+            aie_off = Some(h.offset);
+            aie_sz = Some(h.size);
+        }
+    }
+    let has_bs = bs_off.is_some();
+    let has_aie = aie_off.is_some();
+    let has_surface = has_bs || has_aie;
+    let detail = if headers.is_empty() && num > 0 {
+        "section_headers_truncated"
+    } else if has_bs && has_aie {
+        "cu_pdi_offset_surface_bitstream_and_aie_partition"
+    } else if has_bs {
+        "cu_pdi_offset_surface_bitstream_only"
+    } else if has_aie {
+        "cu_pdi_offset_surface_aie_partition_only"
+    } else if !headers.is_empty() {
+        "no_cu_pdi_section_headers"
+    } else {
+        "zero_sections"
+    };
+    CuPdiSectionOffsetMapResearch {
+        magic_xclbin2: true,
+        num_sections: Some(num),
+        section_headers_parsed: parsed,
+        bitstream_offset: bs_off,
+        bitstream_size: bs_sz,
+        aie_partition_offset: aie_off,
+        aie_partition_size: aie_sz,
+        has_bitstream_section: has_bs,
+        has_aie_partition_section: has_aie,
+        has_cu_pdi_offset_surface: has_surface,
+        section_offset_map_alone_closes_fw_residual: false,
+        do_not_invent_pdi_layout: true,
+        public_pdi_image_decode: false,
+        detail: detail.into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure axlf section body window bounds (no body decode; stamp 2c4b96bf)
+// ---------------------------------------------------------------------------
+
+/// Overflow-safe: section body window `[offset, offset+size)` fits in `file_len`.
+///
+/// - Zero-size at `offset <= file_len` is **in-bounds** (empty window).
+/// - `offset > file_len` is OOB even when `size == 0`.
+/// - `offset + size` overflow (wrapping) is OOB.
+///
+/// Does **not** read or decode body bytes. Soft research only.
+#[must_use]
+pub fn axlf_section_body_window_in_bounds(file_len: u64, offset: u64, size: u64) -> bool {
+    check_axlf_section_body_bounds(file_len, offset, size).in_bounds
+}
+
+/// One pure section body window bounds check (no body bytes returned).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxlfSectionBodyBounds {
+    /// Claimed section data file offset.
+    pub offset: u64,
+    /// Claimed section data size.
+    pub size: u64,
+    /// Parent buffer / file length used for the check.
+    pub file_len: u64,
+    /// True when the half-open window fits without overflow.
+    pub in_bounds: bool,
+    /// Stable research detail: `in_bounds` / `oob_offset_past_file` /
+    /// `oob_end_past_file` / `oob_size_overflow`.
+    pub detail: String,
+}
+
+/// Pure bounds check for one axlf section body window vs a file length.
+///
+/// Never returns body bytes. Never invents PDI layout / Pass.
+#[must_use]
+pub fn check_axlf_section_body_bounds(
+    file_len: u64,
+    offset: u64,
+    size: u64,
+) -> AxlfSectionBodyBounds {
+    let (in_bounds, detail) = if offset > file_len {
+        (false, "oob_offset_past_file")
+    } else {
+        match offset.checked_add(size) {
+            None => (false, "oob_size_overflow"),
+            Some(end) if end > file_len => (false, "oob_end_past_file"),
+            Some(_) => (true, "in_bounds"),
+        }
+    };
+    AxlfSectionBodyBounds {
+        offset,
+        size,
+        file_len,
+        in_bounds,
+        detail: detail.into(),
+    }
+}
+
+/// Soft research: BITSTREAM / AIE_PARTITION body windows vs buffer/file length.
+///
+/// Stamp `2c4b96bf`: uses the public section-offset map ([`CuPdiSectionOffsetMapResearch`]
+/// / `a5787723`) and checks that claimed body windows fit in `file_len` —
+/// **without** decoding PDI/bitstream bodies or inventing product known-good.
+///
+/// Honesty:
+/// - Body-bounds alone **never** closes FW residual
+/// - Always `do_not_invent_pdi_layout=1` / `public_pdi_image_decode=0`
+/// - Always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 product_known_good=0`
+/// - In-bounds windows on a research buffer **≠** working-stack known-good
+/// - Header-only / truncated buffers correctly report OOB vs short `file_len`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct CuPdiSectionBodyBoundsResearch {
+    /// Parent buffer/file length used for bounds checks.
+    pub file_len: u64,
+    /// True when parent buffer has xclbin2 magic (from offset map path).
+    pub magic_xclbin2: bool,
+    /// BITSTREAM window in-bounds when section present; `None` if absent.
+    pub bitstream_in_bounds: Option<bool>,
+    /// AIE_PARTITION window in-bounds when section present; `None` if absent.
+    pub aie_partition_in_bounds: Option<bool>,
+    /// BITSTREAM offset when section header present.
+    pub bitstream_offset: Option<u64>,
+    /// BITSTREAM size when section header present.
+    pub bitstream_size: Option<u64>,
+    /// AIE_PARTITION offset when section header present.
+    pub aie_partition_offset: Option<u64>,
+    /// AIE_PARTITION size when section header present.
+    pub aie_partition_size: Option<u64>,
+    /// True when ≥1 of BITSTREAM / AIE_PARTITION section headers is present.
+    pub has_cu_pdi_offset_surface: bool,
+    /// True when any present CU/PDI window is OOB vs `file_len`.
+    pub any_oob: bool,
+    /// True when every present CU/PDI window is in-bounds (false if none present).
+    pub all_present_in_bounds: bool,
+    /// Always **false**: body bounds alone never closes FW residual / invent Pass.
+    pub body_bounds_alone_closes_fw_residual: bool,
+    /// Always **true**: no private PDI layout invent.
+    pub do_not_invent_pdi_layout: bool,
+    /// Always **false**: public image decode remains closed.
+    pub public_pdi_image_decode: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for CuPdiSectionBodyBoundsResearch {
+    fn default() -> Self {
+        Self {
+            file_len: 0,
+            magic_xclbin2: false,
+            bitstream_in_bounds: None,
+            aie_partition_in_bounds: None,
+            bitstream_offset: None,
+            bitstream_size: None,
+            aie_partition_offset: None,
+            aie_partition_size: None,
+            has_cu_pdi_offset_surface: false,
+            any_oob: false,
+            all_present_in_bounds: false,
+            body_bounds_alone_closes_fw_residual: false,
+            do_not_invent_pdi_layout: true,
+            public_pdi_image_decode: false,
+            detail: "default_empty_bytes".into(),
+        }
+    }
+}
+
+impl CuPdiSectionBodyBoundsResearch {
+    /// Soft research note (always honesty trio; never invent Pass / product known-good).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "cu_pdi_section_body_bounds_research".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            "body_bounds_alone_closes_fw_residual=0".into(),
+            format!("file_len={}", self.file_len),
+            format!("magic_xclbin2={}", u8::from(self.magic_xclbin2)),
+            format!(
+                "has_cu_pdi_offset_surface={}",
+                u8::from(self.has_cu_pdi_offset_surface)
+            ),
+            format!("any_oob={}", u8::from(self.any_oob)),
+            format!(
+                "all_present_in_bounds={}",
+                u8::from(self.all_present_in_bounds)
+            ),
+        ];
+        match self.bitstream_in_bounds {
+            Some(true) => parts.push("bitstream_in_bounds=1".into()),
+            Some(false) => parts.push("bitstream_in_bounds=0".into()),
+            None => parts.push("bitstream_in_bounds=absent".into()),
+        }
+        match self.aie_partition_in_bounds {
+            Some(true) => parts.push("aie_partition_in_bounds=1".into()),
+            Some(false) => parts.push("aie_partition_in_bounds=0".into()),
+            None => parts.push("aie_partition_in_bounds=absent".into()),
+        }
+        match self.bitstream_offset {
+            Some(o) => parts.push(format!("bitstream_offset={o}")),
+            None => parts.push("bitstream_offset=absent".into()),
+        }
+        match self.bitstream_size {
+            Some(s) => parts.push(format!("bitstream_size={s}")),
+            None => parts.push("bitstream_size=absent".into()),
+        }
+        match self.aie_partition_offset {
+            Some(o) => parts.push(format!("aie_partition_offset={o}")),
+            None => parts.push("aie_partition_offset=absent".into()),
+        }
+        match self.aie_partition_size {
+            Some(s) => parts.push(format!("aie_partition_size={s}")),
+            None => parts.push("aie_partition_size=absent".into()),
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Research CU/PDI body bounds from an offset map + file length (no body decode).
+///
+/// Stamp `2c4b96bf`. Soft only; always `body_bounds_alone_closes_fw_residual=false`.
+#[must_use]
+pub fn research_cu_pdi_section_body_bounds_from_offset_map(
+    map: &CuPdiSectionOffsetMapResearch,
+    file_len: u64,
+) -> CuPdiSectionBodyBoundsResearch {
+    if !map.magic_xclbin2 && map.detail == "default_empty_bytes" && file_len == 0 {
+        return CuPdiSectionBodyBoundsResearch::default();
+    }
+    if !map.magic_xclbin2 {
+        return CuPdiSectionBodyBoundsResearch {
+            file_len,
+            magic_xclbin2: false,
+            detail: if map.detail.is_empty() {
+                "magic_not_xclbin2".into()
+            } else {
+                map.detail.clone()
+            },
+            ..CuPdiSectionBodyBoundsResearch::default()
+        };
+    }
+    if !map.has_cu_pdi_offset_surface {
+        let detail = if map.detail.is_empty() {
+            "no_cu_pdi_section_headers".into()
+        } else {
+            map.detail.clone()
+        };
+        return CuPdiSectionBodyBoundsResearch {
+            file_len,
+            magic_xclbin2: true,
+            bitstream_offset: map.bitstream_offset,
+            bitstream_size: map.bitstream_size,
+            aie_partition_offset: map.aie_partition_offset,
+            aie_partition_size: map.aie_partition_size,
+            has_cu_pdi_offset_surface: false,
+            detail,
+            ..CuPdiSectionBodyBoundsResearch::default()
+        };
+    }
+
+    let bs_bounds = match (map.bitstream_offset, map.bitstream_size) {
+        (Some(o), Some(s)) => Some(check_axlf_section_body_bounds(file_len, o, s)),
+        _ => None,
+    };
+    let aie_bounds = match (map.aie_partition_offset, map.aie_partition_size) {
+        (Some(o), Some(s)) => Some(check_axlf_section_body_bounds(file_len, o, s)),
+        _ => None,
+    };
+    let bitstream_in_bounds = bs_bounds.as_ref().map(|b| b.in_bounds);
+    let aie_partition_in_bounds = aie_bounds.as_ref().map(|b| b.in_bounds);
+    let any_oob = bitstream_in_bounds == Some(false) || aie_partition_in_bounds == Some(false);
+    let present =
+        usize::from(bitstream_in_bounds.is_some()) + usize::from(aie_partition_in_bounds.is_some());
+    let present_ok = usize::from(bitstream_in_bounds == Some(true))
+        + usize::from(aie_partition_in_bounds == Some(true));
+    let all_present_in_bounds = present > 0 && present_ok == present;
+
+    let detail = if all_present_in_bounds && present == 2 {
+        "cu_pdi_body_windows_in_bounds"
+    } else if all_present_in_bounds {
+        "cu_pdi_body_window_in_bounds_partial_surface"
+    } else if any_oob && present_ok > 0 {
+        "cu_pdi_body_windows_partial_oob"
+    } else if any_oob {
+        "cu_pdi_body_windows_oob"
+    } else {
+        "cu_pdi_body_bounds_unknown"
+    };
+
+    CuPdiSectionBodyBoundsResearch {
+        file_len,
+        magic_xclbin2: true,
+        bitstream_in_bounds,
+        aie_partition_in_bounds,
+        bitstream_offset: map.bitstream_offset,
+        bitstream_size: map.bitstream_size,
+        aie_partition_offset: map.aie_partition_offset,
+        aie_partition_size: map.aie_partition_size,
+        has_cu_pdi_offset_surface: true,
+        any_oob,
+        all_present_in_bounds,
+        body_bounds_alone_closes_fw_residual: false,
+        do_not_invent_pdi_layout: true,
+        public_pdi_image_decode: false,
+        detail: detail.into(),
+    }
+}
+
+/// Research BITSTREAM / AIE_PARTITION body windows from axlf bytes (headers + len).
+///
+/// Pure offline TDD surface (stamp `2c4b96bf`). Parses section **headers** via
+/// [`research_xclbin_cu_pdi_section_offset_map`], then checks body windows against
+/// `bytes.len()` — **never** slices or decodes section bodies / invents PDI /
+/// product known-good / residual closed.
+///
+/// Soft only; always `body_bounds_alone_closes_fw_residual=false`.
+#[must_use]
+pub fn research_xclbin_cu_pdi_section_body_bounds(bytes: &[u8]) -> CuPdiSectionBodyBoundsResearch {
+    #[allow(clippy::cast_possible_truncation)]
+    let file_len = bytes.len() as u64;
+    let map = research_xclbin_cu_pdi_section_offset_map(bytes);
+    research_cu_pdi_section_body_bounds_from_offset_map(&map, file_len)
+}
+
+/// Corpus fingerprint of patched (and unpatched) ctrltext after rela apply.
+///
+/// Pure offline research for future byte-diff vs a known-good image. **Not**
+/// Pass evidence. Sha of **patched** bytes depends on IO paddrs; prefer
+/// structural locks (`patched_len`, `rela_count`, classic header) and
+/// [`Self::unpatched_sha256_hex`] for paddr-stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PatchedCtrltextFingerprint {
+    /// Length of patched ctrltext when patch+walk produced bytes.
+    pub patched_len: Option<usize>,
+    /// Classic v0.1 walk OK after rela overwrite.
+    pub classic_walk_ok: bool,
+    /// `.rela.dyn` entry count when parseable.
+    pub rela_count: Option<usize>,
+    /// Staged mladf classic profile (1688 B / gen4 / 8×6 class) when true.
+    pub staged_mladf_classic_profile: bool,
+    /// Classic header `num_ops` when walkable (staged mladf = 40).
+    pub txn_num_ops: Option<u32>,
+    /// Classic header `dev_gen` (u8; staged mladf = 4).
+    pub txn_dev_gen: Option<u8>,
+    /// Classic header cols (u8; staged 8×6).
+    pub txn_num_cols: Option<u8>,
+    /// Classic header rows (u8; staged 8×6).
+    pub txn_num_rows: Option<u8>,
+    /// SHA-256 of **patched** ctrltext (paddr-dependent). Empty if absent.
+    pub patched_sha256_hex: String,
+    /// SHA-256 of **unpatched** peeled ctrltext (stable across paddrs). Empty if absent.
+    pub unpatched_sha256_hex: String,
+    /// Soft detail (`elf_empty`, `invalid_live_paddr`, `classic_walk_ok`, …).
+    pub detail: String,
+}
+
+impl PatchedCtrltextFingerprint {
+    /// Soft research note (honesty trio; documents paddr dependence of patched sha).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "patched_ctrltext_fingerprint".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!("classic_walk_ok={}", u8::from(self.classic_walk_ok)),
+            format!(
+                "staged_mladf_classic_profile={}",
+                u8::from(self.staged_mladf_classic_profile)
+            ),
+        ];
+        if let Some(n) = self.patched_len {
+            parts.push(format!("patched_len={n}"));
+        }
+        if let Some(n) = self.rela_count {
+            parts.push(format!("rela_count={n}"));
+        }
+        if let Some(n) = self.txn_num_ops {
+            parts.push(format!("txn_num_ops={n}"));
+        }
+        if let Some(g) = self.txn_dev_gen {
+            parts.push(format!("txn_dev_gen={g}"));
+        }
+        if let Some(c) = self.txn_num_cols {
+            parts.push(format!("txn_num_cols={c}"));
+        }
+        if let Some(r) = self.txn_num_rows {
+            parts.push(format!("txn_num_rows={r}"));
+        }
+        // Only claim paddr dependence when a patched sha is present.
+        if self.patched_sha256_hex.is_empty() {
+            parts.push("patched_sha=absent".into());
+        } else {
+            parts.push("patched_sha_depends_on_paddrs=1".into());
+            parts.push(format!("patched_sha256={}", self.patched_sha256_hex));
+        }
+        if !self.unpatched_sha256_hex.is_empty() {
+            parts.push(format!("unpatched_sha256={}", self.unpatched_sha256_hex));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Fingerprint peeled/patched ctrltext after rela with supplied IO paddrs.
+///
+/// Returns `None` only when inputs are empty (soft-skip). Invalid paddrs /
+/// non-ELF still return a fingerprint bag with honesty detail (no invent Pass).
+/// Prefer structural fields + `unpatched_sha256_hex` when locking unit tests;
+/// `patched_sha256_hex` is stable only for a **fixed** paddr set.
+#[must_use]
+pub fn fingerprint_patched_ctrltext_after_rela(
+    elf: &[u8],
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    ctrl: u64,
+) -> Option<PatchedCtrltextFingerprint> {
+    if elf.is_empty() {
+        return None;
+    }
+    let unpatched_sha = if is_aiebu_elf_ctrltext(elf) {
+        super::txn::instruction_payload_bytes(elf)
+            .ok()
+            .map(|p| sha256_hex_lower(&p))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let research = profile_instr_payload_after_rela(elf, ifm, wts, ofm, ctrl);
+    let pay = research.payload.as_ref();
+    Some(PatchedCtrltextFingerprint {
+        patched_len: research.rela_audit.patched_ctrltext_len,
+        classic_walk_ok: research.rela_audit.patched_ctrltext_walk_ok
+            && pay.is_some_and(|p| p.classic_walk_ok),
+        rela_count: research.rela_audit.rela_count,
+        staged_mladf_classic_profile: pay.is_some_and(|p| p.staged_mladf_classic_profile),
+        txn_num_ops: pay.and_then(|p| p.txn_num_ops),
+        txn_dev_gen: pay.and_then(|p| p.txn_dev_gen),
+        txn_num_cols: pay.and_then(|p| p.txn_num_cols),
+        txn_num_rows: pay.and_then(|p| p.txn_num_rows),
+        patched_sha256_hex: pay
+            .map(|p| p.payload_sha256_hex.clone())
+            .unwrap_or_default(),
+        unpatched_sha256_hex: unpatched_sha,
+        detail: research.detail,
+    })
+}
+
+/// Convenience: fingerprint with locked C2 live IO paddrs (research only).
+#[must_use]
+pub fn fingerprint_patched_ctrltext_after_rela_c2_locked(
+    elf: &[u8],
+) -> Option<PatchedCtrltextFingerprint> {
+    let (_instr, ifm, wts, ofm, ctrl) = c2_live_io_paddrs_locked();
+    fingerprint_patched_ctrltext_after_rela(elf, ifm, wts, ofm, ctrl)
+}
+
+// ---------------------------------------------------------------------------
+// Construction residual: fingerprint export + external ctrltext compare (no Pass)
+// ---------------------------------------------------------------------------
+
+/// Soft-note / export token: no known-good **external** ctrltext offline yet.
+///
+/// Local pure-direct oracle (`gt_capture/instr_post_patch.bin`) is **not** this —
+/// it is our own patched peel, not a working public-stack capture. Export APIs
+/// keep this status until a real external known-good is supplied to the compare
+/// helper. Never equals Pass / C-ready / `ran_on_npu`.
+pub const KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN: &str = "absent_awaiting_capture";
+
+/// Soft-note bag name for [`CtrltextFingerprintExport::format_soft_note`].
+pub const CTRLTEXT_FINGERPRINT_EXPORT_NOTE: &str = "ctrltext_fingerprint_export";
+
+/// Soft-note bag name for [`ExternalCtrltextCompareResearch::format_soft_note`].
+pub const EXTERNAL_CTRLTEXT_COMPARE_NOTE: &str = "external_ctrltext_compare";
+
+/// Exportable unpatched ctrltext identity for later external known-good compare.
+///
+/// Pure offline research bag. Locks structural fields + paddr-stable
+/// [`Self::unpatched_sha256_hex`]. **Always** reports
+/// [`KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN`] from constructors — this API never invents
+/// known-good external bytes. Compare via
+/// [`compare_external_ctrltext_to_lab_export`] when external bytes arrive.
+///
+/// Honesty: export identity **≠** Pass **≠** C-ready **≠** `ran_on_npu`.
+/// Matching our failing silicon_lab corpus is research only (FW still
+/// `0x3000003`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct CtrltextFingerprintExport {
+    /// Peeled unpatched ctrltext length when aiebu present.
+    pub ctrltext_len: Option<usize>,
+    /// `.rela.dyn` entry count when parseable (None for non-aiebu).
+    pub rela_count: Option<usize>,
+    /// Classic v0.1 walk OK on **unpatched** peel.
+    pub classic_walk_ok: bool,
+    /// Staged mladf classic profile (1688 / gen4 / 8×6) on unpatched peel.
+    pub staged_mladf_classic_profile: bool,
+    /// Classic header `num_ops` when walkable.
+    pub txn_num_ops: Option<u32>,
+    /// Classic header `dev_gen` (u8).
+    pub txn_dev_gen: Option<u8>,
+    /// Classic header cols (u8).
+    pub txn_num_cols: Option<u8>,
+    /// Classic header rows (u8).
+    pub txn_num_rows: Option<u8>,
+    /// SHA-256 of **unpatched** peeled ctrltext (stable; empty if peel absent).
+    pub unpatched_sha256_hex: String,
+    /// Always **false** from [`export_ctrltext_fingerprint_research`] — do not invent.
+    pub known_good_present: bool,
+    /// [`KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN`] from production export path.
+    pub known_good_status: &'static str,
+    /// Research detail (`elf_empty`, `classic_unpatched_ok`, …).
+    pub detail: String,
+}
+
+impl Default for CtrltextFingerprintExport {
+    fn default() -> Self {
+        Self {
+            ctrltext_len: None,
+            rela_count: None,
+            classic_walk_ok: false,
+            staged_mladf_classic_profile: false,
+            txn_num_ops: None,
+            txn_dev_gen: None,
+            txn_num_cols: None,
+            txn_num_rows: None,
+            unpatched_sha256_hex: String::new(),
+            known_good_present: false,
+            known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
+            detail: "default_known_good_absent".into(),
+        }
+    }
+}
+
+impl CtrltextFingerprintExport {
+    /// True when export reports known-good external still absent (production path).
+    #[must_use]
+    pub fn is_known_good_absent(&self) -> bool {
+        !self.known_good_present && self.known_good_status == KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN
+    }
+
+    /// Soft research note (always honesty trio; never invent Pass / C-ready).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            CTRLTEXT_FINGERPRINT_EXPORT_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            format!("classic_walk_ok={}", u8::from(self.classic_walk_ok)),
+            format!(
+                "staged_mladf_classic_profile={}",
+                u8::from(self.staged_mladf_classic_profile)
+            ),
+            format!("known_good_present={}", u8::from(self.known_good_present)),
+            format!(
+                "known_good_status={}",
+                sanitize_soft_note_field_value(self.known_good_status)
+            ),
+            format!(
+                "known_good_absent={}",
+                u8::from(self.is_known_good_absent())
+            ),
+        ];
+        if let Some(n) = self.ctrltext_len {
+            parts.push(format!("ctrltext_len={n}"));
+        }
+        if let Some(n) = self.rela_count {
+            parts.push(format!("rela_count={n}"));
+        }
+        if let Some(n) = self.txn_num_ops {
+            parts.push(format!("txn_num_ops={n}"));
+        }
+        if let Some(g) = self.txn_dev_gen {
+            parts.push(format!("txn_dev_gen={g}"));
+        }
+        if let Some(c) = self.txn_num_cols {
+            parts.push(format!("txn_num_cols={c}"));
+        }
+        if let Some(r) = self.txn_num_rows {
+            parts.push(format!("txn_num_rows={r}"));
+        }
+        if self.unpatched_sha256_hex.is_empty() {
+            parts.push("unpatched_sha=absent".into());
+        } else {
+            parts.push(format!("unpatched_sha256={}", self.unpatched_sha256_hex));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+
+    /// Portable key=value export text for offline bags (when known-good arrives later).
+    ///
+    /// Same honesty tokens as [`Self::format_soft_note`]; one field per line for
+    /// easy `diff` / archival. **Not** a Pass snapshot.
+    ///
+    /// **Contract:** soft-note field values are single tokens only (via
+    /// [`sanitize_soft_note_field_value`] / hex / numeric). Splitting on space
+    /// is safe under that contract; do not add unsanitized multi-word values.
+    #[must_use]
+    pub fn format_export_text(&self) -> String {
+        // Reuse soft-note tokens; split on space into lines for bag files.
+        // Safe only while values remain single tokens (see rustdoc contract).
+        self.format_soft_note().replace(' ', "\n")
+    }
+}
+
+/// Build a fingerprint export from an aiebu ELF (unpatched peel + structural).
+///
+/// - Empty / non-aiebu → honesty bag with `known_good_absent`; no invent sha.
+/// - Valid aiebu → structural + unpatched sha; **still**
+///   [`KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN`] (export is lab identity, not known-good).
+/// - Does **not** apply rela (paddr-independent identity).
+/// - Always soft; never Pass / C-ready / second unlock.
+#[must_use]
+pub fn export_ctrltext_fingerprint_research(elf: &[u8]) -> CtrltextFingerprintExport {
+    if elf.is_empty() {
+        return CtrltextFingerprintExport {
+            detail: "elf_empty".into(),
+            ..CtrltextFingerprintExport::default()
+        };
+    }
+    if !is_aiebu_elf_ctrltext(elf) {
+        return CtrltextFingerprintExport {
+            detail: "not_aiebu_elf_ctrltext".into(),
+            ..CtrltextFingerprintExport::default()
+        };
+    }
+    let rela_count = parse_elf32_rela_dyn(elf).ok().map(|r| r.len());
+    let Ok(peeled) = super::txn::instruction_payload_bytes(elf) else {
+        return CtrltextFingerprintExport {
+            rela_count,
+            detail: "ctrltext_peel_failed".into(),
+            ..CtrltextFingerprintExport::default()
+        };
+    };
+    let profile = profile_instr_payload_bytes(&peeled);
+    let detail = if profile.classic_walk_ok && profile.staged_mladf_classic_profile {
+        "silicon_lab_structural_ok".into()
+    } else if profile.classic_walk_ok {
+        "classic_unpatched_ok".into()
+    } else {
+        "ctrltext_not_classic_walkable".into()
+    };
+    CtrltextFingerprintExport {
+        ctrltext_len: Some(peeled.len()),
+        rela_count,
+        classic_walk_ok: profile.classic_walk_ok,
+        staged_mladf_classic_profile: profile.staged_mladf_classic_profile,
+        txn_num_ops: profile.txn_num_ops,
+        txn_dev_gen: profile.txn_dev_gen,
+        txn_num_cols: profile.txn_num_cols,
+        txn_num_rows: profile.txn_num_rows,
+        unpatched_sha256_hex: sha256_hex_lower(&peeled),
+        known_good_present: false,
+        known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
+        detail,
+    }
+}
+
+/// Offline compare of optional external ctrltext bytes vs a lab fingerprint export.
+///
+/// Soft research only:
+/// - Empty / missing external → `known_good_absent=1` (awaiting capture).
+/// - Present external → sha/len/structural diff vs lab unpatched peel.
+/// - **Even** `sha_match=1` is **not** Pass (may match our failing corpus; FW
+///   residual still open). Never invents C-ready / `ran_on_npu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ExternalCtrltextCompareResearch {
+    /// Lab unpatched sha (echo from export).
+    pub lab_unpatched_sha256_hex: String,
+    /// Lab ctrltext length when known.
+    pub lab_len: Option<usize>,
+    /// True when non-empty external bytes were supplied.
+    pub external_present: bool,
+    /// SHA-256 of external bytes (empty when absent).
+    pub external_sha256_hex: String,
+    /// External byte length when present.
+    pub external_len: Option<usize>,
+    /// `external_len == lab_len` when both known.
+    pub len_match: bool,
+    /// External sha equals lab unpatched sha (both non-empty).
+    pub sha_match: bool,
+    /// Classic walk OK on external bytes.
+    pub external_classic_walk_ok: bool,
+    /// Echo of lab classic walk.
+    pub lab_classic_walk_ok: bool,
+    /// External matches staged mladf classic profile.
+    pub external_staged_mladf_classic_profile: bool,
+    /// Echo of lab staged profile bit.
+    pub lab_staged_mladf_classic_profile: bool,
+    /// len + classic + staged profile bits all agree (research; ≠ Pass).
+    pub structural_match: bool,
+    /// True when external missing/empty (awaiting capture). False when bytes
+    /// were supplied for research compare — still **not** product known-good /
+    /// Pass (see soft-note honesty trio + always `known_good_present=0` /
+    /// `product_known_good=0` on [`Self::format_soft_note`]).
+    pub known_good_absent: bool,
+    /// Research detail token.
+    pub detail: String,
+}
+
+impl Default for ExternalCtrltextCompareResearch {
+    fn default() -> Self {
+        Self {
+            lab_unpatched_sha256_hex: String::new(),
+            lab_len: None,
+            external_present: false,
+            external_sha256_hex: String::new(),
+            external_len: None,
+            len_match: false,
+            sha_match: false,
+            external_classic_walk_ok: false,
+            lab_classic_walk_ok: false,
+            external_staged_mladf_classic_profile: false,
+            lab_staged_mladf_classic_profile: false,
+            structural_match: false,
+            known_good_absent: true,
+            detail: "default_known_good_absent".into(),
+        }
+    }
+}
+
+impl ExternalCtrltextCompareResearch {
+    /// Soft research note (always honesty trio; sha_match ≠ invent Pass).
+    ///
+    /// Always emits `known_good_present=0` and `product_known_good=0` so a
+    /// log skim cannot confuse `known_good_absent=0` (research external bytes
+    /// supplied) with product known-good capture.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            EXTERNAL_CTRLTEXT_COMPARE_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            // Explicit product-known-good denial even when external_present=1
+            // (research bytes / lab self-peel are never product known-good).
+            "known_good_present=0".into(),
+            "product_known_good=0".into(),
+            format!("external_present={}", u8::from(self.external_present)),
+            format!("known_good_absent={}", u8::from(self.known_good_absent)),
+            format!("len_match={}", u8::from(self.len_match)),
+            format!("sha_match={}", u8::from(self.sha_match)),
+            format!("structural_match={}", u8::from(self.structural_match)),
+            format!(
+                "external_classic_walk_ok={}",
+                u8::from(self.external_classic_walk_ok)
+            ),
+            format!("lab_classic_walk_ok={}", u8::from(self.lab_classic_walk_ok)),
+            format!(
+                "external_staged_mladf_classic_profile={}",
+                u8::from(self.external_staged_mladf_classic_profile)
+            ),
+            format!(
+                "lab_staged_mladf_classic_profile={}",
+                u8::from(self.lab_staged_mladf_classic_profile)
+            ),
+        ];
+        if let Some(n) = self.lab_len {
+            parts.push(format!("lab_len={n}"));
+        }
+        if let Some(n) = self.external_len {
+            parts.push(format!("external_len={n}"));
+        }
+        if !self.lab_unpatched_sha256_hex.is_empty() {
+            parts.push(format!(
+                "lab_unpatched_sha256={}",
+                self.lab_unpatched_sha256_hex
+            ));
+        }
+        if !self.external_sha256_hex.is_empty() {
+            parts.push(format!("external_sha256={}", self.external_sha256_hex));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Compare optional external ctrltext bytes to a lab fingerprint export.
+///
+/// - `external = None` or empty slice → known-good absent bag (awaiting capture).
+/// - Non-empty → profile + sha/len vs lab; soft only.
+/// - Never claims Pass even on full match.
+#[must_use]
+pub fn compare_external_ctrltext_to_lab_export(
+    lab: &CtrltextFingerprintExport,
+    external: Option<&[u8]>,
+) -> ExternalCtrltextCompareResearch {
+    let lab_sha = lab.unpatched_sha256_hex.clone();
+    let lab_len = lab.ctrltext_len;
+    let lab_classic = lab.classic_walk_ok;
+    let lab_staged = lab.staged_mladf_classic_profile;
+
+    let Some(ext) = external.filter(|b| !b.is_empty()) else {
+        return ExternalCtrltextCompareResearch {
+            lab_unpatched_sha256_hex: lab_sha,
+            lab_len,
+            external_present: false,
+            external_sha256_hex: String::new(),
+            external_len: None,
+            len_match: false,
+            sha_match: false,
+            external_classic_walk_ok: false,
+            lab_classic_walk_ok: lab_classic,
+            external_staged_mladf_classic_profile: false,
+            lab_staged_mladf_classic_profile: lab_staged,
+            structural_match: false,
+            known_good_absent: true,
+            detail: "external_absent_awaiting_capture".into(),
+        };
+    };
+
+    let ext_profile = profile_instr_payload_bytes(ext);
+    let ext_sha = sha256_hex_lower(ext);
+    let ext_len = ext.len();
+    let len_match = lab_len == Some(ext_len);
+    let sha_match = !lab_sha.is_empty() && lab_sha == ext_sha;
+    // Positive structural claim requires meaningful classic structure on both
+    // sides (not dual non-walkable same-length garbage reporting match=1).
+    let structural_match = len_match
+        && lab_classic
+        && ext_profile.classic_walk_ok
+        && ext_profile.staged_mladf_classic_profile == lab_staged
+        && ext_profile.txn_num_ops == lab.txn_num_ops
+        && ext_profile.txn_dev_gen == lab.txn_dev_gen
+        && ext_profile.txn_num_cols == lab.txn_num_cols
+        && ext_profile.txn_num_rows == lab.txn_num_rows;
+    let detail = if sha_match && structural_match {
+        // Match to lab unpatched peel — still not a known-good working-stack capture.
+        "sha_and_structural_match_lab_unpatched".into()
+    } else if sha_match {
+        "sha_match_lab_unpatched".into()
+    } else if structural_match {
+        "structural_match_sha_diff".into()
+    } else if len_match {
+        "len_match_content_diff".into()
+    } else {
+        "external_differs_from_lab".into()
+    };
+
+    ExternalCtrltextCompareResearch {
+        lab_unpatched_sha256_hex: lab_sha,
+        lab_len,
+        external_present: true,
+        external_sha256_hex: ext_sha,
+        external_len: Some(ext_len),
+        len_match,
+        sha_match,
+        external_classic_walk_ok: ext_profile.classic_walk_ok,
+        lab_classic_walk_ok: lab_classic,
+        external_staged_mladf_classic_profile: ext_profile.staged_mladf_classic_profile,
+        lab_staged_mladf_classic_profile: lab_staged,
+        structural_match,
+        // Bytes present for research compare — still never product known-good /
+        // Pass (`invent_pass=0` soft note). Working public-stack capture is open.
+        known_good_absent: false,
+        detail,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External known-good bag confinement + load (feed compare when bytes arrive)
+// ---------------------------------------------------------------------------
+
+/// Subdir under `testdata/xdna2_cmd/` for operator-placed external known-good bags.
+///
+/// Local pure-direct oracles (`gt_capture/instr_post_patch.bin`, etc.) live
+/// **outside** this tree and are **refused** as known-good. Bins under this
+/// subdir stay gitignored; tracked `PROVENANCE.md` documents the capture.
+pub const EXTERNAL_KNOWN_GOOD_SUBDIR: &str = "external_known_good";
+
+/// Env: optional path to external ctrltext for soft classify compare.
+///
+/// Soft only. Path must pass [`external_known_good_load_path_is_allowed`].
+/// Loading for research **≠** product known-good **≠** Pass **≠** C-ready.
+pub const ENV_LAB_EXTERNAL_CTRLTEXT: &str = "XDNA2_LAB_EXTERNAL_CTRLTEXT";
+
+/// Basenames that are local pure-direct / vendor post-patch oracles — never
+/// treated as working public-stack known-good by default.
+const REFUSED_KNOWN_GOOD_BASENAMES: &[&str] = &[
+    "instr_post_patch.bin",
+    "instr_vendor_post_patch.bin",
+    "ctrl_post_patch.bin",
+    "instr_raw_txn.bin",
+    "instr_vendor_txn_bin.bin",
+];
+
+/// True when `path` basenames a local post-patch / pure-direct oracle that must
+/// **not** be treated as external known-good.
+///
+/// Pure path check (basename only). Complements dedicated-subdir confinement.
+#[must_use]
+pub fn is_refused_local_post_patch_as_known_good(path: &std::path::Path) -> bool {
+    path.file_name().is_some_and(|n| {
+        let s = n.to_string_lossy();
+        REFUSED_KNOWN_GOOD_BASENAMES
+            .iter()
+            .any(|b| s.eq_ignore_ascii_case(b))
+    })
+}
+
+/// True when the final path component has an allowed external bag extension.
+///
+/// Allowed: `.bin`, `.ctrltext` (case-insensitive). Not `.json` / `.elf` —
+/// known-good compare expects raw ctrltext bytes, not whole ELF/meta.
+#[must_use]
+pub fn external_ctrltext_extension_ok(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin") || ext.eq_ignore_ascii_case("ctrltext"))
+}
+
+/// Lab root for external known-good bags: `testdata/xdna2_cmd/external_known_good`.
+#[must_use]
+pub fn external_known_good_lab_root() -> std::path::PathBuf {
+    let lab = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/xdna2_cmd")
+        .join(EXTERNAL_KNOWN_GOOD_SUBDIR);
+    std::fs::canonicalize(&lab).unwrap_or(lab)
+}
+
+/// True when `path` is under clamped temp root or the dedicated external bag root.
+fn path_under_external_known_good_roots(path: &std::path::Path) -> bool {
+    let temp_root = last_apply_temp_root();
+    let bag_root = external_known_good_lab_root();
+    path.starts_with(&temp_root) || path.starts_with(&bag_root)
+}
+
+/// Whether an external known-good **path** is allowed (roots + extension + refuse).
+///
+/// **Confinement** (mirrors [`last_apply_path_is_allowed`]):
+/// - Under [`last_apply_temp_root`] **or** [`external_known_good_lab_root`]
+/// - Extension `.bin` / `.ctrltext` only
+/// - No `..` components
+/// - Refuse local post-patch oracle basenames
+/// - Resolve intermediate dir symlinks via `canonicalize(parent)` before root check
+///
+/// Does **not** require PROVENANCE (that is a load-time check for lab bag paths).
+/// Does **not** open the file.
+#[must_use]
+pub fn external_known_good_path_is_allowed(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if !external_ctrltext_extension_ok(path) {
+        return false;
+    }
+    if is_refused_local_post_patch_as_known_good(path) {
+        return false;
+    }
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return path_under_external_known_good_roots(path);
+    };
+    if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+        let candidate = canon_parent.join(path.file_name().unwrap_or_default());
+        // Re-check refuse on resolved candidate basename (same as path usually).
+        if is_refused_local_post_patch_as_known_good(&candidate) {
+            return false;
+        }
+        path_under_external_known_good_roots(&candidate)
+    } else if path.is_absolute() {
+        // Absolute + missing parent: cannot prove confinement → refuse.
+        false
+    } else {
+        path_under_external_known_good_roots(path)
+    }
+}
+
+/// Soft-load path: path roots + refuse final-component symlink + re-check
+/// resolved real path under allowed roots when the file exists.
+///
+/// Lab-bag paths (under [`external_known_good_lab_root`]) additionally require a
+/// **research-ready** sibling/parent [`PROVENANCE.md`] via
+/// [`external_known_good_provenance_research_ready`] (non-empty + research-only
+/// marker + source/stack marker + no product Pass invent tokens) so local
+/// pure-direct dumps cannot be renamed into the bag without honest notes.
+/// Temp-dir files used by unit tests do **not** require PROVENANCE.
+///
+/// **Fail-closed:** if the path exists but `canonicalize` fails (permissions /
+/// transient FS), refuse — cannot prove resolved roots or lab-bag PROVENANCE.
+///
+/// Residual TOCTOU after this check: [`load_external_ctrltext_for_compare`] opens
+/// with Unix `O_NOFOLLOW` as defense-in-depth (same posture as soft last_apply
+/// JSON in the classify example).
+#[must_use]
+pub fn external_known_good_load_path_is_allowed(path: &std::path::Path) -> bool {
+    if !external_known_good_path_is_allowed(path) {
+        return false;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+    }
+    if path.exists() {
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            // Fail closed: cannot re-check roots / bag PROVENANCE.
+            return false;
+        };
+        if !path_under_external_known_good_roots(&canon) {
+            return false;
+        }
+        if is_refused_local_post_patch_as_known_good(&canon) {
+            return false;
+        }
+        // Lab bag only: require research-ready PROVENANCE (fields + refuse invent).
+        // Pure gate = [`external_known_good_lab_bag_provenance_allows_load`].
+        let bag = external_known_good_lab_root();
+        if canon.starts_with(&bag)
+            && !external_known_good_lab_bag_provenance_allows_load(
+                read_external_known_good_provenance_text(&canon).as_deref(),
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when a non-empty `PROVENANCE.md` exists next to `path` or in its parent
+/// directory (lab bag honesty token). Whitespace-only counts as empty.
+///
+/// For **research-present** eligibility (field markers + refuse product Pass
+/// claims), use [`external_known_good_provenance_research_ready`] /
+/// [`validate_external_known_good_provenance_text`].
+#[must_use]
+pub fn external_known_good_provenance_present(path: &std::path::Path) -> bool {
+    read_external_known_good_provenance_text(path).is_some()
+}
+
+/// Read first non-empty `PROVENANCE.md` for a bag path.
+///
+/// **Candidates (no grandparent walk outside the bag):**
+/// 1. Immediate parent `PROVENANCE.md` (subdir sibling note).
+/// 2. When `path` is under [`external_known_good_lab_root`], also the **bag root**
+///    `external_known_good/PROVENANCE.md` (lab bag owns its research-ready note).
+///
+/// Does **not** accept `testdata/xdna2_cmd/PROVENANCE.md` (grandparent of the lab
+/// bag) — that would weaken “lab bag requires its own research-ready PROVENANCE.”
+/// Temp-dir research files use parent only (no grandparent).
+///
+/// Returns `None` when missing, not a file, empty, or whitespace-only.
+#[must_use]
+pub fn read_external_known_good_provenance_text(path: &std::path::Path) -> Option<String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(parent) = path.parent() {
+        candidates.push(parent.join("PROVENANCE.md"));
+    }
+    // Lab bag only: bag-root PROVENANCE when path is nested under the bag.
+    // (Immediate parent already covers bag/foo.bin → bag/PROVENANCE.md.)
+    let bag = external_known_good_lab_root();
+    let under_bag = path.starts_with(&bag)
+        || std::fs::canonicalize(path).is_ok_and(|c| c.starts_with(&bag))
+        || path
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .is_some_and(|cp| cp.starts_with(&bag));
+    if under_bag {
+        let bag_prov = bag.join("PROVENANCE.md");
+        if !candidates.iter().any(|c| c == &bag_prov) {
+            candidates.push(bag_prov);
+        }
+    }
+    for cand in candidates {
+        if let Ok(meta) = std::fs::metadata(&cand) {
+            if !meta.is_file() || meta.len() == 0 {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&cand) {
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fail-closed PROVENANCE field check for external known-good research bags.
+///
+/// Research only — passing this check **≠** product known-good **≠** Pass
+/// **≠** C-ready **≠** second unlock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ExternalKnownGoodProvenanceCheck {
+    /// Text was non-empty after trim.
+    pub non_empty: bool,
+    /// Honesty language: research-only / not product Pass / not C-ready.
+    pub has_research_only_marker: bool,
+    /// Source/stack section or public-stack language present.
+    pub has_source_stack_marker: bool,
+    /// No product Pass invent tokens (`invent_pass=1`, `ran_on_npu=1`, …).
+    pub refuses_product_pass_claim: bool,
+    /// All required markers pass → bag may be treated as research-present.
+    pub research_present_eligible: bool,
+    /// Stable detail token for soft notes / unit locks.
+    pub detail: String,
+}
+
+impl Default for ExternalKnownGoodProvenanceCheck {
+    fn default() -> Self {
+        Self {
+            non_empty: false,
+            has_research_only_marker: false,
+            has_source_stack_marker: false,
+            refuses_product_pass_claim: true,
+            research_present_eligible: false,
+            detail: "empty".into(),
+        }
+    }
+}
+
+impl ExternalKnownGoodProvenanceCheck {
+    /// Soft research note (always honesty trio; never invent Pass).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "external_known_good_provenance_check".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            format!("non_empty={}", u8::from(self.non_empty)),
+            format!(
+                "has_research_only_marker={}",
+                u8::from(self.has_research_only_marker)
+            ),
+            format!(
+                "has_source_stack_marker={}",
+                u8::from(self.has_source_stack_marker)
+            ),
+            format!(
+                "refuses_product_pass_claim={}",
+                u8::from(self.refuses_product_pass_claim)
+            ),
+            format!(
+                "research_present_eligible={}",
+                u8::from(self.research_present_eligible)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// True when ascii-lowered `hay` contains `needle` as a whole alphanumeric token
+/// (split on non-alphanumeric). Used for source-stack marker `xrt` so prose like
+/// `texture` / `extract` does not satisfy the stack marker by accident.
+#[must_use]
+fn provenance_lower_has_alnum_token(hay_lower: &str, needle_lower: &str) -> bool {
+    hay_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == needle_lower)
+}
+
+/// Validate PROVENANCE.md body before treating an external bag as research-present.
+///
+/// **Required (all):**
+/// 1. Non-empty (after trim).
+/// 2. Research-only honesty marker (case-insensitive):
+///    prose `research only` / `not product pass` / `not c-ready` / `not c ready`,
+///    **or** exact token `not_c_ready=1` (not bare substring `not_c_ready`, which
+///    would also match honesty-inverse `not_c_ready=0`).
+/// 3. Source/stack marker (case-insensitive contains one of:
+///    `source stack`, `public stack`, `working public`, `dynamicdispatch`,
+///    `ryzen ai`, or whole-token `xrt`).
+/// 4. Refuse product Pass invent / honesty-inverse tokens (ascii-lower exact):
+///    `invent_pass=1`, `invent_pass=true`, `ran_on_npu=1`, `ran_on_npu=true`,
+///    `c_ready=1`, `product_known_good=1`, `not_c_ready=0`.
+///
+/// Empty / missing markers → `research_present_eligible=false` (fail-closed).
+/// Passing eligibility **≠** product known-good **≠** Pass.
+#[must_use]
+pub fn validate_external_known_good_provenance_text(
+    text: &str,
+) -> ExternalKnownGoodProvenanceCheck {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ExternalKnownGoodProvenanceCheck {
+            non_empty: false,
+            has_research_only_marker: false,
+            has_source_stack_marker: false,
+            refuses_product_pass_claim: true,
+            research_present_eligible: false,
+            detail: "empty".into(),
+        };
+    }
+    // All marker / invent checks on ascii-lower so mixed-case claims cannot bypass.
+    let lower = trimmed.to_ascii_lowercase();
+    let research = lower.contains("research only")
+        || lower.contains("not product pass")
+        || lower.contains("not c-ready")
+        || lower.contains("not c ready")
+        // Exact honesty token only — not substring (avoids `not_c_ready=0`).
+        || residual_note_has_exact_token(&lower, "not_c_ready=1");
+    let source = lower.contains("source stack")
+        || lower.contains("public stack")
+        || lower.contains("working public")
+        || lower.contains("dynamicdispatch")
+        || lower.contains("ryzen ai")
+        // Whole-token `xrt` only (not substring of unrelated words).
+        || provenance_lower_has_alnum_token(&lower, "xrt");
+    // Product invent / honesty-inverse claims as exact soft-note tokens on lower.
+    // Not substring of `not_ran_on_npu=1` / `invent_pass=0`.
+    let invent = residual_note_has_exact_token(&lower, "invent_pass=1")
+        || residual_note_has_exact_token(&lower, "invent_pass=true")
+        || residual_note_has_exact_token(&lower, "ran_on_npu=1")
+        || residual_note_has_exact_token(&lower, "ran_on_npu=true")
+        || residual_note_has_exact_token(&lower, "c_ready=1")
+        || residual_note_has_exact_token(&lower, "product_known_good=1")
+        || residual_note_has_exact_token(&lower, "not_c_ready=0");
+    let refuses = !invent;
+    let eligible = research && source && refuses;
+    let detail = if invent {
+        "product_pass_claim_refused"
+    } else if !research {
+        "missing_research_only_marker"
+    } else if !source {
+        "missing_source_stack_marker"
+    } else {
+        "research_present_eligible"
+    };
+    ExternalKnownGoodProvenanceCheck {
+        non_empty: true,
+        has_research_only_marker: research,
+        has_source_stack_marker: source,
+        refuses_product_pass_claim: refuses,
+        research_present_eligible: eligible,
+        detail: detail.into(),
+    }
+}
+
+/// Pure lab-bag PROVENANCE load gate given already-read text.
+///
+/// `None` / invalid markers / invent tokens → **false** (fail-closed). Used by
+/// [`external_known_good_provenance_research_ready`] and unit-locked so load
+/// path refuse does not depend on mutating the tracked bag on disk.
+///
+/// Research only — eligible **≠** product known-good **≠** Pass **≠** C-ready.
+#[must_use]
+pub fn external_known_good_lab_bag_provenance_allows_load(text: Option<&str>) -> bool {
+    text.is_some_and(|t| validate_external_known_good_provenance_text(t).research_present_eligible)
+}
+
+/// True when lab-bag PROVENANCE next to `path` passes field validation.
+///
+/// Fail-closed: missing/empty/invalid markers → false. Temp-dir test bags do
+/// not need this (load path only requires it under the dedicated lab root).
+#[must_use]
+pub fn external_known_good_provenance_research_ready(path: &std::path::Path) -> bool {
+    external_known_good_lab_bag_provenance_allows_load(
+        read_external_known_good_provenance_text(path).as_deref(),
+    )
+}
+
+/// Load external ctrltext bytes for [`compare_external_ctrltext_to_lab_export`].
+///
+/// **Confinement:** [`external_known_good_load_path_is_allowed`] must pass.
+/// **Size cap:** `MAX_MLADF_LAB_FILE_BYTES` (same ceiling as [`read_lab_file_capped`]).
+/// **Open:** Unix `O_NOFOLLOW` so a final-component symlink race after the load
+/// path check cannot redirect the read (mirrors soft last_apply JSON classify).
+/// Intermediate dir symlinks are already refused by parent canonicalize.
+///
+/// Research only: loaded bytes for compare **≠** product known-good (soft note
+/// always `product_known_good=0`) **≠** Pass **≠** C-ready **≠** second unlock.
+///
+/// # Errors
+///
+/// Path refused / missing / empty / oversize / symlink / I/O.
+pub fn load_external_ctrltext_for_compare(path: &std::path::Path) -> Result<Vec<u8>, DirectError> {
+    if !external_known_good_load_path_is_allowed(path) {
+        return Err(DirectError::InvalidArgument(format!(
+            "external known-good path not allowed (must be under temp_dir or \
+             testdata/xdna2_cmd/{EXTERNAL_KNOWN_GOOD_SUBDIR}, .bin/.ctrltext only, \
+             no .., no symlink escape, not local post-patch oracle; lab bag needs \
+             research-ready PROVENANCE.md: research-only + source/stack markers, \
+             no invent_pass=1 / ran_on_npu=1): {}",
+            path.display()
+        )));
+    }
+    // Re-check final component is not a symlink immediately before open (TOCTOU
+    // window still residual until O_NOFOLLOW open below).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(DirectError::InvalidArgument(format!(
+                "external known-good path is a symlink (refused): {}",
+                path.display()
+            )));
+        }
+        if !meta.is_file() {
+            return Err(DirectError::InvalidArgument(format!(
+                "external known-good missing or not a file: {}",
+                path.display()
+            )));
+        }
+        let len = meta.len();
+        if len == 0 {
+            return Err(DirectError::InvalidArgument(format!(
+                "external known-good file is empty: {}",
+                path.display()
+            )));
+        }
+        if len > MAX_MLADF_LAB_FILE_BYTES {
+            return Err(DirectError::InvalidArgument(format!(
+                "external known-good file is {len} bytes > max {MAX_MLADF_LAB_FILE_BYTES}: {}",
+                path.display()
+            )));
+        }
+    } else {
+        return Err(DirectError::InvalidArgument(format!(
+            "external known-good missing or not a file: {}",
+            path.display()
+        )));
+    }
+    let bytes = read_external_ctrltext_nofollow_capped(path)?;
+    if bytes.is_empty() {
+        return Err(DirectError::InvalidArgument(format!(
+            "external known-good file is empty: {}",
+            path.display()
+        )));
+    }
+    if (bytes.len() as u64) > MAX_MLADF_LAB_FILE_BYTES {
+        return Err(DirectError::InvalidArgument(format!(
+            "external known-good read size {} > max {MAX_MLADF_LAB_FILE_BYTES}: {}",
+            bytes.len(),
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Soft bag-drop checklist + e2e fixture path (stamp 8e898123)
+// ---------------------------------------------------------------------------
+//
+// Highest-value offline delta while external known-good **bytes still absent**:
+// unit-testable orchestration of body-bounds + journal tokens against the
+// last_apply / C2 residual surface, plus fail-closed bag-drop completeness.
+// Never invents Pass / residual closed / second C unlock.
+
+/// Fail-closed operator bag-drop checklist for external known-good capture.
+///
+/// Stamp `8e898123`. Incomplete drops (no ctrltext bytes, PROVENANCE not
+/// research-ready, refused local post-patch basenames, VE2/NOT_AIE2 claims)
+/// never report complete. **Complete drop ≠ Pass / product known-good /
+/// residual closed / C-ready / second unlock.**
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ExternalKnownGoodBagDropCheck {
+    /// Operator placed non-empty `.bin`/`.ctrltext` bytes for compare.
+    pub ctrltext_bytes_present: bool,
+    /// PROVENANCE text passes [`validate_external_known_good_provenance_text`].
+    pub provenance_research_ready: bool,
+    /// Proposed basename is a local pure-direct/post-patch oracle (refused).
+    pub refused_local_post_patch_basename: bool,
+    /// Platform claim marks VE2 / NOT_AIE2 (refused as AIE2 known-good).
+    pub refused_ve2_not_aie2: bool,
+    /// True only when bytes + research-ready PROVENANCE and no refuse flags.
+    pub bag_drop_complete: bool,
+    /// Always **false**: bag drop alone never closes FW residual / invent Pass.
+    pub bag_drop_alone_closes_fw_residual: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for ExternalKnownGoodBagDropCheck {
+    fn default() -> Self {
+        Self {
+            ctrltext_bytes_present: false,
+            provenance_research_ready: false,
+            refused_local_post_patch_basename: false,
+            refused_ve2_not_aie2: false,
+            bag_drop_complete: false,
+            bag_drop_alone_closes_fw_residual: false,
+            detail: "bag_drop_absent".into(),
+        }
+    }
+}
+
+impl ExternalKnownGoodBagDropCheck {
+    /// Soft research note (always honesty trio hard-coded; never invent Pass).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "external_known_good_bag_drop_check".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "bag_drop_alone_closes_fw_residual=0".into(),
+            format!(
+                "ctrltext_bytes_present={}",
+                u8::from(self.ctrltext_bytes_present)
+            ),
+            format!(
+                "provenance_research_ready={}",
+                u8::from(self.provenance_research_ready)
+            ),
+            format!(
+                "refused_local_post_patch_basename={}",
+                u8::from(self.refused_local_post_patch_basename)
+            ),
+            format!(
+                "refused_ve2_not_aie2={}",
+                u8::from(self.refused_ve2_not_aie2)
+            ),
+            format!("bag_drop_complete={}", u8::from(self.bag_drop_complete)),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Pure fail-closed bag-drop completeness for external known-good capture.
+///
+/// Stamp `8e898123`. Inputs are pure (no FS). Use when the operator stages a
+/// drop (bytes present?, PROVENANCE body, proposed basename, optional platform
+/// claim). Lab bag disk load still uses [`external_known_good_load_path_is_allowed`].
+///
+/// **Refuse (incomplete):** missing bytes, PROVENANCE not research-ready,
+/// refused post-patch basename, VE2/NOT_AIE2 platform claim.
+///
+/// Complete **≠** product known-good **≠** residual closed.
+#[must_use]
+pub fn check_external_known_good_bag_drop(
+    ctrltext_bytes_present: bool,
+    provenance_text: Option<&str>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> ExternalKnownGoodBagDropCheck {
+    let provenance_research_ready =
+        external_known_good_lab_bag_provenance_allows_load(provenance_text);
+    let refused_local_post_patch_basename = proposed_basename.is_some_and(|b| {
+        let p = std::path::Path::new(b);
+        // Basename-only check: accept bare names or path-ish inputs.
+        is_refused_local_post_patch_as_known_good(p)
+            || p.file_name()
+                .is_some_and(|n| is_refused_local_post_patch_as_known_good(std::path::Path::new(n)))
+    });
+    let refused_ve2_not_aie2 = platform_claim.is_some_and(platform_claim_is_not_aie2_known_good);
+
+    let bag_drop_complete = ctrltext_bytes_present
+        && provenance_research_ready
+        && !refused_local_post_patch_basename
+        && !refused_ve2_not_aie2;
+
+    let detail = if bag_drop_complete {
+        "bag_drop_complete_research_only"
+    } else if refused_local_post_patch_basename {
+        "bag_drop_refused_local_post_patch"
+    } else if refused_ve2_not_aie2 {
+        "bag_drop_refused_ve2_not_aie2"
+    } else if !ctrltext_bytes_present && !provenance_research_ready {
+        "bag_drop_absent_bytes_and_provenance"
+    } else if !ctrltext_bytes_present {
+        "bag_drop_absent_ctrltext_bytes"
+    } else if !provenance_research_ready {
+        "bag_drop_provenance_not_research_ready"
+    } else {
+        "bag_drop_incomplete"
+    };
+
+    ExternalKnownGoodBagDropCheck {
+        ctrltext_bytes_present,
+        provenance_research_ready,
+        refused_local_post_patch_basename,
+        refused_ve2_not_aie2,
+        bag_drop_complete,
+        bag_drop_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Soft end-to-end fixture research: residual class + journal tokens + body
+/// bounds + bag drop against last_apply / C2 surfaces.
+///
+/// Stamp `8e898123`. Unit-testable orchestration only — never invents Pass,
+/// never claims residual closed, never product known-good, never C-ready.
+///
+/// Hard locks (always in soft note, even if fields are mutated):
+/// - `residual_not_closed=1`
+/// - `body_bounds_alone_closes_fw_residual=0`
+/// - `bag_drop_alone_closes_fw_residual=0`
+/// - `ctrltext_match_alone_closes_fw_residual=0`
+/// - honesty trio + `product_known_good=0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct AppLoadE2eFixtureResearch {
+    /// Residual class token ([`SiliconResidualClass::as_str`]).
+    pub residual_class: String,
+    /// True when class is locked APP_LOAD after aiebu+rela.
+    pub locked_app_load_after_aiebu: bool,
+    /// Userspace ELF+rela green (from last_apply signals / class lock).
+    pub userspace_elf_rela_ok: bool,
+    /// Journal Failed-cmd status when present (never invented).
+    pub journal_failed_cmd: Option<u32>,
+    /// Journal chain Status when present (never invented).
+    pub journal_chain_status: Option<u32>,
+    /// True when pair matches locked C2 APP_LOAD dual codes.
+    pub journal_c2_app_load_pair: bool,
+    /// True when last_apply detail alone has no failed_cmd/chain tokens (userspace-only).
+    pub last_apply_detail_journal_absent: bool,
+    /// Body-bounds: any present CU/PDI window OOB (from optional axlf prefix).
+    pub body_bounds_any_oob: bool,
+    /// Body-bounds: ≥1 CU/PDI section header surface present.
+    pub body_bounds_has_surface: bool,
+    /// Always **false** (body bounds alone never closes residual).
+    pub body_bounds_alone_closes_fw_residual: bool,
+    /// Bag drop complete for research compare (still ≠ Pass).
+    pub bag_drop_complete: bool,
+    /// Always **true**: residual remains open offline without live Pass evidence.
+    pub residual_not_closed: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for AppLoadE2eFixtureResearch {
+    fn default() -> Self {
+        Self {
+            residual_class: SiliconResidualClass::Unclassified.as_str().into(),
+            locked_app_load_after_aiebu: false,
+            userspace_elf_rela_ok: false,
+            journal_failed_cmd: None,
+            journal_chain_status: None,
+            journal_c2_app_load_pair: false,
+            last_apply_detail_journal_absent: true,
+            body_bounds_any_oob: false,
+            body_bounds_has_surface: false,
+            body_bounds_alone_closes_fw_residual: false,
+            bag_drop_complete: false,
+            residual_not_closed: true,
+            detail: "e2e_default_unclassified".into(),
+        }
+    }
+}
+
+impl AppLoadE2eFixtureResearch {
+    /// Soft research note (always honesty trio + residual_not_closed hard-coded).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "app_load_e2e_fixture_research".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "body_bounds_alone_closes_fw_residual=0".into(),
+            "bag_drop_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            format!(
+                "residual_class={}",
+                sanitize_soft_note_field_value(&self.residual_class)
+            ),
+            format!(
+                "locked_app_load_after_aiebu={}",
+                u8::from(self.locked_app_load_after_aiebu)
+            ),
+            format!(
+                "userspace_elf_rela_ok={}",
+                u8::from(self.userspace_elf_rela_ok)
+            ),
+            format!(
+                "journal_c2_app_load_pair={}",
+                u8::from(self.journal_c2_app_load_pair)
+            ),
+            format!(
+                "last_apply_detail_journal_absent={}",
+                u8::from(self.last_apply_detail_journal_absent)
+            ),
+            format!("body_bounds_any_oob={}", u8::from(self.body_bounds_any_oob)),
+            format!(
+                "body_bounds_has_surface={}",
+                u8::from(self.body_bounds_has_surface)
+            ),
+            format!("bag_drop_complete={}", u8::from(self.bag_drop_complete)),
+        ];
+        match self.journal_failed_cmd {
+            Some(c) => parts.push(format!("journal_failed_cmd=0x{c:x}")),
+            None => parts.push("journal_failed_cmd=absent".into()),
+        }
+        match self.journal_chain_status {
+            Some(c) => parts.push(format!("journal_chain_status=0x{c:x}")),
+            None => parts.push("journal_chain_status=absent".into()),
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Orchestrate soft e2e fixture research from pure inputs (stamp `8e898123`).
+///
+/// - `class` / `detail`: last_apply residual class + userspace detail
+/// - `journal_text`: optional journal paste (C2 dual codes when present)
+/// - `axlf_bytes`: optional axlf/xclbin header prefix for body-bounds surface
+/// - `bag_drop`: fail-closed bag completeness ([`check_external_known_good_bag_drop`])
+///
+/// Always `residual_not_closed=true`. Never invents journal codes from detail
+/// alone when tokens are absent. Never Pass.
+#[must_use]
+pub fn research_app_load_e2e_fixture_path(
+    class: SiliconResidualClass,
+    detail: Option<&str>,
+    journal_text: Option<&str>,
+    axlf_bytes: Option<&[u8]>,
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+) -> AppLoadE2eFixtureResearch {
+    let sig = detail.map(str::trim).filter(|s| !s.is_empty()).map_or_else(
+        LastApplyDetailSignals::default,
+        parse_last_apply_detail_signals,
+    );
+    let userspace_elf_rela_ok = class.is_locked_app_load_after_aiebu()
+        || (sig.aiebu_elf == Some(true) && last_apply_has_rela_evidence(&sig));
+
+    // Journal pair: only from explicit journal paste (never invent from detail).
+    let pair = journal_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_journal_fw_status_pair);
+    let journal_failed_cmd = pair.as_ref().and_then(|p| p.failed_cmd_status);
+    let journal_chain_status = pair.as_ref().and_then(|p| p.chain_status);
+    let journal_c2_app_load_pair = pair
+        .as_ref()
+        .is_some_and(JournalFwStatusPair::is_c2_app_load_pair);
+
+    // last_apply detail userspace surface: confirm no invented journal tokens.
+    let detail_pair = detail
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_journal_fw_status_pair);
+    let last_apply_detail_journal_absent = detail_pair
+        .as_ref()
+        .is_none_or(|p| p.failed_cmd_status.is_none() && p.chain_status.is_none());
+
+    let bounds = axlf_bytes.map(research_xclbin_cu_pdi_section_body_bounds);
+    let body_bounds_any_oob = bounds.as_ref().is_some_and(|b| b.any_oob);
+    let body_bounds_has_surface = bounds.as_ref().is_some_and(|b| b.has_cu_pdi_offset_surface);
+
+    let detail_tok = if class.is_locked_app_load_after_aiebu() && journal_c2_app_load_pair {
+        if bag_drop.bag_drop_complete {
+            "e2e_app_load_c2_pair_bag_present_residual_open"
+        } else {
+            "e2e_app_load_c2_pair_bag_absent_residual_open"
+        }
+    } else if class.is_locked_app_load_after_aiebu() {
+        if bag_drop.bag_drop_complete {
+            "e2e_app_load_userspace_ok_bag_present_residual_open"
+        } else {
+            "e2e_app_load_userspace_ok_bag_absent_residual_open"
+        }
+    } else if bag_drop.bag_drop_complete {
+        "e2e_class_open_bag_present_residual_open"
+    } else {
+        "e2e_class_open_bag_absent_residual_open"
+    };
+
+    AppLoadE2eFixtureResearch {
+        residual_class: class.as_str().into(),
+        locked_app_load_after_aiebu: class.is_locked_app_load_after_aiebu(),
+        userspace_elf_rela_ok,
+        journal_failed_cmd,
+        journal_chain_status,
+        journal_c2_app_load_pair,
+        last_apply_detail_journal_absent,
+        body_bounds_any_oob,
+        body_bounds_has_surface,
+        body_bounds_alone_closes_fw_residual: false,
+        bag_drop_complete: bag_drop.bag_drop_complete,
+        residual_not_closed: true,
+        detail: detail_tok.into(),
+    }
+}
+
+/// E2e fixture research with locked C2 journal + absent bag (bytes still missing).
+///
+/// Unit surface for the offline residual while external known-good is absent.
+/// Always `residual_not_closed` / honesty trio / invent_pass=0.
+#[must_use]
+pub fn research_app_load_e2e_fixture_c2_locked_absent_bag() -> AppLoadE2eFixtureResearch {
+    let bag = check_external_known_good_bag_drop(false, None, None, None);
+    research_app_load_e2e_fixture_path(
+        SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+        Some(
+            "ert_state=5(Error) aiebu_elf=1 rela_count=12 aiebu_rela_patched \
+             ctrltext=1688B ran_on_npu=false",
+        ),
+        Some(c2_locked_app_load_journal_text()),
+        None,
+        &bag,
+    )
+}
+
+/// Research-only external compare status for the offline progress scorecard.
+///
+/// Never product Pass. Soft note always hard-codes invent_pass=0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExternalCompareStatus {
+    /// No external bytes supplied / bag empty.
+    #[default]
+    Absent,
+    /// Bytes present (bag or env) but compare not conclusive match/mismatch.
+    Loaded,
+    /// Research sha match vs lab export (≠ residual closed / ≠ Pass).
+    Match,
+    /// Bytes present and sha does not match lab export.
+    Mismatch,
+    /// Load/bag refused (local post_patch basename, VE2/NOT_AIE2, path policy).
+    Refused,
+}
+
+impl ExternalCompareStatus {
+    /// Stable soft-note token (`absent` / `loaded` / `match` / `mismatch` / `refused`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Loaded => "loaded",
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// Pure soft offline residual **progress scorecard** (stamp `9cdfe8d0`).
+///
+/// Composes existing pure surfaces without inventing Pass, residual closed,
+/// product known-good, or journal codes from userspace detail alone:
+/// residual class, bag-drop checklist, e2e residual_not_closed, body-bounds
+/// alone_closes=0, journal token presence when journal paste supplied,
+/// external compare status.
+///
+/// Hard locks (always in soft note, even if fields are mutated):
+/// - honesty trio + `product_known_good=0`
+/// - `residual_not_closed=1`
+/// - `scorecard_alone_closes_fw_residual=0`
+/// - `ctrltext_match_alone_closes_fw_residual=0`
+/// - `body_bounds_alone_closes_fw_residual=0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct AppLoadOfflineProgressScorecard {
+    /// Residual class token ([`SiliconResidualClass::as_str`]).
+    pub residual_class: String,
+    /// True when class is locked APP_LOAD after aiebu+rela.
+    pub locked_app_load_after_aiebu: bool,
+    /// Userspace ELF+rela green (from e2e / class lock).
+    pub userspace_elf_rela_ok: bool,
+    /// Bag drop complete for research compare (still ≠ Pass).
+    pub bag_drop_complete: bool,
+    /// Echo of e2e residual_not_closed (always true offline without Pass).
+    pub e2e_residual_not_closed: bool,
+    /// Always **false** (body bounds alone never closes residual).
+    pub body_bounds_alone_closes_fw_residual: bool,
+    /// True when journal paste yielded failed_cmd and/or chain_status.
+    pub journal_tokens_present: bool,
+    /// True when pair matches locked C2 APP_LOAD dual codes.
+    pub journal_c2_app_load_pair: bool,
+    /// External compare research status (never invent Pass).
+    pub external_compare_status: ExternalCompareStatus,
+    /// True when bag complete **and** compare status is `match` (research only).
+    pub scorecard_research_surfaces_ready: bool,
+    /// Always **true**: residual remains open offline without live Pass evidence.
+    pub residual_not_closed: bool,
+    /// Always **false**: scorecard alone never closes FW residual / invent Pass.
+    pub scorecard_alone_closes_fw_residual: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for AppLoadOfflineProgressScorecard {
+    fn default() -> Self {
+        Self {
+            residual_class: SiliconResidualClass::Unclassified.as_str().into(),
+            locked_app_load_after_aiebu: false,
+            userspace_elf_rela_ok: false,
+            bag_drop_complete: false,
+            e2e_residual_not_closed: true,
+            body_bounds_alone_closes_fw_residual: false,
+            journal_tokens_present: false,
+            journal_c2_app_load_pair: false,
+            external_compare_status: ExternalCompareStatus::Absent,
+            scorecard_research_surfaces_ready: false,
+            residual_not_closed: true,
+            scorecard_alone_closes_fw_residual: false,
+            detail: "scorecard_default_incomplete".into(),
+        }
+    }
+}
+
+impl AppLoadOfflineProgressScorecard {
+    /// Soft research note (always honesty + residual_not_closed hard-coded).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "app_load_offline_progress_scorecard".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "scorecard_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            "body_bounds_alone_closes_fw_residual=0".into(),
+            format!(
+                "residual_class={}",
+                sanitize_soft_note_field_value(&self.residual_class)
+            ),
+            format!(
+                "locked_app_load_after_aiebu={}",
+                u8::from(self.locked_app_load_after_aiebu)
+            ),
+            format!(
+                "userspace_elf_rela_ok={}",
+                u8::from(self.userspace_elf_rela_ok)
+            ),
+            format!("bag_drop_complete={}", u8::from(self.bag_drop_complete)),
+            format!(
+                "e2e_residual_not_closed={}",
+                u8::from(self.e2e_residual_not_closed)
+            ),
+            format!(
+                "journal_tokens_present={}",
+                u8::from(self.journal_tokens_present)
+            ),
+            format!(
+                "journal_c2_app_load_pair={}",
+                u8::from(self.journal_c2_app_load_pair)
+            ),
+            format!(
+                "external_compare_status={}",
+                self.external_compare_status.as_str()
+            ),
+            format!(
+                "scorecard_research_surfaces_ready={}",
+                u8::from(self.scorecard_research_surfaces_ready)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Derive research-only external compare status (never Pass).
+///
+/// Priority: refuse flags → sha match → mismatch → loaded (bytes only) → absent.
+#[must_use]
+pub fn external_compare_status_from_surfaces(
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    compare: Option<&ExternalCtrltextCompareResearch>,
+    external_load_refused: bool,
+) -> ExternalCompareStatus {
+    if external_load_refused
+        || bag_drop.refused_local_post_patch_basename
+        || bag_drop.refused_ve2_not_aie2
+    {
+        return ExternalCompareStatus::Refused;
+    }
+    if let Some(c) = compare {
+        if c.external_present {
+            return if c.sha_match {
+                ExternalCompareStatus::Match
+            } else {
+                ExternalCompareStatus::Mismatch
+            };
+        }
+    }
+    if bag_drop.ctrltext_bytes_present {
+        return ExternalCompareStatus::Loaded;
+    }
+    ExternalCompareStatus::Absent
+}
+
+/// Compose offline residual progress scorecard from pure surfaces (stamp `9cdfe8d0`).
+///
+/// - `class` / `bag_drop` / `e2e`: existing pure research surfaces
+/// - `compare`: optional external ctrltext compare (never invent Pass on match)
+/// - `external_load_refused`: path/policy refuse even when compare absent
+///
+/// Always `residual_not_closed=true` and `scorecard_alone_closes_fw_residual=false`.
+/// Never invents journal codes (reads `e2e` journal fields only).
+#[must_use]
+pub fn research_app_load_offline_progress_scorecard(
+    class: SiliconResidualClass,
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    e2e: &AppLoadE2eFixtureResearch,
+    compare: Option<&ExternalCtrltextCompareResearch>,
+    external_load_refused: bool,
+) -> AppLoadOfflineProgressScorecard {
+    let external_compare_status =
+        external_compare_status_from_surfaces(bag_drop, compare, external_load_refused);
+    let journal_tokens_present =
+        e2e.journal_failed_cmd.is_some() || e2e.journal_chain_status.is_some();
+    let scorecard_research_surfaces_ready =
+        bag_drop.bag_drop_complete && external_compare_status == ExternalCompareStatus::Match;
+
+    let detail = if class.is_locked_app_load_after_aiebu()
+        && e2e.journal_c2_app_load_pair
+        && !bag_drop.bag_drop_complete
+        && external_compare_status == ExternalCompareStatus::Absent
+    {
+        "scorecard_c2_locked_bag_absent_residual_open"
+    } else if external_compare_status == ExternalCompareStatus::Refused {
+        "scorecard_external_refused_residual_open"
+    } else if scorecard_research_surfaces_ready {
+        // Match + bag complete still residual open (never close from scorecard).
+        "scorecard_surfaces_ready_residual_still_open"
+    } else if bag_drop.bag_drop_complete {
+        // Distinguish compare-ran mismatch vs bytes-present-no-compare vs other.
+        match external_compare_status {
+            ExternalCompareStatus::Mismatch => "scorecard_bag_complete_mismatch_residual_open",
+            ExternalCompareStatus::Loaded => {
+                "scorecard_bag_complete_loaded_compare_pending_residual_open"
+            }
+            // Match handled above; Absent/Refused edges keep incomplete token.
+            _ => "scorecard_bag_complete_compare_incomplete_residual_open",
+        }
+    } else if class.is_locked_app_load_after_aiebu() {
+        "scorecard_app_load_userspace_ok_bag_incomplete_residual_open"
+    } else {
+        "scorecard_incomplete_residual_open"
+    };
+
+    AppLoadOfflineProgressScorecard {
+        residual_class: class.as_str().into(),
+        locked_app_load_after_aiebu: class.is_locked_app_load_after_aiebu(),
+        userspace_elf_rela_ok: e2e.userspace_elf_rela_ok,
+        bag_drop_complete: bag_drop.bag_drop_complete,
+        e2e_residual_not_closed: e2e.residual_not_closed,
+        body_bounds_alone_closes_fw_residual: false,
+        journal_tokens_present,
+        journal_c2_app_load_pair: e2e.journal_c2_app_load_pair,
+        external_compare_status,
+        scorecard_research_surfaces_ready,
+        residual_not_closed: true,
+        scorecard_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Scorecard with locked C2 journal + absent bag (bytes still missing offline).
+///
+/// Unit surface: incomplete scorecard, residual_not_closed, honesty trio.
+#[must_use]
+pub fn research_app_load_offline_progress_scorecard_c2_locked_absent_bag()
+-> AppLoadOfflineProgressScorecard {
+    let bag = check_external_known_good_bag_drop(false, None, None, None);
+    let e2e = research_app_load_e2e_fixture_c2_locked_absent_bag();
+    research_app_load_offline_progress_scorecard(
+        SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+        &bag,
+        &e2e,
+        None,
+        false,
+    )
+}
+
+/// Operator extract-to-bag checklist text (pure; stamp `588c1c72` + prior steps).
+///
+/// Fail-closed refuse tokens unit-locked: local post_patch, VE2/NOT_AIE2,
+/// invent_pass / product Pass / residual closed / second unlock.
+/// Research-only — does not invent bytes or claim Pass.
+/// Dry-run when bag absent reports explicit `blocked_on_external_bytes=1`
+/// (see [`research_external_ctrltext_compare_dry_run`]).
+/// Lab export fingerprint **auto-feed** into dry-run when ELF/export path is
+/// available (see [`research_lab_export_fingerprint_feed`]).
+/// Bag + feed + dry-run **composition scorecard** reports the same blocker in one
+/// soft row (see [`research_app_load_bag_feed_dry_run_scorecard`]).
+/// Extract → bag → scorecard **pipeline** folds public section markers into that
+/// row (see [`research_app_load_extract_bag_scorecard_pipeline`]).
+#[must_use]
+pub fn format_external_known_good_operator_extract_checklist() -> String {
+    [
+        "external_known_good_operator_extract_checklist",
+        "stamp=588c1c72",
+        "step1=run_working_public_stack_xrt_or_dd_same_mladf_key_when_possible",
+        "step2=capture_post_patch_ctrltext_or_aiebu_elf_after_peel_document_path",
+        "step3=copy_bytes_to_testdata_xdna2_cmd_external_known_good_clear_basename",
+        "step4=fill_PROVENANCE_capture_table_research_ready_markers",
+        "step5=confirm_bag_drop_complete_via_soft_classify_or_unit_bag_drop",
+        "step6=set_XDNA2_LAB_EXTERNAL_CTRLTEXT_confined_path_soft_compare",
+        "step7=compare_external_ctrltext_to_lab_export_match_neq_pass",
+        "step8=soft_external_ctrltext_compare_dry_run_blocked_on_external_bytes_when_absent",
+        "step9=lab_export_fingerprint_auto_feed_into_dry_run_when_export_path_ready",
+        "step10=soft_app_load_bag_feed_dry_run_scorecard_blocked_on_external_bytes_after_auto_feed",
+        "step11=soft_app_load_extract_bag_scorecard_pipeline_markers_without_bytes_still_blocked",
+        "refuse_local_post_patch=1",
+        "refuse_instr_post_patch_bin=1",
+        "refuse_instr_vendor_post_patch_bin=1",
+        "refuse_ctrl_post_patch_bin=1",
+        "refuse_instr_raw_txn_bin=1",
+        "refuse_ve2_not_aie2=1",
+        "refuse_validate_xclbin_as_aie2_known_good=1",
+        "bag_drop_complete_neq_pass=1",
+        "blocked_on_external_bytes_when_bag_absent=1",
+        "lab_export_auto_feed=1",
+        "extract_alone_closes_fw_residual=0",
+        "pipeline_alone_closes_fw_residual=0",
+        "ctrltext_match_alone_closes_fw_residual=0",
+        "scorecard_alone_closes_fw_residual=0",
+        "dry_run_alone_closes_fw_residual=0",
+        "feed_alone_closes_fw_residual=0",
+        "residual_not_closed=1",
+        "invent_pass=0",
+        "not_c_ready=1",
+        "not_ran_on_npu=1",
+        "product_known_good=0",
+        "no_second_c_unlock=1",
+        "c_unlock_b17b0119_consumed=1",
+    ]
+    .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// External ctrltext compare dry-run (stamp `6033158a`)
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`ExternalCtrltextCompareDryRun::format_soft_note`].
+pub const EXTERNAL_CTRLTEXT_COMPARE_DRY_RUN_NOTE: &str = "external_ctrltext_compare_dry_run";
+
+/// Explicit offline blocker token when external known-good bytes are still missing.
+///
+/// Emitted as `blocked_on_external_bytes=1` on the dry-run soft note when the bag
+/// is absent (and not on a refuse path). Never invents match / Pass.
+pub const BLOCKED_ON_EXTERNAL_BYTES_TOKEN: &str = "blocked_on_external_bytes";
+
+/// Pure offline **compare dry-run** when external known-good may still be absent
+/// (stamp `6033158a`).
+///
+/// Advances residual research beyond the progress scorecard alone by making
+/// the bag-absent path **explicit** (`blocked_on_external_bytes=1`) instead of
+/// a silent `known_good_absent` skim. Optional refuse paths (local post_patch
+/// basename, VE2/NOT_AIE2 platform claim) are unit-locked. When both lab export
+/// and external bytes are present, surfaces compare results but **match ≠ Pass**.
+///
+/// Hard locks (always in soft note, even if fields are mutated):
+/// - honesty trio + `product_known_good=0`
+/// - `residual_not_closed=1`
+/// - `dry_run_alone_closes_fw_residual=0`
+/// - `ctrltext_match_alone_closes_fw_residual=0`
+/// - `scorecard_alone_closes_fw_residual=0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ExternalCtrltextCompareDryRun {
+    /// Lab fingerprint has non-empty unpatched sha (export ready for compare).
+    pub lab_export_ready: bool,
+    /// Non-empty external bytes supplied and **not** on a refuse path.
+    pub external_present: bool,
+    /// Explicit bag-absent blocker (primary when external missing, not refused).
+    pub blocked_on_external_bytes: bool,
+    /// Local pure-direct / post_patch basename refused as known-good.
+    pub refused_local_post_patch: bool,
+    /// VE2 / NOT_AIE2 platform claim refused as AIE2 known-good.
+    pub refused_ve2_not_aie2: bool,
+    /// Tag when VE2 / NOT_AIE2 fixtures drive the refuse path (`platform_not_aie2=1`).
+    pub platform_not_aie2: bool,
+    /// True when [`compare_external_ctrltext_to_lab_export`] ran with both sides.
+    pub compare_ran: bool,
+    /// Echo of compare `sha_match` when `compare_ran` (research only; ≠ Pass).
+    pub sha_match: bool,
+    /// Echo of compare `structural_match` when `compare_ran`.
+    pub structural_match: bool,
+    /// VE2 / NOT_AIE2 refuse companion: set when xclbin extract dry-run marks
+    /// NOT_AIE2 **or** when claim-only VE2 refuses (echo of the same refuse matrix;
+    /// not limited to “headers were passed”).
+    pub xclbin_extract_refused_ve2: bool,
+    /// Always **true**: residual remains open offline without live Pass evidence.
+    pub residual_not_closed: bool,
+    /// Always **false**: dry-run alone never closes FW residual / invent Pass.
+    pub dry_run_alone_closes_fw_residual: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for ExternalCtrltextCompareDryRun {
+    fn default() -> Self {
+        Self {
+            lab_export_ready: false,
+            external_present: false,
+            blocked_on_external_bytes: true,
+            refused_local_post_patch: false,
+            refused_ve2_not_aie2: false,
+            platform_not_aie2: false,
+            compare_ran: false,
+            sha_match: false,
+            structural_match: false,
+            xclbin_extract_refused_ve2: false,
+            residual_not_closed: true,
+            dry_run_alone_closes_fw_residual: false,
+            detail: "dry_run_default_blocked_on_external_bytes".into(),
+        }
+    }
+}
+
+impl ExternalCtrltextCompareDryRun {
+    /// Soft research note (always honesty + residual_not_closed hard-coded).
+    ///
+    /// Honesty tokens are **hard-coded** (not from mutable struct fields) so a
+    /// hand-built bag cannot invent Pass / residual closed / product known-good.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            EXTERNAL_CTRLTEXT_COMPARE_DRY_RUN_NOTE.into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "dry_run_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            "scorecard_alone_closes_fw_residual=0".into(),
+            format!("lab_export_ready={}", u8::from(self.lab_export_ready)),
+            format!("external_present={}", u8::from(self.external_present)),
+            format!(
+                "{}={}",
+                BLOCKED_ON_EXTERNAL_BYTES_TOKEN,
+                u8::from(self.blocked_on_external_bytes)
+            ),
+            format!(
+                "refused_local_post_patch={}",
+                u8::from(self.refused_local_post_patch)
+            ),
+            format!(
+                "refused_ve2_not_aie2={}",
+                u8::from(self.refused_ve2_not_aie2)
+            ),
+            format!("platform_not_aie2={}", u8::from(self.platform_not_aie2)),
+            format!("compare_ran={}", u8::from(self.compare_ran)),
+            format!("sha_match={}", u8::from(self.sha_match)),
+            format!("structural_match={}", u8::from(self.structural_match)),
+            format!(
+                "xclbin_extract_refused_ve2={}",
+                u8::from(self.xclbin_extract_refused_ve2)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// True when a lab fingerprint export is ready for research compare (non-empty sha).
+#[must_use]
+pub fn lab_fingerprint_export_is_ready(lab: Option<&CtrltextFingerprintExport>) -> bool {
+    lab.is_some_and(|e| !e.unpatched_sha256_hex.is_empty() && e.ctrltext_len.is_some())
+}
+
+/// Pure external ctrltext compare **dry-run** (stamp `6033158a`).
+///
+/// - `lab`: optional lab fingerprint export (from
+///   [`export_ctrltext_fingerprint_research`]); when ready → `lab_export_ready=1`.
+/// - `external`: optional external ctrltext bytes; empty/None →
+///   **`blocked_on_external_bytes=1`** (explicit; not silent absent) unless refused.
+/// - `proposed_basename`: optional basename for local post_patch refuse.
+/// - `platform_claim`: optional path/PROVENANCE claim for VE2/NOT_AIE2 refuse.
+/// - `xclbin_header` / `xclbin_section_text`: optional companion xclbin extract
+///   dry-run (refuse VE2; never product known-good / never invent PDI layout).
+/// - `external_load_refused`: soft/confinement load failed (non-empty path set but
+///   bytes unusable); when true and external absent (not refuse-matrix), detail is
+///   `dry_run_external_load_refused_blocked_on_bytes` (still `blocked_on_external_bytes=1`).
+///
+/// Compare runs **only** when lab export is ready **and** external non-empty (and
+/// not refused). External present without lab-ready →
+/// `dry_run_lab_export_not_ready_external_present` with `compare_ran=0` (no default
+/// empty-sha compare). **Even** `sha_match=1` leaves `residual_not_closed=1` and
+/// `dry_run_alone_closes_fw_residual=0`.
+///
+/// Never invents Pass / C-ready / product known-good / second unlock.
+#[must_use]
+pub fn research_external_ctrltext_compare_dry_run(
+    lab: Option<&CtrltextFingerprintExport>,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> ExternalCtrltextCompareDryRun {
+    research_external_ctrltext_compare_dry_run_ex(
+        lab,
+        external,
+        proposed_basename,
+        platform_claim,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Extended dry-run with optional confined xclbin extract refuse companion and
+/// external-load-refused detail.
+///
+/// Same honesty locks as [`research_external_ctrltext_compare_dry_run`]. When
+/// xclbin inputs are provided **or** claim is VE2/NOT_AIE2, composes
+/// [`research_xclbin_extract_dry_run`] / VE2 refuse helper and surfaces
+/// `xclbin_extract_refused_ve2` / `platform_not_aie2` (claim-only VE2 also sets
+/// the xclbin refuse echo — not only when headers were passed).
+/// Never grants product known-good / Pass from xclbin eligibility.
+#[must_use]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // research surface: lab + external + refuse + xclbin + load flag
+pub fn research_external_ctrltext_compare_dry_run_ex(
+    lab: Option<&CtrltextFingerprintExport>,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+    xclbin_header: Option<&[u8]>,
+    xclbin_section_text: Option<&str>,
+    external_load_refused: bool,
+) -> ExternalCtrltextCompareDryRun {
+    let lab_export_ready = lab_fingerprint_export_is_ready(lab);
+    let claim = platform_claim.unwrap_or("").trim();
+    let refused_ve2 = !claim.is_empty() && platform_claim_is_not_aie2_known_good(claim);
+    let refused_post = proposed_basename
+        .is_some_and(|b| is_refused_local_post_patch_as_known_good(std::path::Path::new(b)));
+
+    // Optional xclbin companion (public magic + markers only; never invent PDI).
+    // Single flag: claim-only VE2 also sets xclbin_extract_refused_ve2 (refuse echo).
+    let xclbin_refused_ve2 =
+        if xclbin_header.is_some() || xclbin_section_text.is_some() || refused_ve2 {
+            let hdr = xclbin_header.unwrap_or(&[]);
+            let x = if refused_ve2 && xclbin_header.is_none() && xclbin_section_text.is_none() {
+                // Claim-only VE2: use locked refuse helper path.
+                research_xclbin_extract_ve2_fixture_refused(&[], None)
+            } else {
+                research_xclbin_extract_dry_run(hdr, xclbin_section_text, platform_claim)
+            };
+            x.platform_not_aie2_known_good || refused_ve2
+        } else {
+            false
+        };
+
+    let platform_not_aie2 = refused_ve2 || xclbin_refused_ve2;
+
+    // Refuse paths take priority over blocked_on_external_bytes.
+    if refused_post || refused_ve2 || xclbin_refused_ve2 {
+        let detail = if refused_post {
+            "dry_run_refused_local_post_patch"
+        } else {
+            "dry_run_refused_ve2_not_aie2"
+        };
+        return ExternalCtrltextCompareDryRun {
+            lab_export_ready,
+            external_present: false,
+            blocked_on_external_bytes: false,
+            refused_local_post_patch: refused_post,
+            refused_ve2_not_aie2: refused_ve2 || xclbin_refused_ve2,
+            platform_not_aie2,
+            compare_ran: false,
+            sha_match: false,
+            structural_match: false,
+            xclbin_extract_refused_ve2: xclbin_refused_ve2,
+            residual_not_closed: true,
+            dry_run_alone_closes_fw_residual: false,
+            detail: detail.into(),
+        };
+    }
+
+    let Some(ext) = external.filter(|b| !b.is_empty()) else {
+        let detail = if external_load_refused {
+            // Env/path set but confinement/read failed (not post_patch/VE2 refuse).
+            "dry_run_external_load_refused_blocked_on_bytes"
+        } else if lab_export_ready {
+            "dry_run_lab_export_ready_blocked_on_external_bytes"
+        } else {
+            "dry_run_blocked_on_external_bytes"
+        };
+        return ExternalCtrltextCompareDryRun {
+            lab_export_ready,
+            external_present: false,
+            blocked_on_external_bytes: true,
+            refused_local_post_patch: false,
+            refused_ve2_not_aie2: false,
+            platform_not_aie2: false,
+            compare_ran: false,
+            sha_match: false,
+            structural_match: false,
+            xclbin_extract_refused_ve2: false,
+            residual_not_closed: true,
+            dry_run_alone_closes_fw_residual: false,
+            detail: detail.into(),
+        };
+    };
+
+    // External present: compare only when lab export is ready (no empty-sha compare).
+    if !lab_export_ready {
+        return ExternalCtrltextCompareDryRun {
+            lab_export_ready: false,
+            external_present: true,
+            blocked_on_external_bytes: false,
+            refused_local_post_patch: false,
+            refused_ve2_not_aie2: false,
+            platform_not_aie2: false,
+            compare_ran: false,
+            sha_match: false,
+            structural_match: false,
+            xclbin_extract_refused_ve2: false,
+            residual_not_closed: true,
+            dry_run_alone_closes_fw_residual: false,
+            detail: "dry_run_lab_export_not_ready_external_present".into(),
+        };
+    }
+
+    // Both lab-ready and external available (match still ≠ Pass).
+    // lab_export_ready already requires non-empty unpatched sha + ctrltext_len.
+    let lab_export = lab.cloned().unwrap_or_default();
+    let cmp = compare_external_ctrltext_to_lab_export(&lab_export, Some(ext));
+    let detail = if cmp.sha_match && cmp.structural_match {
+        "dry_run_sha_and_structural_match_residual_still_open"
+    } else if cmp.sha_match {
+        "dry_run_sha_match_residual_still_open"
+    } else if cmp.structural_match {
+        "dry_run_structural_match_sha_diff_residual_open"
+    } else {
+        "dry_run_compare_mismatch_residual_open"
+    };
+    ExternalCtrltextCompareDryRun {
+        lab_export_ready: true,
+        external_present: true,
+        blocked_on_external_bytes: false,
+        refused_local_post_patch: false,
+        refused_ve2_not_aie2: false,
+        platform_not_aie2: false,
+        compare_ran: true,
+        sha_match: cmp.sha_match,
+        structural_match: cmp.structural_match,
+        xclbin_extract_refused_ve2: false,
+        residual_not_closed: true,
+        dry_run_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Dry-run with locked C2 residual context + absent external bag (bytes missing).
+///
+/// Unit surface: `blocked_on_external_bytes=1`, honesty trio, residual_not_closed.
+/// Does **not** invent lab export from disk (lab_export_ready=0 unless a real
+/// export is passed via the full API).
+#[must_use]
+pub fn research_external_ctrltext_compare_dry_run_c2_locked_absent_bag()
+-> ExternalCtrltextCompareDryRun {
+    research_external_ctrltext_compare_dry_run(None, None, None, None)
+}
+
+// ---------------------------------------------------------------------------
+// Lab export fingerprint auto-feed into compare dry-run (stamp `d2e287ab`)
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`LabExportFingerprintFeed::format_soft_note`].
+pub const LAB_EXPORT_FINGERPRINT_FEED_NOTE: &str = "lab_export_fingerprint_feed";
+
+/// Pure **lab export fingerprint auto-feed** for compare dry-run (stamp `d2e287ab`).
+///
+/// Derives optional [`CtrltextFingerprintExport`] from export-path ELF bytes when
+/// available (research surface already used by soft classify). **Never invents
+/// external ctrltext** and **never invents unpatched sha** from last_apply
+/// signals alone (content size / aiebu flags are incomplete without ELF bytes).
+///
+/// Auto-feed into [`research_external_ctrltext_compare_dry_run_from_lab_feed`] so
+/// dry-run is not only hand-fed when optional args exist: lab-ready + bag absent
+/// → `lab_export_ready=1` + `blocked_on_external_bytes=1`.
+///
+/// Hard locks (always in soft note): honesty trio + `product_known_good=0` +
+/// `residual_not_closed=1` + `feed_alone_closes_fw_residual=0` +
+/// `dry_run_alone_closes_fw_residual=0` + `ctrltext_match_alone_closes_fw_residual=0`
+/// + `scorecard_alone_closes_fw_residual=0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct LabExportFingerprintFeed {
+    /// True when export has non-empty unpatched sha + ctrltext_len (ready for dry-run).
+    pub lab_export_ready: bool,
+    /// Always **true** from constructors — marks auto-feed research surface.
+    pub lab_export_auto_feed: bool,
+    /// Stable source token: `elf_bytes` / `last_apply_signals` / `absent` /
+    /// `refused_local_post_patch` / `platform_not_aie2`.
+    pub feed_source: String,
+    /// Local pure-direct / post_patch basename refused as known-good for feed.
+    pub refused_local_post_patch: bool,
+    /// VE2 / NOT_AIE2 platform claim on feed path (`platform_not_aie2=1`).
+    pub platform_not_aie2: bool,
+    /// Built export when ELF bytes parseable (still known_good absent / not external).
+    pub export: Option<CtrltextFingerprintExport>,
+    /// Echo of last_apply `content_size` when signals path used (no invent sha).
+    pub last_apply_content_size_b: Option<u32>,
+    /// Echo of last_apply `aiebu_elf` when signals path used.
+    pub last_apply_aiebu_elf: Option<bool>,
+    /// Echo of last_apply `rela_count` when signals path used.
+    pub last_apply_rela_count: Option<usize>,
+    /// Always **true**: feed alone never closes FW residual.
+    pub residual_not_closed: bool,
+    /// Always **false**: feed alone never closes residual / invent Pass.
+    pub feed_alone_closes_fw_residual: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for LabExportFingerprintFeed {
+    fn default() -> Self {
+        Self {
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            feed_source: "absent".into(),
+            refused_local_post_patch: false,
+            platform_not_aie2: false,
+            export: None,
+            last_apply_content_size_b: None,
+            last_apply_aiebu_elf: None,
+            last_apply_rela_count: None,
+            residual_not_closed: true,
+            feed_alone_closes_fw_residual: false,
+            detail: "feed_default_absent".into(),
+        }
+    }
+}
+
+impl LabExportFingerprintFeed {
+    /// Soft research note (honesty + residual_not_closed hard-coded).
+    ///
+    /// Honesty tokens are **hard-coded** (not from mutable struct fields).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            LAB_EXPORT_FINGERPRINT_FEED_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "feed_alone_closes_fw_residual=0".into(),
+            "dry_run_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            "scorecard_alone_closes_fw_residual=0".into(),
+            // Always report auto-feed=1 from production path (hard-coded lock).
+            "lab_export_auto_feed=1".into(),
+            format!("lab_export_ready={}", u8::from(self.lab_export_ready)),
+            format!(
+                "feed_source={}",
+                sanitize_soft_note_field_value(&self.feed_source)
+            ),
+            format!(
+                "refused_local_post_patch={}",
+                u8::from(self.refused_local_post_patch)
+            ),
+            format!("platform_not_aie2={}", u8::from(self.platform_not_aie2)),
+        ];
+        if let Some(n) = self.last_apply_content_size_b {
+            parts.push(format!("last_apply_content_size_b={n}"));
+        }
+        if let Some(a) = self.last_apply_aiebu_elf {
+            parts.push(format!("last_apply_aiebu_elf={}", u8::from(a)));
+        }
+        if let Some(r) = self.last_apply_rela_count {
+            parts.push(format!("last_apply_rela_count={r}"));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+
+    /// Lab export borrow for dry-run when ready (None when incomplete/absent).
+    ///
+    /// Belt-and-suspenders: requires both `lab_export_ready` **and**
+    /// [`lab_fingerprint_export_is_ready`] on the attached export (hand-mutated
+    /// bags cannot invent a ready export with empty sha).
+    #[must_use]
+    pub fn ready_export(&self) -> Option<&CtrltextFingerprintExport> {
+        if self.lab_export_ready && lab_fingerprint_export_is_ready(self.export.as_ref()) {
+            self.export.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+/// Build lab export feed from optional ELF bytes only (export-path surface).
+///
+/// Empty / None → absent incomplete feed. Valid aiebu → ready when fingerprint
+/// has unpatched sha. Never invents external bytes / product known-good.
+#[must_use]
+pub fn research_lab_export_fingerprint_feed_from_elf(
+    elf: Option<&[u8]>,
+) -> LabExportFingerprintFeed {
+    research_lab_export_fingerprint_feed_from_elf_ex(elf, None, None)
+}
+
+/// ELF feed with optional local post_patch basename / VE2 platform refuse.
+///
+/// Refuse takes priority: post_patch basename or VE2 claim → refuse-only feed
+/// (`export: None`, `lab_export_ready=0`). ELF bytes are **not** attached on
+/// refuse paths (combined [`research_lab_export_fingerprint_feed`] also drops
+/// ELF when refuse wins). Refuse flags still surface for dry-run merge.
+#[must_use]
+pub fn research_lab_export_fingerprint_feed_from_elf_ex(
+    elf: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> LabExportFingerprintFeed {
+    let refused_post = proposed_basename
+        .is_some_and(|b| is_refused_local_post_patch_as_known_good(std::path::Path::new(b)));
+    let claim = platform_claim.unwrap_or("").trim();
+    let refused_ve2 = !claim.is_empty() && platform_claim_is_not_aie2_known_good(claim);
+
+    if refused_post {
+        return LabExportFingerprintFeed {
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            feed_source: "refused_local_post_patch".into(),
+            refused_local_post_patch: true,
+            platform_not_aie2: refused_ve2,
+            export: None,
+            residual_not_closed: true,
+            feed_alone_closes_fw_residual: false,
+            detail: "feed_refused_local_post_patch".into(),
+            ..LabExportFingerprintFeed::default()
+        };
+    }
+    if refused_ve2 {
+        return LabExportFingerprintFeed {
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            feed_source: "platform_not_aie2".into(),
+            refused_local_post_patch: false,
+            platform_not_aie2: true,
+            export: None,
+            residual_not_closed: true,
+            feed_alone_closes_fw_residual: false,
+            detail: "feed_refused_ve2_not_aie2".into(),
+            ..LabExportFingerprintFeed::default()
+        };
+    }
+
+    let Some(bytes) = elf.filter(|b| !b.is_empty()) else {
+        return LabExportFingerprintFeed {
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            feed_source: "absent".into(),
+            detail: "feed_elf_absent".into(),
+            ..LabExportFingerprintFeed::default()
+        };
+    };
+
+    let exp = export_ctrltext_fingerprint_research(bytes);
+    let ready = lab_fingerprint_export_is_ready(Some(&exp));
+    LabExportFingerprintFeed {
+        lab_export_ready: ready,
+        lab_export_auto_feed: true,
+        feed_source: "elf_bytes".into(),
+        refused_local_post_patch: false,
+        platform_not_aie2: false,
+        export: Some(exp),
+        residual_not_closed: true,
+        feed_alone_closes_fw_residual: false,
+        detail: if ready {
+            "feed_elf_export_ready".into()
+        } else {
+            "feed_elf_export_not_ready".into()
+        },
+        ..LabExportFingerprintFeed::default()
+    }
+}
+
+/// Feed from last_apply detail **signals only** — never invents unpatched sha.
+///
+/// When aiebu + content size present → incomplete feed (`lab_export_ready=0`)
+/// with explicit detail (need ELF bytes for ready export). When empty → absent.
+#[must_use]
+pub fn research_lab_export_fingerprint_feed_from_last_apply_signals(
+    aiebu_elf: Option<bool>,
+    content_size_b: Option<u32>,
+    rela_count: Option<usize>,
+) -> LabExportFingerprintFeed {
+    // No ELF → never ready (do not invent sha from size alone).
+    let has_any = aiebu_elf.is_some() || content_size_b.is_some() || rela_count.is_some();
+    if !has_any {
+        return LabExportFingerprintFeed {
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            feed_source: "absent".into(),
+            detail: "feed_last_apply_signals_absent".into(),
+            ..LabExportFingerprintFeed::default()
+        };
+    }
+    let detail = if aiebu_elf == Some(true) && content_size_b.is_some() {
+        "feed_last_apply_signals_incomplete_need_elf_bytes"
+    } else if aiebu_elf == Some(true) {
+        "feed_last_apply_aiebu_without_content_size"
+    } else {
+        "feed_last_apply_signals_incomplete"
+    };
+    LabExportFingerprintFeed {
+        lab_export_ready: false,
+        lab_export_auto_feed: true,
+        feed_source: "last_apply_signals".into(),
+        refused_local_post_patch: false,
+        platform_not_aie2: false,
+        export: None,
+        last_apply_content_size_b: content_size_b,
+        last_apply_aiebu_elf: aiebu_elf,
+        last_apply_rela_count: rela_count,
+        residual_not_closed: true,
+        feed_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Feed from parsed last_apply detail signals (pure; no I/O).
+#[must_use]
+pub fn research_lab_export_fingerprint_feed_from_last_apply_detail(
+    sig: &LastApplyDetailSignals,
+) -> LabExportFingerprintFeed {
+    research_lab_export_fingerprint_feed_from_last_apply_signals(
+        sig.aiebu_elf,
+        sig.content_size_b,
+        sig.rela_count,
+    )
+}
+
+/// Prefer ELF bytes when present; else fall back to last_apply detail signals.
+///
+/// Optional basename / platform refuse apply to the ELF path (post_patch / VE2).
+/// On refuse, ELF is **dropped** (refuse-only feed; no ready export invent).
+/// Never invents external ctrltext. Soft classify auto-feed uses this.
+/// Combined absent (no ELF, no signals) uses detail `feed_absent_no_elf_no_signals`.
+#[must_use]
+pub fn research_lab_export_fingerprint_feed(
+    elf: Option<&[u8]>,
+    last_apply_detail: Option<&str>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> LabExportFingerprintFeed {
+    // Refuse surfaces always win (no invent ready export from post_patch / VE2).
+    let refused_post = proposed_basename
+        .is_some_and(|b| is_refused_local_post_patch_as_known_good(std::path::Path::new(b)));
+    let claim = platform_claim.unwrap_or("").trim();
+    let refused_ve2 = !claim.is_empty() && platform_claim_is_not_aie2_known_good(claim);
+    if refused_post || refused_ve2 {
+        return research_lab_export_fingerprint_feed_from_elf_ex(
+            None,
+            proposed_basename,
+            platform_claim,
+        );
+    }
+
+    if elf.is_some_and(|b| !b.is_empty()) {
+        return research_lab_export_fingerprint_feed_from_elf_ex(
+            elf,
+            proposed_basename,
+            platform_claim,
+        );
+    }
+
+    // No ELF: pure last_apply signals (incomplete without bytes).
+    if let Some(d) = last_apply_detail.filter(|s| !s.trim().is_empty()) {
+        let sig = parse_last_apply_detail_signals(d);
+        return research_lab_export_fingerprint_feed_from_last_apply_detail(&sig);
+    }
+
+    // Combined absent: distinct from ELF-only or signals-only absent details.
+    LabExportFingerprintFeed {
+        lab_export_ready: false,
+        lab_export_auto_feed: true,
+        feed_source: "absent".into(),
+        detail: "feed_absent_no_elf_no_signals".into(),
+        ..LabExportFingerprintFeed::default()
+    }
+}
+
+/// Auto-feed lab fingerprint into external compare dry-run (stamp `d2e287ab`).
+///
+/// When feed is lab-ready and external absent → `lab_export_ready=1` +
+/// `blocked_on_external_bytes=1`. Feed refuse flags **force** refuse even when
+/// the caller passes a non-refused basename/platform (cannot clobber feed refuse).
+/// Match ≠ Pass. Never invents external bytes.
+#[must_use]
+pub fn research_external_ctrltext_compare_dry_run_from_lab_feed(
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> ExternalCtrltextCompareDryRun {
+    research_external_ctrltext_compare_dry_run_from_lab_feed_ex(
+        feed,
+        external,
+        proposed_basename,
+        platform_claim,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Extended auto-feed dry-run (xclbin companion + external_load_refused).
+///
+/// Merges feed refuse into dry-run refuse matrix. Feed refuse flags **force**
+/// refuse: non-refused caller basename/platform cannot drop post_patch/VE2.
+/// Lab export from feed only when ready (no empty-sha invent).
+#[must_use]
+#[allow(clippy::too_many_arguments)] // research surface mirrors dry_run_ex
+pub fn research_external_ctrltext_compare_dry_run_from_lab_feed_ex(
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+    xclbin_header: Option<&[u8]>,
+    xclbin_section_text: Option<&str>,
+    external_load_refused: bool,
+) -> ExternalCtrltextCompareDryRun {
+    // Force refuse from feed flags: caller non-refused overrides must not drop.
+    let basename = if feed.refused_local_post_patch {
+        let caller_refused = proposed_basename.filter(|b| {
+            !b.is_empty() && is_refused_local_post_patch_as_known_good(std::path::Path::new(b))
+        });
+        Some(caller_refused.unwrap_or("instr_post_patch.bin"))
+    } else {
+        proposed_basename
+    };
+    let platform = if feed.platform_not_aie2 {
+        let caller_ve2 = platform_claim
+            .filter(|c| !c.trim().is_empty() && platform_claim_is_not_aie2_known_good(c));
+        Some(caller_ve2.unwrap_or("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"))
+    } else {
+        platform_claim
+    };
+    research_external_ctrltext_compare_dry_run_ex(
+        feed.ready_export(),
+        external,
+        basename,
+        platform,
+        xclbin_header,
+        xclbin_section_text,
+        external_load_refused,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Bag-drop + lab feed + dry-run soft scorecard (stamp `2b01425e`)
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`AppLoadBagFeedDryRunScorecard::format_soft_note`].
+pub const APP_LOAD_BAG_FEED_DRY_RUN_SCORECARD_NOTE: &str = "app_load_bag_feed_dry_run_scorecard";
+
+/// Pure soft **composition scorecard**: bag-drop + lab export feed + compare
+/// dry-run after auto-feed (stamp `2b01425e`).
+///
+/// Beyond feed alone (`d2e287ab`): one research row that surfaces explicit
+/// **`blocked_on_external_bytes=1`** when auto-feed is lab-ready and the external
+/// bag is still absent — without inventing Pass / residual closed.
+///
+/// Composes existing pure surfaces only:
+/// - [`ExternalKnownGoodBagDropCheck`] / [`check_external_known_good_bag_drop`]
+/// - [`LabExportFingerprintFeed`] / feed ready flags
+/// - [`research_external_ctrltext_compare_dry_run_from_lab_feed_ex`]
+///
+/// Hard locks (always in soft note, even if fields are mutated):
+/// - honesty trio + `product_known_good=0`
+/// - `residual_not_closed=1`
+/// - `bag_drop_alone_closes_fw_residual=0`
+/// - `feed_alone_closes_fw_residual=0`
+/// - `dry_run_alone_closes_fw_residual=0`
+/// - `scorecard_alone_closes_fw_residual=0`
+/// - `ctrltext_match_alone_closes_fw_residual=0`
+/// - `lab_export_auto_feed=1`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct AppLoadBagFeedDryRunScorecard {
+    /// Echo of bag-drop completeness (still ≠ Pass).
+    pub bag_drop_complete: bool,
+    /// Echo of bag-drop ctrltext_bytes_present.
+    pub bag_ctrltext_bytes_present: bool,
+    /// Lab fingerprint ready for dry-run (from feed / dry-run).
+    pub lab_export_ready: bool,
+    /// Always **true** from constructors — auto-feed research surface.
+    pub lab_export_auto_feed: bool,
+    /// Explicit bag-absent blocker after auto-feed (primary when external missing).
+    pub blocked_on_external_bytes: bool,
+    /// Non-empty external on dry-run path (not refuse).
+    pub external_present: bool,
+    /// Compare ran with both sides present.
+    pub compare_ran: bool,
+    /// Echo of dry-run sha_match (research only; ≠ Pass).
+    pub sha_match: bool,
+    /// Echo of dry-run structural_match.
+    pub structural_match: bool,
+    /// Local post_patch refuse (bag and/or feed and/or dry-run).
+    pub refused_local_post_patch: bool,
+    /// VE2 / NOT_AIE2 refuse (bag and/or feed and/or dry-run).
+    pub refused_ve2_not_aie2: bool,
+    /// Tag when VE2 / NOT_AIE2 fixtures drive refuse (`platform_not_aie2=1`).
+    pub platform_not_aie2: bool,
+    /// Always **true**: residual remains open offline without live Pass evidence.
+    pub residual_not_closed: bool,
+    /// Always **false**: bag-drop alone never closes residual.
+    pub bag_drop_alone_closes_fw_residual: bool,
+    /// Always **false**: feed alone never closes residual.
+    pub feed_alone_closes_fw_residual: bool,
+    /// Always **false**: dry-run alone never closes residual.
+    pub dry_run_alone_closes_fw_residual: bool,
+    /// Always **false**: this scorecard alone never closes residual / invent Pass.
+    pub scorecard_alone_closes_fw_residual: bool,
+    /// Stable research detail token (distinct outcomes; not one lumped label).
+    pub detail: String,
+}
+
+impl Default for AppLoadBagFeedDryRunScorecard {
+    fn default() -> Self {
+        Self {
+            bag_drop_complete: false,
+            bag_ctrltext_bytes_present: false,
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            blocked_on_external_bytes: true,
+            external_present: false,
+            compare_ran: false,
+            sha_match: false,
+            structural_match: false,
+            refused_local_post_patch: false,
+            refused_ve2_not_aie2: false,
+            platform_not_aie2: false,
+            residual_not_closed: true,
+            bag_drop_alone_closes_fw_residual: false,
+            feed_alone_closes_fw_residual: false,
+            dry_run_alone_closes_fw_residual: false,
+            scorecard_alone_closes_fw_residual: false,
+            detail: "scorecard_default_blocked_on_external_bytes".into(),
+        }
+    }
+}
+
+impl AppLoadBagFeedDryRunScorecard {
+    /// Soft research note (honesty + residual_not_closed hard-coded).
+    ///
+    /// Honesty tokens are **hard-coded** (not from mutable struct fields).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            APP_LOAD_BAG_FEED_DRY_RUN_SCORECARD_NOTE.into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "bag_drop_alone_closes_fw_residual=0".into(),
+            "feed_alone_closes_fw_residual=0".into(),
+            "dry_run_alone_closes_fw_residual=0".into(),
+            "scorecard_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            // Always report auto-feed=1 from production path (hard-coded lock).
+            "lab_export_auto_feed=1".into(),
+            format!("bag_drop_complete={}", u8::from(self.bag_drop_complete)),
+            format!(
+                "bag_ctrltext_bytes_present={}",
+                u8::from(self.bag_ctrltext_bytes_present)
+            ),
+            format!("lab_export_ready={}", u8::from(self.lab_export_ready)),
+            format!(
+                "{}={}",
+                BLOCKED_ON_EXTERNAL_BYTES_TOKEN,
+                u8::from(self.blocked_on_external_bytes)
+            ),
+            format!("external_present={}", u8::from(self.external_present)),
+            format!("compare_ran={}", u8::from(self.compare_ran)),
+            format!("sha_match={}", u8::from(self.sha_match)),
+            format!("structural_match={}", u8::from(self.structural_match)),
+            format!(
+                "refused_local_post_patch={}",
+                u8::from(self.refused_local_post_patch)
+            ),
+            format!(
+                "refused_ve2_not_aie2={}",
+                u8::from(self.refused_ve2_not_aie2)
+            ),
+            format!("platform_not_aie2={}", u8::from(self.platform_not_aie2)),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Compose bag-drop + lab feed + dry-run scorecard (stamp `2b01425e`).
+///
+/// - `bag_drop`: fail-closed bag completeness
+/// - `feed`: lab export fingerprint feed (auto-feed surface)
+/// - `external`: optional external ctrltext (None/empty → blocked when not refused)
+/// - `proposed_basename` / `platform_claim`: refuse matrix (post_patch / VE2)
+///
+/// Bag-drop and feed refuse flags **force** refuse even when the caller passes
+/// a non-refused basename/platform (cannot clobber prior refuse). Match ≠ Pass.
+/// Always `residual_not_closed=true` and all alone_closes locks false.
+#[must_use]
+pub fn research_app_load_bag_feed_dry_run_scorecard(
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> AppLoadBagFeedDryRunScorecard {
+    research_app_load_bag_feed_dry_run_scorecard_ex(
+        bag_drop,
+        feed,
+        external,
+        proposed_basename,
+        platform_claim,
+        false,
+    )
+}
+
+/// Extended composition scorecard (external_load_refused detail path).
+///
+/// Same honesty locks as [`research_app_load_bag_feed_dry_run_scorecard`].
+/// When `external_load_refused` and bag absent (not refuse-matrix), detail is
+/// `scorecard_external_load_refused_blocked_on_bytes` (still
+/// `blocked_on_external_bytes=1`).
+#[must_use]
+pub fn research_app_load_bag_feed_dry_run_scorecard_ex(
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+    external_load_refused: bool,
+) -> AppLoadBagFeedDryRunScorecard {
+    // Force refuse from bag_drop + feed: non-refused caller overrides must not drop.
+    let basename = if bag_drop.refused_local_post_patch_basename || feed.refused_local_post_patch {
+        let caller_refused = proposed_basename.filter(|b| {
+            !b.is_empty() && is_refused_local_post_patch_as_known_good(std::path::Path::new(b))
+        });
+        Some(caller_refused.unwrap_or("instr_post_patch.bin"))
+    } else {
+        proposed_basename
+    };
+    let platform = if bag_drop.refused_ve2_not_aie2 || feed.platform_not_aie2 {
+        let caller_ve2 = platform_claim
+            .filter(|c| !c.trim().is_empty() && platform_claim_is_not_aie2_known_good(c));
+        Some(caller_ve2.unwrap_or("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"))
+    } else {
+        platform_claim
+    };
+
+    let dry = research_external_ctrltext_compare_dry_run_from_lab_feed_ex(
+        feed,
+        external,
+        basename,
+        platform,
+        None,
+        None,
+        external_load_refused,
+    );
+
+    let refused_post = dry.refused_local_post_patch
+        || bag_drop.refused_local_post_patch_basename
+        || feed.refused_local_post_patch;
+    let refused_ve2 =
+        dry.refused_ve2_not_aie2 || bag_drop.refused_ve2_not_aie2 || feed.platform_not_aie2;
+    let platform_not_aie2 =
+        dry.platform_not_aie2 || feed.platform_not_aie2 || bag_drop.refused_ve2_not_aie2;
+
+    // Distinct detail tokens — refuse first, then blocked, then compare outcomes.
+    let detail = if refused_post {
+        "scorecard_refused_local_post_patch_residual_open"
+    } else if refused_ve2 {
+        "scorecard_refused_ve2_not_aie2_residual_open"
+    } else if dry.blocked_on_external_bytes {
+        if external_load_refused {
+            "scorecard_external_load_refused_blocked_on_bytes"
+        } else if dry.lab_export_ready {
+            "scorecard_lab_ready_blocked_on_external_bytes"
+        } else {
+            "scorecard_blocked_on_external_bytes_lab_not_ready"
+        }
+    } else if dry.compare_ran && dry.sha_match && dry.structural_match {
+        "scorecard_sha_and_structural_match_residual_still_open"
+    } else if dry.compare_ran && dry.sha_match {
+        "scorecard_sha_match_residual_still_open"
+    } else if dry.compare_ran && dry.structural_match {
+        // Align with dry-run `dry_run_structural_match_sha_diff_residual_open`.
+        "scorecard_structural_match_sha_diff_residual_open"
+    } else if dry.compare_ran {
+        "scorecard_mismatch_residual_open"
+    } else if dry.external_present && !dry.lab_export_ready {
+        "scorecard_lab_export_not_ready_external_present_residual_open"
+    } else {
+        "scorecard_bag_feed_dry_run_residual_open"
+    };
+
+    AppLoadBagFeedDryRunScorecard {
+        bag_drop_complete: bag_drop.bag_drop_complete,
+        bag_ctrltext_bytes_present: bag_drop.ctrltext_bytes_present,
+        lab_export_ready: dry.lab_export_ready,
+        lab_export_auto_feed: true,
+        blocked_on_external_bytes: dry.blocked_on_external_bytes,
+        external_present: dry.external_present,
+        compare_ran: dry.compare_ran,
+        sha_match: dry.sha_match,
+        structural_match: dry.structural_match,
+        refused_local_post_patch: refused_post,
+        refused_ve2_not_aie2: refused_ve2,
+        platform_not_aie2,
+        residual_not_closed: true,
+        bag_drop_alone_closes_fw_residual: false,
+        feed_alone_closes_fw_residual: false,
+        dry_run_alone_closes_fw_residual: false,
+        scorecard_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Unit surface: locked C2 residual context + absent external bag (bytes missing).
+///
+/// Lab feed absent → not ready; dry-run / scorecard → `blocked_on_external_bytes=1`.
+/// Honesty trio + residual_not_closed + all alone_closes=0.
+#[must_use]
+pub fn research_app_load_bag_feed_dry_run_scorecard_c2_locked_absent_bag()
+-> AppLoadBagFeedDryRunScorecard {
+    let bag = check_external_known_good_bag_drop(false, None, None, None);
+    let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+    research_app_load_bag_feed_dry_run_scorecard(&bag, &feed, None, None, None)
+}
+
+// ---------------------------------------------------------------------------
+// Extract → bag-drop → composition scorecard pipeline (stamp `588c1c72`)
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`AppLoadExtractBagScorecardPipeline::format_soft_note`].
+pub const APP_LOAD_EXTRACT_BAG_SCORECARD_PIPELINE_NOTE: &str =
+    "app_load_extract_bag_scorecard_pipeline";
+
+/// Pure **extract → bag-drop → composition scorecard** pipeline (stamp `588c1c72`).
+///
+/// Beyond bag+feed+dry-run alone (`2b01425e`): one research row that folds
+/// [`research_xclbin_extract_dry_run`] (public section markers / magic) into
+/// bag-drop + [`research_app_load_bag_feed_dry_run_scorecard_ex`].
+///
+/// When public section markers exist **without** ctrltext bytes, still reports
+/// explicit **`blocked_on_external_bytes=1`** and residual open — markers alone
+/// never invent Pass / bag-drop complete / product known-good.
+///
+/// Composes existing pure surfaces only:
+/// - [`XclbinExtractResearchDryRun`] / [`research_xclbin_extract_dry_run`]
+/// - [`ExternalKnownGoodBagDropCheck`] / [`check_external_known_good_bag_drop`]
+/// - [`LabExportFingerprintFeed`]
+/// - [`AppLoadBagFeedDryRunScorecard`] / bag-feed composition
+///
+/// Hard locks (always in soft note, even if fields are mutated):
+/// - honesty trio + `product_known_good=0`
+/// - `residual_not_closed=1`
+/// - `extract_alone_closes_fw_residual=0`
+/// - `bag_drop_alone_closes_fw_residual=0`
+/// - `feed_alone_closes_fw_residual=0`
+/// - `dry_run_alone_closes_fw_residual=0`
+/// - `scorecard_alone_closes_fw_residual=0`
+/// - `pipeline_alone_closes_fw_residual=0`
+/// - `ctrltext_match_alone_closes_fw_residual=0`
+/// - `lab_export_auto_feed=1`
+/// - `do_not_invent_pdi_layout=1` / `public_pdi_image_decode=0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct AppLoadExtractBagScorecardPipeline {
+    /// Echo of extract magic_xclbin2.
+    pub extract_magic_xclbin2: bool,
+    /// Echo of extract AIE_PARTITION marker presence.
+    pub extract_has_aie_partition_marker: bool,
+    /// Echo of extract section marker count (capped).
+    pub extract_section_marker_count: u8,
+    /// Research bag candidate from extract (never product Pass).
+    pub extract_eligible_as_aie2_external_known_good: bool,
+    /// Extract VE2 / NOT_AIE2 refuse.
+    pub extract_platform_not_aie2_known_good: bool,
+    /// Echo of bag-drop completeness (still ≠ Pass).
+    pub bag_drop_complete: bool,
+    /// Echo of bag-drop ctrltext_bytes_present.
+    pub bag_ctrltext_bytes_present: bool,
+    /// Lab fingerprint ready for dry-run (from composition scorecard).
+    pub lab_export_ready: bool,
+    /// Always **true** from constructors — auto-feed research surface.
+    pub lab_export_auto_feed: bool,
+    /// Explicit bag-absent blocker after auto-feed (primary when external missing).
+    pub blocked_on_external_bytes: bool,
+    /// Non-empty external on dry-run path (not refuse).
+    pub external_present: bool,
+    /// Compare ran with both sides present.
+    pub compare_ran: bool,
+    /// Echo of dry-run/scorecard sha_match (research only; ≠ Pass).
+    pub sha_match: bool,
+    /// Echo of dry-run/scorecard structural_match.
+    pub structural_match: bool,
+    /// Local post_patch refuse (extract path / bag / feed / scorecard).
+    pub refused_local_post_patch: bool,
+    /// VE2 / NOT_AIE2 refuse (extract and/or bag/feed/scorecard).
+    pub refused_ve2_not_aie2: bool,
+    /// Tag when VE2 / NOT_AIE2 fixtures drive refuse (`platform_not_aie2=1`).
+    pub platform_not_aie2: bool,
+    /// Always **true**: residual remains open offline without live Pass evidence.
+    pub residual_not_closed: bool,
+    /// Always **false**: extract markers alone never close residual.
+    pub extract_alone_closes_fw_residual: bool,
+    /// Always **false**: bag-drop alone never closes residual.
+    pub bag_drop_alone_closes_fw_residual: bool,
+    /// Always **false**: feed alone never closes residual.
+    pub feed_alone_closes_fw_residual: bool,
+    /// Always **false**: dry-run alone never closes residual.
+    pub dry_run_alone_closes_fw_residual: bool,
+    /// Always **false**: bag+feed scorecard alone never closes residual.
+    pub scorecard_alone_closes_fw_residual: bool,
+    /// Always **false**: this pipeline alone never closes residual / invent Pass.
+    pub pipeline_alone_closes_fw_residual: bool,
+    /// Stable research detail token (distinct outcomes; not one lumped label).
+    pub detail: String,
+}
+
+impl Default for AppLoadExtractBagScorecardPipeline {
+    fn default() -> Self {
+        Self {
+            extract_magic_xclbin2: false,
+            extract_has_aie_partition_marker: false,
+            extract_section_marker_count: 0,
+            extract_eligible_as_aie2_external_known_good: false,
+            extract_platform_not_aie2_known_good: false,
+            bag_drop_complete: false,
+            bag_ctrltext_bytes_present: false,
+            lab_export_ready: false,
+            lab_export_auto_feed: true,
+            blocked_on_external_bytes: true,
+            external_present: false,
+            compare_ran: false,
+            sha_match: false,
+            structural_match: false,
+            refused_local_post_patch: false,
+            refused_ve2_not_aie2: false,
+            platform_not_aie2: false,
+            residual_not_closed: true,
+            extract_alone_closes_fw_residual: false,
+            bag_drop_alone_closes_fw_residual: false,
+            feed_alone_closes_fw_residual: false,
+            dry_run_alone_closes_fw_residual: false,
+            scorecard_alone_closes_fw_residual: false,
+            pipeline_alone_closes_fw_residual: false,
+            detail: "pipeline_default_blocked_on_external_bytes".into(),
+        }
+    }
+}
+
+impl AppLoadExtractBagScorecardPipeline {
+    /// Soft research note (honesty + residual_not_closed + alone_closes hard-coded).
+    ///
+    /// Honesty tokens are **hard-coded** (not from mutable struct fields).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            APP_LOAD_EXTRACT_BAG_SCORECARD_PIPELINE_NOTE.into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "extract_alone_closes_fw_residual=0".into(),
+            "bag_drop_alone_closes_fw_residual=0".into(),
+            "feed_alone_closes_fw_residual=0".into(),
+            "dry_run_alone_closes_fw_residual=0".into(),
+            "scorecard_alone_closes_fw_residual=0".into(),
+            "pipeline_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            "lab_export_auto_feed=1".into(),
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            format!(
+                "extract_magic_xclbin2={}",
+                u8::from(self.extract_magic_xclbin2)
+            ),
+            format!(
+                "extract_has_aie_partition_marker={}",
+                u8::from(self.extract_has_aie_partition_marker)
+            ),
+            format!(
+                "extract_section_marker_count={}",
+                self.extract_section_marker_count
+            ),
+            format!(
+                "extract_eligible_as_aie2_external_known_good={}",
+                u8::from(self.extract_eligible_as_aie2_external_known_good)
+            ),
+            format!(
+                "extract_platform_not_aie2_known_good={}",
+                u8::from(self.extract_platform_not_aie2_known_good)
+            ),
+            format!("bag_drop_complete={}", u8::from(self.bag_drop_complete)),
+            format!(
+                "bag_ctrltext_bytes_present={}",
+                u8::from(self.bag_ctrltext_bytes_present)
+            ),
+            format!("lab_export_ready={}", u8::from(self.lab_export_ready)),
+            format!(
+                "{}={}",
+                BLOCKED_ON_EXTERNAL_BYTES_TOKEN,
+                u8::from(self.blocked_on_external_bytes)
+            ),
+            format!("external_present={}", u8::from(self.external_present)),
+            format!("compare_ran={}", u8::from(self.compare_ran)),
+            format!("sha_match={}", u8::from(self.sha_match)),
+            format!("structural_match={}", u8::from(self.structural_match)),
+            format!(
+                "refused_local_post_patch={}",
+                u8::from(self.refused_local_post_patch)
+            ),
+            format!(
+                "refused_ve2_not_aie2={}",
+                u8::from(self.refused_ve2_not_aie2)
+            ),
+            format!("platform_not_aie2={}", u8::from(self.platform_not_aie2)),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Compose extract dry-run + bag-drop + bag-feed composition scorecard (stamp `588c1c72`).
+///
+/// - `extract`: public xclbin magic/markers research (never invents PDI / product known-good)
+/// - `bag_drop`: fail-closed bag completeness
+/// - `feed`: lab export fingerprint feed (auto-feed surface)
+/// - `external`: optional external ctrltext (None/empty → blocked when not refused)
+/// - `proposed_basename` / `platform_claim`: refuse matrix (post_patch / VE2)
+///
+/// Extract VE2 refuse, bag-drop refuse, and feed refuse **force** refuse even when
+/// the caller passes a non-refused basename/platform (cannot clobber prior refuse).
+/// Markers present without bytes → still `blocked_on_external_bytes=1`.
+/// Match ≠ Pass. Always `residual_not_closed=true` and all alone_closes locks false.
+#[must_use]
+pub fn research_app_load_extract_bag_scorecard_pipeline(
+    extract: &XclbinExtractResearchDryRun,
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> AppLoadExtractBagScorecardPipeline {
+    research_app_load_extract_bag_scorecard_pipeline_ex(
+        extract,
+        bag_drop,
+        feed,
+        external,
+        proposed_basename,
+        platform_claim,
+        false,
+    )
+}
+
+/// Extended extract→bag→scorecard pipeline (external_load_refused detail path).
+///
+/// Same honesty locks as [`research_app_load_extract_bag_scorecard_pipeline`].
+/// When `external_load_refused` and bag absent (not refuse-matrix), detail is
+/// `pipeline_external_load_refused_blocked_on_bytes` (still
+/// `blocked_on_external_bytes=1`).
+#[must_use]
+#[allow(clippy::too_many_arguments)] // research surface: extract + bag + feed + refuse + load flag
+pub fn research_app_load_extract_bag_scorecard_pipeline_ex(
+    extract: &XclbinExtractResearchDryRun,
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+    external_load_refused: bool,
+) -> AppLoadExtractBagScorecardPipeline {
+    // Force VE2 refuse from extract into platform_claim so bag/feed/scorecard merge.
+    let platform = if extract.platform_not_aie2_known_good
+        || bag_drop.refused_ve2_not_aie2
+        || feed.platform_not_aie2
+    {
+        let caller_ve2 = platform_claim
+            .filter(|c| !c.trim().is_empty() && platform_claim_is_not_aie2_known_good(c));
+        Some(caller_ve2.unwrap_or("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"))
+    } else {
+        platform_claim
+    };
+
+    let scorecard = research_app_load_bag_feed_dry_run_scorecard_ex(
+        bag_drop,
+        feed,
+        external,
+        proposed_basename,
+        platform,
+        external_load_refused,
+    );
+
+    let refused_post = scorecard.refused_local_post_patch
+        || bag_drop.refused_local_post_patch_basename
+        || feed.refused_local_post_patch;
+    let refused_ve2 = scorecard.refused_ve2_not_aie2
+        || extract.platform_not_aie2_known_good
+        || bag_drop.refused_ve2_not_aie2
+        || feed.platform_not_aie2;
+    let platform_not_aie2 = scorecard.platform_not_aie2
+        || extract.platform_not_aie2_known_good
+        || feed.platform_not_aie2
+        || bag_drop.refused_ve2_not_aie2;
+
+    // Distinct detail tokens — refuse first, then marker+blocked, then compare.
+    let markers_present = extract.has_aie_partition_marker
+        || extract.section_marker_count > 0
+        || extract.magic_xclbin2;
+    let detail = if refused_post {
+        "pipeline_refused_local_post_patch_residual_open"
+    } else if refused_ve2 {
+        "pipeline_refused_ve2_not_aie2_residual_open"
+    } else if scorecard.blocked_on_external_bytes {
+        if external_load_refused {
+            "pipeline_external_load_refused_blocked_on_bytes"
+        } else if extract.eligible_as_aie2_external_known_good {
+            // Research-eligible extract still needs real ctrltext bytes.
+            "pipeline_extract_eligible_research_only_blocked_on_external_bytes"
+        } else if extract.has_aie_partition_marker || extract.section_marker_count > 0 {
+            "pipeline_extract_markers_present_blocked_on_external_bytes"
+        } else if extract.magic_xclbin2 {
+            "pipeline_extract_magic_only_blocked_on_external_bytes"
+        } else if scorecard.lab_export_ready {
+            "pipeline_lab_ready_blocked_on_external_bytes"
+        } else {
+            "pipeline_blocked_on_external_bytes_lab_not_ready"
+        }
+    } else if scorecard.compare_ran && scorecard.sha_match && scorecard.structural_match {
+        "pipeline_sha_and_structural_match_residual_still_open"
+    } else if scorecard.compare_ran && scorecard.sha_match {
+        "pipeline_sha_match_residual_still_open"
+    } else if scorecard.compare_ran && scorecard.structural_match {
+        "pipeline_structural_match_sha_diff_residual_open"
+    } else if scorecard.compare_ran {
+        "pipeline_mismatch_residual_open"
+    } else if scorecard.external_present && !scorecard.lab_export_ready {
+        "pipeline_lab_export_not_ready_external_present_residual_open"
+    } else if markers_present {
+        "pipeline_extract_markers_present_residual_open"
+    } else {
+        "pipeline_extract_bag_scorecard_residual_open"
+    };
+
+    AppLoadExtractBagScorecardPipeline {
+        extract_magic_xclbin2: extract.magic_xclbin2,
+        extract_has_aie_partition_marker: extract.has_aie_partition_marker,
+        extract_section_marker_count: extract.section_marker_count,
+        extract_eligible_as_aie2_external_known_good: extract.eligible_as_aie2_external_known_good,
+        extract_platform_not_aie2_known_good: extract.platform_not_aie2_known_good,
+        bag_drop_complete: bag_drop.bag_drop_complete,
+        bag_ctrltext_bytes_present: bag_drop.ctrltext_bytes_present,
+        lab_export_ready: scorecard.lab_export_ready,
+        lab_export_auto_feed: true,
+        blocked_on_external_bytes: scorecard.blocked_on_external_bytes,
+        external_present: scorecard.external_present,
+        compare_ran: scorecard.compare_ran,
+        sha_match: scorecard.sha_match,
+        structural_match: scorecard.structural_match,
+        refused_local_post_patch: refused_post,
+        refused_ve2_not_aie2: refused_ve2,
+        platform_not_aie2,
+        residual_not_closed: true,
+        extract_alone_closes_fw_residual: false,
+        bag_drop_alone_closes_fw_residual: false,
+        feed_alone_closes_fw_residual: false,
+        dry_run_alone_closes_fw_residual: false,
+        scorecard_alone_closes_fw_residual: false,
+        pipeline_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Build pipeline from raw extract inputs + bag/feed surfaces (convenience).
+///
+/// Pure: builds [`research_xclbin_extract_dry_run`] then composes bag+feed scorecard.
+/// Never invents product known-good / Pass / residual closed.
+#[must_use]
+#[allow(clippy::too_many_arguments)] // research convenience: header + text + claim + bag + feed
+pub fn research_app_load_extract_bag_scorecard_pipeline_from_inputs(
+    header_bytes: &[u8],
+    section_or_info_text: Option<&str>,
+    extract_platform_claim: Option<&str>,
+    bag_drop: &ExternalKnownGoodBagDropCheck,
+    feed: &LabExportFingerprintFeed,
+    external: Option<&[u8]>,
+    proposed_basename: Option<&str>,
+    platform_claim: Option<&str>,
+) -> AppLoadExtractBagScorecardPipeline {
+    let extract =
+        research_xclbin_extract_dry_run(header_bytes, section_or_info_text, extract_platform_claim);
+    research_app_load_extract_bag_scorecard_pipeline(
+        &extract,
+        bag_drop,
+        feed,
+        external,
+        proposed_basename,
+        platform_claim,
+    )
+}
+
+/// Unit surface: locked C2 residual + empty extract + absent external bag.
+///
+/// Extract has no markers; bag absent; lab feed not ready →
+/// `blocked_on_external_bytes=1`. Honesty trio + residual_not_closed + all
+/// alone_closes=0. Never invents Pass.
+#[must_use]
+pub fn research_app_load_extract_bag_scorecard_pipeline_c2_locked_absent_bag()
+-> AppLoadExtractBagScorecardPipeline {
+    let extract = research_xclbin_extract_dry_run(&[], None, None);
+    let bag = check_external_known_good_bag_drop(false, None, None, None);
+    let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+    research_app_load_extract_bag_scorecard_pipeline(&extract, &bag, &feed, None, None, None)
+}
+
+// ---------------------------------------------------------------------------
+// Pure public-stack section marker fixture + confined marker path (stamp `93ccd077`)
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`PublicStackSectionMarkerFixtureResearch::format_soft_note`].
+pub const PUBLIC_STACK_SECTION_MARKER_FIXTURE_NOTE: &str = "public_stack_section_marker_fixture";
+
+/// Soft-note bag name for confined markers path / stage research.
+pub const RESEARCH_XCLBIN_SECTION_MARKERS_PATH_NOTE: &str = "research_xclbin_section_markers_path";
+
+/// Env: optional **confined path** to research-only xclbin section marker text
+/// (public names only; never product known-good / never PDI decode).
+///
+/// Allowed under temp root ∪ `testdata/xdna2_cmd/external_known_good/`;
+/// extensions `.txt` / `.sections` / `.info`; refuse post_patch basenames;
+/// O_NOFOLLOW open. Soft feeds extract half of the pipeline under PRINT.
+pub const ENV_LAB_XCLBIN_SECTION_MARKERS_PATH: &str = "XDNA2_LAB_XCLBIN_SECTION_MARKERS_PATH";
+
+/// Locked pure fixture: public xclbin section **names only** (no bodies, no PDI).
+///
+/// Drawn from [`XCLBIN_RESEARCH_SECTION_MARKERS`] / CU-PDI identity markers so
+/// unit tests can drive
+/// `pipeline_extract_markers_present_blocked_on_external_bytes` without inventing
+/// Pass or product known-good. Format mimics a short `xclbinutil --info` paste.
+pub const PUBLIC_STACK_XCLBIN_SECTION_MARKER_FIXTURE_TEXT: &str = "\
+Section: AIE_PARTITION
+Section: BITSTREAM
+Section: MEM_TOPOLOGY
+Section: IP_LAYOUT
+Section: CONNECTIVITY
+Section: BUILD_METADATA
+";
+
+/// Cap for research section-marker text (paste or file). Same order as soft paste.
+pub const MAX_XCLBIN_SECTION_MARKERS_TEXT_BYTES: usize = 64 * 1024;
+
+/// Pure **public-stack section marker fixture** research (stamp `93ccd077`).
+///
+/// Beyond extract→bag→scorecard pipeline alone (`588c1c72`): a locked pure
+/// fixture of public section **names** that feeds the extract half of the
+/// pipeline and **still** asserts `blocked_on_external_bytes=1` + residual open.
+/// Never invents ctrltext/PDI bytes, Pass, or product known-good.
+///
+/// Hard locks (always in soft note, even if fields are mutated):
+/// - honesty trio + `product_known_good=0`
+/// - `residual_not_closed=1`
+/// - `fixture_alone_closes_fw_residual=0`
+/// - `markers_alone_closes_fw_residual=0`
+/// - `pipeline_alone_closes_fw_residual=0`
+/// - `ctrltext_match_alone_closes_fw_residual=0`
+/// - `do_not_invent_pdi_layout=1` / `public_pdi_image_decode=0`
+/// - `invents_ctrltext_bytes=0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct PublicStackSectionMarkerFixtureResearch {
+    /// Distinct public section name markers found in the locked fixture text.
+    pub section_marker_count: u8,
+    /// Fixture lists `AIE_PARTITION`.
+    pub has_aie_partition_marker: bool,
+    /// Fixture lists `BITSTREAM`.
+    pub has_bitstream_marker: bool,
+    /// Always **false**: names only — never product known-good.
+    pub product_known_good: bool,
+    /// Always **false**: fixture does not invent ctrltext/PDI bytes.
+    pub invents_ctrltext_bytes: bool,
+    /// When fed into extract→bag→scorecard with absent bag, expected blocker.
+    pub feeds_pipeline_markers_blocked_on_external_bytes: bool,
+    /// Always **true**: residual remains open offline.
+    pub residual_not_closed: bool,
+    /// Always **false**: fixture alone never closes residual.
+    pub fixture_alone_closes_fw_residual: bool,
+    /// Always **false**: markers alone never close residual.
+    pub markers_alone_closes_fw_residual: bool,
+    /// Always **false**: pipeline alone never closes residual.
+    pub pipeline_alone_closes_fw_residual: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for PublicStackSectionMarkerFixtureResearch {
+    fn default() -> Self {
+        Self {
+            section_marker_count: 0,
+            has_aie_partition_marker: false,
+            has_bitstream_marker: false,
+            product_known_good: false,
+            invents_ctrltext_bytes: false,
+            feeds_pipeline_markers_blocked_on_external_bytes: true,
+            residual_not_closed: true,
+            fixture_alone_closes_fw_residual: false,
+            markers_alone_closes_fw_residual: false,
+            pipeline_alone_closes_fw_residual: false,
+            detail: "fixture_default_blocked_on_external_bytes".into(),
+        }
+    }
+}
+
+impl PublicStackSectionMarkerFixtureResearch {
+    /// Soft research note (honesty + alone_closes hard-coded).
+    ///
+    /// Honesty tokens are **hard-coded** (not from mutable struct fields).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            PUBLIC_STACK_SECTION_MARKER_FIXTURE_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "fixture_alone_closes_fw_residual=0".into(),
+            "markers_alone_closes_fw_residual=0".into(),
+            "pipeline_alone_closes_fw_residual=0".into(),
+            "ctrltext_match_alone_closes_fw_residual=0".into(),
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            "invents_ctrltext_bytes=0".into(),
+            format!("section_marker_count={}", self.section_marker_count),
+            format!(
+                "has_aie_partition_marker={}",
+                u8::from(self.has_aie_partition_marker)
+            ),
+            format!(
+                "has_bitstream_marker={}",
+                u8::from(self.has_bitstream_marker)
+            ),
+            format!(
+                "feeds_pipeline_markers_blocked_on_external_bytes={}",
+                u8::from(self.feeds_pipeline_markers_blocked_on_external_bytes)
+            ),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Locked pure fixture text (public section names only).
+#[must_use]
+pub fn public_stack_xclbin_section_marker_fixture_text() -> &'static str {
+    PUBLIC_STACK_XCLBIN_SECTION_MARKER_FIXTURE_TEXT
+}
+
+/// Research the locked public-stack section marker fixture (stamp `93ccd077`).
+///
+/// Always `product_known_good=0` / `invents_ctrltext_bytes=0` /
+/// `fixture_alone_closes_fw_residual=0`. Never invents Pass.
+#[must_use]
+pub fn research_public_stack_section_marker_fixture() -> PublicStackSectionMarkerFixtureResearch {
+    let text = public_stack_xclbin_section_marker_fixture_text();
+    let markers = scan_xclbin_section_markers_from_text(text);
+    #[allow(clippy::cast_possible_truncation)]
+    let count = markers.len().min(255) as u8;
+    let has_aie = markers.contains(&"AIE_PARTITION");
+    let has_bs = markers.contains(&"BITSTREAM");
+    PublicStackSectionMarkerFixtureResearch {
+        section_marker_count: count,
+        has_aie_partition_marker: has_aie,
+        has_bitstream_marker: has_bs,
+        product_known_good: false,
+        invents_ctrltext_bytes: false,
+        feeds_pipeline_markers_blocked_on_external_bytes: true,
+        residual_not_closed: true,
+        fixture_alone_closes_fw_residual: false,
+        markers_alone_closes_fw_residual: false,
+        pipeline_alone_closes_fw_residual: false,
+        detail: "fixture_public_section_names_only_blocked_on_external_bytes".into(),
+    }
+}
+
+/// Extract dry-run from the locked pure fixture (names only; no magic bytes).
+///
+/// No working-stack claim → not research-eligible product path; markers present
+/// so pipeline detail becomes
+/// `pipeline_extract_markers_present_blocked_on_external_bytes` when bag absent.
+/// Never invents Pass / product known-good.
+#[must_use]
+pub fn research_public_stack_section_marker_fixture_extract() -> XclbinExtractResearchDryRun {
+    research_xclbin_extract_dry_run(
+        &[],
+        Some(public_stack_xclbin_section_marker_fixture_text()),
+        None,
+    )
+}
+
+/// Unit surface: fixture markers + absent bag → pipeline still blocked.
+///
+/// Detail locked to
+/// `pipeline_extract_markers_present_blocked_on_external_bytes`. Honesty +
+/// residual_not_closed + all alone_closes=0. Never invents Pass.
+#[must_use]
+pub fn research_public_stack_marker_pipeline_c2_locked_blocked()
+-> AppLoadExtractBagScorecardPipeline {
+    let extract = research_public_stack_section_marker_fixture_extract();
+    let bag = check_external_known_good_bag_drop(false, None, None, None);
+    let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+    research_app_load_extract_bag_scorecard_pipeline(&extract, &bag, &feed, None, None, None)
+}
+
+/// True when the final path component has an allowed **section markers** extension.
+///
+/// Allowed: `.txt`, `.sections`, `.info` (case-insensitive). Not `.bin` /
+/// `.ctrltext` (those are ctrltext bag bytes) and not binary xclbin bodies.
+#[must_use]
+pub fn xclbin_section_markers_extension_ok(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("txt")
+            || ext.eq_ignore_ascii_case("sections")
+            || ext.eq_ignore_ascii_case("info")
+    })
+}
+
+/// Whether a research section-markers **path** is allowed (roots + ext + refuse).
+///
+/// **Confinement** (mirrors external known-good roots):
+/// - Under [`last_apply_temp_root`] **or** [`external_known_good_lab_root`]
+/// - Extension `.txt` / `.sections` / `.info` only
+/// - No `..` components
+/// - Refuse local post-patch oracle basenames
+/// - Resolve intermediate dir symlinks via `canonicalize(parent)` before root check
+///
+/// Does **not** open the file. Markers path **≠** product known-good.
+#[must_use]
+pub fn xclbin_section_markers_path_is_allowed(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if !xclbin_section_markers_extension_ok(path) {
+        return false;
+    }
+    if is_refused_local_post_patch_as_known_good(path) {
+        return false;
+    }
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return path_under_external_known_good_roots(path);
+    };
+    if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+        let candidate = canon_parent.join(path.file_name().unwrap_or_default());
+        if is_refused_local_post_patch_as_known_good(&candidate) {
+            return false;
+        }
+        path_under_external_known_good_roots(&candidate)
+    } else if path.is_absolute() {
+        false
+    } else {
+        path_under_external_known_good_roots(path)
+    }
+}
+
+/// Soft-load path for markers: path allow + refuse final-component symlink.
+///
+/// Does **not** require bag PROVENANCE (markers are research names only, not
+/// product known-good ctrltext). Never invents Pass.
+#[must_use]
+pub fn xclbin_section_markers_load_path_is_allowed(path: &std::path::Path) -> bool {
+    if !xclbin_section_markers_path_is_allowed(path) {
+        return false;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+    }
+    if path.exists() {
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        if !path_under_external_known_good_roots(&canon) {
+            return false;
+        }
+        if is_refused_local_post_patch_as_known_good(&canon) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pure validation of research section-marker **text** (names only).
+///
+/// - Empty / whitespace → not ready
+/// - Invent / honesty-inverse tokens refuse (`invent_pass=1`, `product_known_good=1`, …)
+/// - At least one public marker from [`XCLBIN_RESEARCH_SECTION_MARKERS`] required
+/// - Never product known-good / Pass
+#[must_use]
+pub fn validate_research_xclbin_section_markers_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    // Refuse invent / honesty-inverse claims embedded in marker pastes.
+    if lower.contains("invent_pass=1")
+        || lower.contains("invent_pass=true")
+        || lower.contains("product_known_good=1")
+        || lower.contains("product_known_good=true")
+        || lower.contains("ran_on_npu=1")
+        || lower.contains("ran_on_npu=true")
+        || lower.contains("c_ready=1")
+        || lower.contains("not_c_ready=0")
+    {
+        return false;
+    }
+    !scan_xclbin_section_markers_from_text(t).is_empty()
+}
+
+/// Pure **stage check** for research-only xclbin section marker files (stamp `93ccd077`).
+///
+/// Confined operator path (research only): proposed basename + markers text under
+/// refuse rules. Never product known-good. Stage allowed ≠ Pass ≠ residual closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ResearchXclbinSectionMarkersStageCheck {
+    /// Basename present and not a refused post_patch oracle.
+    pub basename_allowed: bool,
+    /// Extension is `.txt` / `.sections` / `.info`.
+    pub extension_ok: bool,
+    /// Text validates as research public markers (no invent tokens).
+    pub markers_text_ok: bool,
+    /// Count of public markers when text ok (else 0).
+    pub section_marker_count: u8,
+    /// Local post_patch basename refuse.
+    pub refused_local_post_patch: bool,
+    /// VE2 / NOT_AIE2 platform claim refuse.
+    pub refused_ve2_not_aie2: bool,
+    /// Tag when VE2 / NOT_AIE2 (`platform_not_aie2=1`).
+    pub platform_not_aie2: bool,
+    /// Research stage path ok (all gates + not refuse). Still ≠ product known-good.
+    pub stage_allowed: bool,
+    /// Always **true**: residual remains open.
+    pub residual_not_closed: bool,
+    /// Always **false**: stage alone never closes residual.
+    pub stage_alone_closes_fw_residual: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for ResearchXclbinSectionMarkersStageCheck {
+    fn default() -> Self {
+        Self {
+            basename_allowed: false,
+            extension_ok: false,
+            markers_text_ok: false,
+            section_marker_count: 0,
+            refused_local_post_patch: false,
+            refused_ve2_not_aie2: false,
+            platform_not_aie2: false,
+            stage_allowed: false,
+            residual_not_closed: true,
+            stage_alone_closes_fw_residual: false,
+            detail: "stage_default_not_allowed".into(),
+        }
+    }
+}
+
+impl ResearchXclbinSectionMarkersStageCheck {
+    /// Soft research note (honesty hard-coded).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            RESEARCH_XCLBIN_SECTION_MARKERS_PATH_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "residual_not_closed=1".into(),
+            "stage_alone_closes_fw_residual=0".into(),
+            "markers_alone_closes_fw_residual=0".into(),
+            "pipeline_alone_closes_fw_residual=0".into(),
+            "do_not_invent_pdi_layout=1".into(),
+            "public_pdi_image_decode=0".into(),
+            format!("basename_allowed={}", u8::from(self.basename_allowed)),
+            format!("extension_ok={}", u8::from(self.extension_ok)),
+            format!("markers_text_ok={}", u8::from(self.markers_text_ok)),
+            format!("section_marker_count={}", self.section_marker_count),
+            format!(
+                "refused_local_post_patch={}",
+                u8::from(self.refused_local_post_patch)
+            ),
+            format!(
+                "refused_ve2_not_aie2={}",
+                u8::from(self.refused_ve2_not_aie2)
+            ),
+            format!("platform_not_aie2={}", u8::from(self.platform_not_aie2)),
+            format!("stage_allowed={}", u8::from(self.stage_allowed)),
+        ];
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Pure stage check for research-only section marker files (stamp `93ccd077`).
+///
+/// - `proposed_basename`: e.g. `public_stack_sections.txt` (not post_patch oracles)
+/// - `markers_text`: public section names paste (or fixture text)
+/// - `platform_claim`: optional VE2 refuse
+///
+/// Stage allowed ≠ product known-good ≠ Pass. Always residual_not_closed.
+#[must_use]
+pub fn check_research_xclbin_section_markers_stage(
+    proposed_basename: Option<&str>,
+    markers_text: Option<&str>,
+    platform_claim: Option<&str>,
+) -> ResearchXclbinSectionMarkersStageCheck {
+    let claim = platform_claim.unwrap_or("").trim();
+    let refused_ve2 = !claim.is_empty() && platform_claim_is_not_aie2_known_good(claim);
+    let base = proposed_basename.map(str::trim).filter(|s| !s.is_empty());
+    let path_for_ext = base.map(std::path::Path::new);
+    let refused_post = path_for_ext.is_some_and(is_refused_local_post_patch_as_known_good);
+    let extension_ok = path_for_ext.is_some_and(xclbin_section_markers_extension_ok);
+    let basename_allowed = base.is_some() && !refused_post && extension_ok;
+    let text = markers_text.map(str::trim).filter(|s| !s.is_empty());
+    let markers_text_ok = text.is_some_and(validate_research_xclbin_section_markers_text);
+    let markers = text
+        .map(scan_xclbin_section_markers_from_text)
+        .unwrap_or_default();
+    #[allow(clippy::cast_possible_truncation)]
+    let count = if markers_text_ok {
+        markers.len().min(255) as u8
+    } else {
+        0
+    };
+    let stage_allowed = basename_allowed && markers_text_ok && !refused_ve2;
+    let detail = if refused_post {
+        "stage_refused_local_post_patch"
+    } else if refused_ve2 {
+        "stage_refused_ve2_not_aie2"
+    } else if base.is_none() {
+        "stage_basename_absent"
+    } else if !extension_ok {
+        "stage_extension_not_markers_text"
+    } else if text.is_none() {
+        "stage_markers_text_absent"
+    } else if !markers_text_ok {
+        "stage_markers_text_invalid_or_invent"
+    } else if stage_allowed {
+        "stage_research_only_allowed_not_product_known_good"
+    } else {
+        "stage_not_allowed"
+    };
+    ResearchXclbinSectionMarkersStageCheck {
+        basename_allowed,
+        extension_ok,
+        markers_text_ok,
+        section_marker_count: count,
+        refused_local_post_patch: refused_post,
+        refused_ve2_not_aie2: refused_ve2,
+        platform_not_aie2: refused_ve2,
+        stage_allowed,
+        residual_not_closed: true,
+        stage_alone_closes_fw_residual: false,
+        detail: detail.into(),
+    }
+}
+
+/// Load research section-marker text from a confined path (O_NOFOLLOW).
+///
+/// Cap [`MAX_XCLBIN_SECTION_MARKERS_TEXT_BYTES`]. Validates text after load.
+/// Never product known-good / Pass.
+///
+/// # Errors
+///
+/// Path refused, I/O failure, oversize, or text fails
+/// [`validate_research_xclbin_section_markers_text`].
+pub fn load_xclbin_section_markers_text_for_research(
+    path: &std::path::Path,
+) -> Result<String, DirectError> {
+    if !xclbin_section_markers_load_path_is_allowed(path) {
+        return Err(DirectError::InvalidArgument(format!(
+            "xclbin section markers path refused (confinement/ext/post_patch/symlink): {}",
+            path.display()
+        )));
+    }
+    use std::io::Read;
+    let mut f = open_external_ctrltext_nofollow(path).map_err(|e| {
+        DirectError::InvalidArgument(format!(
+            "xclbin section markers open failed ({}): {e}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    f.by_ref()
+        .take(MAX_XCLBIN_SECTION_MARKERS_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            DirectError::InvalidArgument(format!(
+                "xclbin section markers read failed ({}): {e}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_XCLBIN_SECTION_MARKERS_TEXT_BYTES {
+        return Err(DirectError::InvalidArgument(format!(
+            "xclbin section markers text oversized ({} > {})",
+            bytes.len(),
+            MAX_XCLBIN_SECTION_MARKERS_TEXT_BYTES
+        )));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        DirectError::InvalidArgument(format!(
+            "xclbin section markers not UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    if !validate_research_xclbin_section_markers_text(&text) {
+        return Err(DirectError::InvalidArgument(format!(
+            "xclbin section markers text invalid or invent tokens: {}",
+            path.display()
+        )));
+    }
+    Ok(text)
+}
+
+/// Resolve optional [`ENV_LAB_XCLBIN_SECTION_MARKERS_PATH`] → confined text or `None`.
+///
+/// - Unset / empty → `Ok(None)`
+/// - Set + refuse / I/O / invalid → `Err`
+/// - Set + load OK → `Ok(Some(text))` for extract research only
+///
+/// # Errors
+///
+/// Path refused or load failure when env is non-empty.
+pub fn load_xclbin_section_markers_text_from_env() -> Result<Option<String>, DirectError> {
+    let Ok(raw) = std::env::var(ENV_LAB_XCLBIN_SECTION_MARKERS_PATH) else {
+        return Ok(None);
+    };
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let path = std::path::PathBuf::from(t);
+    Ok(Some(load_xclbin_section_markers_text_for_research(&path)?))
+}
+
+/// Open external known-good bytes without following a final-component symlink.
+///
+/// Unix: `O_NOFOLLOW`. Non-Unix: residual TOCTOU after [`symlink_metadata`] refuse.
+fn read_external_ctrltext_nofollow_capped(path: &std::path::Path) -> Result<Vec<u8>, DirectError> {
+    use std::io::Read;
+    let mut f = open_external_ctrltext_nofollow(path).map_err(|e| {
+        DirectError::InvalidArgument(format!(
+            "external known-good open failed ({}): {e}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    f.by_ref()
+        .take(MAX_MLADF_LAB_FILE_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            DirectError::InvalidArgument(format!(
+                "external known-good read failed ({}): {e}",
+                path.display()
+            ))
+        })?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_external_ctrltext_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_external_ctrltext_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // Residual TOCTOU: path policy refuses symlink via symlink_metadata only.
+    std::fs::File::open(path)
+}
+
+/// Resolve optional [`ENV_LAB_EXTERNAL_CTRLTEXT`] → confined load or `None`.
+///
+/// - Unset / empty → `Ok(None)` (honest absent path; compare uses no external).
+/// - Set + confinement fail / I/O → `Err` (caller soft-WARNs; never invent bytes).
+/// - Set + load OK → `Ok(Some(bytes))` for research compare only.
+///
+/// # Errors
+///
+/// Path refused or read failure when env is non-empty.
+pub fn load_external_ctrltext_from_env() -> Result<Option<Vec<u8>>, DirectError> {
+    let Ok(raw) = std::env::var(ENV_LAB_EXTERNAL_CTRLTEXT) else {
+        return Ok(None);
+    };
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let path = std::path::PathBuf::from(t);
+    Ok(Some(load_external_ctrltext_for_compare(&path)?))
+}
+
+// ---------------------------------------------------------------------------
 // Track L — public FW APP_LOAD / PDI / partition load surface (no private PDI)
 // ---------------------------------------------------------------------------
 
@@ -2091,6 +7522,192 @@ pub fn research_app_load_pdi_partition_c2_locked(
         Some(c2_locked_app_load_journal_text()),
         userspace_content_ok,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Journal `0x3000003` partition-id field map (public surface only)
+// ---------------------------------------------------------------------------
+
+/// Public journal field name for the Failed-cmd status code.
+pub const APP_LOAD_JOURNAL_FIELD_FAILED_CMD: &str = "failed_cmd_status";
+
+/// Public journal field name for the chain/completion status code.
+pub const APP_LOAD_JOURNAL_FIELD_CHAIN_STATUS: &str = "chain_status";
+
+/// Public token: partition **id** is absent on the offline journal surface.
+///
+/// Journal paste yields status **codes/names** only. There is no public
+/// `partition_id` / column-id field to map without private decode. Soft notes
+/// always emit this token (never invent an id).
+pub const APP_LOAD_PARTITION_ID_PUBLIC_TOKEN: &str = "absent_public";
+
+/// Soft research: public field map for FW `APP_LOAD_PDI_FAIL` (`0x3000003`).
+///
+/// Unit-locks which journal fields we actually parse vs what remains absent:
+/// - `failed_cmd_status` → primary load-reject code (name via [`aie2_fw_status_name`])
+/// - `chain_status` → secondary chain code (often `0x4000003` INVALID_PARAM)
+/// - `partition_id` → always [`APP_LOAD_PARTITION_ID_PUBLIC_TOKEN`] (`absent_public`)
+///
+/// Stamp `7a5ab864`. **Not** root-cause closed. **Not** Pass / C-ready / `ran_on_npu`.
+/// Field map alone **never** closes FW residual.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct AppLoadPartitionIdFieldMap {
+    /// Failed-cmd status when journal provided a literal hex.
+    pub failed_cmd_status: Option<u32>,
+    /// Chain/completion status when journal provided a literal hex.
+    pub chain_status: Option<u32>,
+    /// True when failed_cmd is [`AIE2_FW_APP_LOAD_PDI_FAIL`].
+    pub failed_cmd_is_app_load: bool,
+    /// True when chain is [`AIE2_FW_INVALID_PARAM`].
+    pub chain_is_invalid_param: bool,
+    /// Locked live C2 dual pair present.
+    pub c2_app_load_pair: bool,
+    /// Always [`APP_LOAD_PARTITION_ID_PUBLIC_TOKEN`] from constructors / Default.
+    pub partition_id_public: &'static str,
+    /// Always **true**: never invent a partition id from public paste.
+    pub do_not_invent_partition_id: bool,
+    /// Always **false**: field map alone does not close FW residual / invent Pass.
+    pub field_map_alone_closes_fw_residual: bool,
+    /// Always **false**: never invent root-cause closed.
+    pub root_cause_closed: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for AppLoadPartitionIdFieldMap {
+    fn default() -> Self {
+        Self {
+            failed_cmd_status: None,
+            chain_status: None,
+            failed_cmd_is_app_load: false,
+            chain_is_invalid_param: false,
+            c2_app_load_pair: false,
+            partition_id_public: APP_LOAD_PARTITION_ID_PUBLIC_TOKEN,
+            do_not_invent_partition_id: true,
+            field_map_alone_closes_fw_residual: false,
+            root_cause_closed: false,
+            detail: "default_no_journal".into(),
+        }
+    }
+}
+
+impl AppLoadPartitionIdFieldMap {
+    /// Soft research note (always honesty trio; never invent Pass / root-cause closed).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            "app_load_partition_id_field_map".into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            // Force honesty locks even if a hand-built bag mutates fields.
+            format!("partition_id_public={APP_LOAD_PARTITION_ID_PUBLIC_TOKEN}"),
+            "do_not_invent_partition_id=1".into(),
+            "field_map_alone_closes_fw_residual=0".into(),
+            "root_cause_closed=0".into(),
+            format!(
+                "partition_surface_public={}",
+                PUBLIC_PARTITION_SURFACE_TOKEN
+            ),
+            format!(
+                "failed_cmd_is_app_load={}",
+                u8::from(self.failed_cmd_is_app_load)
+            ),
+            format!(
+                "chain_is_invalid_param={}",
+                u8::from(self.chain_is_invalid_param)
+            ),
+            format!("c2_app_load_pair={}", u8::from(self.c2_app_load_pair)),
+            format!(
+                "journal_field_failed_cmd={}",
+                APP_LOAD_JOURNAL_FIELD_FAILED_CMD
+            ),
+            format!(
+                "journal_field_chain_status={}",
+                APP_LOAD_JOURNAL_FIELD_CHAIN_STATUS
+            ),
+        ];
+        match self.failed_cmd_status {
+            Some(c) => {
+                parts.push(format!("failed_cmd=0x{c:x}"));
+                parts.push(format!("failed_cmd_name={}", aie2_fw_status_name(c)));
+            }
+            None => parts.push("failed_cmd=absent".into()),
+        }
+        match self.chain_status {
+            Some(c) => {
+                parts.push(format!("chain_status=0x{c:x}"));
+                parts.push(format!("chain_name={}", aie2_fw_status_name(c)));
+            }
+            None => parts.push("chain_status=absent".into()),
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Build partition-id field map from an optional journal pair (no invent).
+///
+/// - `None` / empty pair → codes absent; partition_id still `absent_public`.
+/// - Always `root_cause_closed=false` / `field_map_alone_closes_fw_residual=false`.
+/// - Soft only; never Pass / C-ready / second unlock.
+#[must_use]
+pub fn research_app_load_partition_id_field_map(
+    journal: Option<&JournalFwStatusPair>,
+) -> AppLoadPartitionIdFieldMap {
+    let (failed, chain) = journal.map_or((None, None), |j| (j.failed_cmd_status, j.chain_status));
+    let failed_app = failed == Some(AIE2_FW_APP_LOAD_PDI_FAIL);
+    let chain_inv = chain == Some(AIE2_FW_INVALID_PARAM);
+    let pair = failed_app && chain_inv;
+    let detail = if pair {
+        "c2_pair_mapped_partition_id_absent"
+    } else if failed_app {
+        "failed_cmd_app_load_partition_id_absent"
+    } else if failed.is_some() || chain.is_some() {
+        "partial_codes_partition_id_absent"
+    } else {
+        "default_no_journal"
+    };
+    AppLoadPartitionIdFieldMap {
+        failed_cmd_status: failed,
+        chain_status: chain,
+        failed_cmd_is_app_load: failed_app,
+        chain_is_invalid_param: chain_inv,
+        c2_app_load_pair: pair,
+        partition_id_public: APP_LOAD_PARTITION_ID_PUBLIC_TOKEN,
+        do_not_invent_partition_id: true,
+        field_map_alone_closes_fw_residual: false,
+        root_cause_closed: false,
+        detail: detail.into(),
+    }
+}
+
+/// Parse optional journal text then run [`research_app_load_partition_id_field_map`].
+///
+/// Oversized / empty text → absent codes (same cap as Track L). Soft only.
+#[must_use]
+pub fn research_app_load_partition_id_field_map_from_journal(
+    journal_text: Option<&str>,
+) -> AppLoadPartitionIdFieldMap {
+    let pair = journal_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| s.len() <= MAX_APP_LOAD_JOURNAL_TEXT_BYTES)
+        .map(parse_journal_fw_status_pair);
+    research_app_load_partition_id_field_map(pair.as_ref())
+}
+
+/// Convenience: locked C2 journal paste → field map with partition_id absent.
+#[must_use]
+pub fn research_app_load_partition_id_field_map_c2_locked() -> AppLoadPartitionIdFieldMap {
+    research_app_load_partition_id_field_map_from_journal(Some(c2_locked_app_load_journal_text()))
 }
 
 // ---------------------------------------------------------------------------
@@ -7212,6 +12829,4935 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
                 ran,
                 "XDNA2_REQUIRE_STAGED_ELF requires full staged mladf ELF for Track K"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Construction path research (lab instr-only vs public CU/PDI + CONFIG_CU)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn construction_path_empty_elf_honesty_and_gap() {
+        let r = research_construction_path_lab_vs_public(&[]);
+        assert!(!r.lab_has_instr_ctrltext);
+        assert!(!r.lab_has_cu_pdi_config, "lab never CONFIG_CU");
+        assert!(r.public_stack_requires_cu_pdi_step);
+        assert!(
+            r.construction_gap_cu_pdi,
+            "gap stays true even when ELF empty (public requires, lab lacks)"
+        );
+        assert_eq!(r.detail, "elf_empty_skip");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "construction_path_research"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "construction_gap_cu_pdi=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_has_instr=0"));
+        assert!(residual_note_has_exact_token(&n, "lab_has_cu_pdi_config=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_stack_cu_pdi_step=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        // Soft note must never claim product Pass (exact tokens only — substring
+        // `ran_on_npu=1` would false-positive match honesty `not_ran_on_npu=1`).
+        assert!(!n.contains("ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+    }
+
+    #[test]
+    fn construction_path_garbage_and_synthetic_noop() {
+        let g = research_construction_path_lab_vs_public(b"not-elf");
+        assert!(!g.lab_has_instr_ctrltext);
+        assert!(g.construction_gap_cu_pdi);
+        assert!(!g.lab_has_cu_pdi_config);
+        assert_eq!(g.detail, "not_aiebu_elf_ctrltext");
+        // Non-ELF must not claim rela_count=0 (reads as empty rela table).
+        assert!(g.lab_rela_count.is_none());
+        let gn = g.format_soft_note();
+        assert!(residual_note_has_exact_token(&gn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&gn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&gn, "not_ran_on_npu=1"));
+        assert!(!gn.contains("ran_on_npu=true"));
+        assert!(!gn.contains("lab_rela_count="));
+
+        // Synthetic aiebu + rela + walkable classic ctrltext → lab instr ok, gap still open.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let s = research_construction_path_lab_vs_public(&synth);
+        assert!(
+            s.lab_has_instr_ctrltext,
+            "synthetic ELF must lock lab_has_instr: detail={}",
+            s.detail
+        );
+        assert!(!s.lab_has_cu_pdi_config);
+        assert!(s.public_stack_requires_cu_pdi_step);
+        assert!(s.construction_gap_cu_pdi);
+        assert_eq!(s.lab_rela_count, Some(1));
+        assert!(s.lab_ctrltext_len.is_some_and(|n| n > 0));
+        let sn = s.format_soft_note();
+        assert!(residual_note_has_exact_token(&sn, "lab_has_instr=1"));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "construction_gap_cu_pdi=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "lab_has_cu_pdi_config=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "public_stack_cu_pdi_step=1"
+        ));
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&sn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&sn, "not_ran_on_npu=1"));
+        assert!(!sn.contains("ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&sn, "invent_pass=1"));
+    }
+
+    #[test]
+    fn construction_path_classic_walk_ok_no_rela() {
+        // aiebu + classic-walkable ctrltext but empty rela table → not lab-instr-ready.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[]);
+        let r = research_construction_path_lab_vs_public(&synth);
+        assert!(
+            !r.lab_has_instr_ctrltext,
+            "zero rela must not claim lab instr ready: detail={}",
+            r.detail
+        );
+        assert_eq!(r.detail, "classic_walk_ok_no_rela");
+        assert_eq!(r.lab_rela_count, Some(0));
+        assert!(r.lab_ctrltext_len.is_some_and(|n| n > 0));
+        assert!(!r.lab_has_cu_pdi_config);
+        assert!(r.construction_gap_cu_pdi);
+        assert!(r.public_stack_requires_cu_pdi_step);
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "lab_has_instr=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "construction_gap_cu_pdi=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_has_cu_pdi_config=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(!n.contains("ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CU/PDI necessity residual matrix (ctrltext-only vs CONFIG_CU identity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cu_pdi_necessity_gap_open_fw_residual_honesty() {
+        let construction = research_construction_path_lab_vs_public(&[]);
+        let r = research_cu_pdi_necessity_for_app_load(&construction, true, false);
+        assert!(r.lab_is_ctrltext_only);
+        assert!(r.public_has_cu_pdi_step);
+        assert!(r.construction_gap_open);
+        assert!(r.fw_name_app_load_pdi_fail);
+        assert!(!r.external_ctrltext_sha_match);
+        assert!(
+            !r.ctrltext_match_alone_closes_fw_residual,
+            "match alone never closes residual"
+        );
+        assert!(
+            r.cu_pdi_identity_may_be_required,
+            "open hypothesis when gap+fw residual"
+        );
+        assert_eq!(r.detail, "gap_open_fw_app_load");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "cu_pdi_necessity_research"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_is_ctrltext_only=1"));
+        assert!(residual_note_has_exact_token(&n, "construction_gap_open=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "fw_name_app_load_pdi_fail=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "cu_pdi_identity_may_be_required=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+    }
+
+    #[test]
+    fn cu_pdi_necessity_sha_match_still_open_residual() {
+        // Even when research external ctrltext sha matches lab export, FW residual
+        // + construction gap stay open — match ≠ Pass.
+        let construction = research_construction_path_lab_vs_public(&[]);
+        let r = research_cu_pdi_necessity_for_app_load(&construction, true, true);
+        assert!(r.external_ctrltext_sha_match);
+        assert!(!r.ctrltext_match_alone_closes_fw_residual);
+        assert!(r.cu_pdi_identity_may_be_required);
+        assert_eq!(r.detail, "sha_match_fw_residual_still_open");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_ctrltext_sha_match=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        // Soft note hard-forces match_alone=0 even if a hand-built bag mutates field.
+        let mut mutated = r.clone();
+        mutated.ctrltext_match_alone_closes_fw_residual = true;
+        let mn = mutated.format_soft_note();
+        assert!(
+            residual_note_has_exact_token(&mn, "ctrltext_match_alone_closes_fw_residual=0"),
+            "format_soft_note must force match_alone=0: {mn}"
+        );
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "ctrltext_match_alone_closes_fw_residual=1"
+        ));
+
+        // Locked convenience for C2 residual matrix.
+        let locked = research_cu_pdi_necessity_c2_locked(true);
+        assert!(locked.fw_name_app_load_pdi_fail);
+        assert!(locked.cu_pdi_identity_may_be_required);
+        assert!(!locked.ctrltext_match_alone_closes_fw_residual);
+        let ln = locked.format_soft_note();
+        assert!(residual_note_has_exact_token(&ln, "invent_pass=0"));
+        assert!(!residual_note_has_exact_token(&ln, "ran_on_npu=1"));
+    }
+
+    #[test]
+    fn cu_pdi_necessity_no_fw_flag_not_required_claim() {
+        // Gap open but no FW residual flag → may_be_required stays false
+        // (do not invent APP_LOAD from construction gap alone).
+        let construction = research_construction_path_lab_vs_public(&[]);
+        let r = research_cu_pdi_necessity_for_app_load(&construction, false, false);
+        assert!(r.construction_gap_open);
+        assert!(!r.fw_name_app_load_pdi_fail);
+        assert!(!r.cu_pdi_identity_may_be_required);
+        assert_eq!(r.detail, "gap_open_no_fw_flag");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "cu_pdi_identity_may_be_required=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // APP_LOAD residual axis matrix (partition vs CU/PDI vs ctrltext-only)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn app_load_residual_axis_matrix_c2_locked_honesty() {
+        // Locked C2: FW 0x3000003 name + construction gap + ctrltext-only lab.
+        let m = research_app_load_residual_axis_matrix_c2_locked(false);
+        assert!(m.axis_fw_status_name_app_load);
+        assert!(m.axis_partition_surface_status_name_only);
+        assert!(m.axis_lab_ctrltext_only);
+        assert!(m.axis_public_cu_pdi_step);
+        assert!(m.axis_construction_gap_open);
+        assert!(m.axis_cu_pdi_identity_hypothesis_open);
+        assert!(!m.axis_external_ctrltext_sha_match);
+        assert!(!m.ctrltext_match_alone_closes_fw_residual);
+        assert!(!m.partition_name_alone_proves_root_cause);
+        assert_eq!(m.detail, "gap_open_fw_app_load_axes");
+        let n = m.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "app_load_residual_axis_matrix"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_fw_status_name_app_load=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_partition_surface_status_name_only=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_lab_ctrltext_only=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_construction_gap_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_cu_pdi_identity_hypothesis_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "partition_name_alone_proves_root_cause=0"
+        ));
+        // FW axis open → emit locked C2 code/name (not invent from gap alone).
+        assert!(residual_note_has_exact_token(&n, "fw_code=0x3000003"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "fw_name=APP_LOAD_PDI_FAIL"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "fw_code=absent"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Contradictory invent tokens must not appear.
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "c_ready=1"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "partition_name_alone_proves_root_cause=1"
+        ));
+    }
+
+    #[test]
+    fn app_load_residual_axis_matrix_sha_match_still_open() {
+        // Research external sha match never closes residual axes.
+        let m = research_app_load_residual_axis_matrix_c2_locked(true);
+        assert!(m.axis_external_ctrltext_sha_match);
+        assert!(!m.ctrltext_match_alone_closes_fw_residual);
+        assert!(!m.partition_name_alone_proves_root_cause);
+        assert!(m.axis_cu_pdi_identity_hypothesis_open);
+        assert_eq!(m.detail, "sha_match_fw_residual_axes_open");
+        let n = m.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_external_ctrltext_sha_match=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Soft note forces locks even if bag fields are mutated.
+        let mut mutated = m.clone();
+        mutated.ctrltext_match_alone_closes_fw_residual = true;
+        mutated.partition_name_alone_proves_root_cause = true;
+        mutated.axis_partition_surface_status_name_only = false;
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "partition_name_alone_proves_root_cause=0"
+        ));
+        // Surface token always forced =1 in soft notes (Issue 5).
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "axis_partition_surface_status_name_only=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "axis_partition_surface_status_name_only=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "ctrltext_match_alone_closes_fw_residual=1"
+        ));
+    }
+
+    #[test]
+    fn app_load_residual_axis_matrix_no_fw_flag_not_required() {
+        // Gap open without FW residual → hypothesis closed (do not invent APP_LOAD).
+        let partition = AppLoadPdiPartitionResearch::default();
+        let construction = research_construction_path_lab_vs_public(&[]);
+        let necessity = research_cu_pdi_necessity_for_app_load(&construction, false, false);
+        let m = research_app_load_residual_axis_matrix(&partition, &necessity);
+        assert!(!m.axis_fw_status_name_app_load);
+        assert!(m.axis_construction_gap_open);
+        assert!(!m.axis_cu_pdi_identity_hypothesis_open);
+        assert_eq!(m.detail, "gap_open_no_fw_flag");
+        let n = m.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_cu_pdi_identity_hypothesis_open=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_fw_status_name_app_load=0"
+        ));
+        // Honesty: never invent FW residual-class narrative when axis is off.
+        assert!(residual_note_has_exact_token(&n, "fw_code=absent"));
+        assert!(!residual_note_has_exact_token(&n, "fw_code=0x3000003"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "fw_name=APP_LOAD_PDI_FAIL"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "axis_partition_surface_status_name_only=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Xclbin extract research dry-run (public markers; VE2 refuse)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn xclbin_magic_and_section_markers_public_only() {
+        assert!(xclbin_magic_is_xclbin2(XCLBIN2_MAGIC));
+        assert!(xclbin_magic_is_xclbin2(b"xclbin2\0rest"));
+        assert!(!xclbin_magic_is_xclbin2(b""));
+        assert!(!xclbin_magic_is_xclbin2(b"xclbin1\0"));
+        assert!(!xclbin_magic_is_xclbin2(b"ELF"));
+
+        let info = "Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, AIE_PARTITION\n";
+        let markers = scan_xclbin_section_markers_from_text(info);
+        assert!(markers.contains(&"AIE_PARTITION"));
+        assert!(markers.contains(&"BITSTREAM"));
+        assert!(markers.contains(&"MEM_TOPOLOGY"));
+        assert_eq!(scan_xclbin_section_markers_from_text("   ").len(), 0);
+        assert_eq!(
+            scan_xclbin_section_markers_from_text("no sections").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn xclbin_extract_ve2_fixture_refused_not_known_good() {
+        // VE2 edge validate.xclbin is NOT_AIE2 — never AIE2 external known-good.
+        let header = *XCLBIN2_MAGIC;
+        let info = "\
+xclbin Information
+   Sections:               BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
+                           BUILD_METADATA, EMBEDDED_METADATA, SYSTEM_METADATA,
+                           GROUP_CONNECTIVITY, GROUP_TOPOLOGY, AIE_PARTITION
+   Platform VBNV:          xilinx_v1_ipu_0_0
+";
+        let r = research_xclbin_extract_ve2_fixture_refused(&header, Some(info));
+        assert!(r.magic_xclbin2);
+        assert!(r.has_aie_partition_marker);
+        assert!(r.section_marker_count >= 5);
+        assert!(r.platform_not_aie2_known_good);
+        assert!(
+            !r.eligible_as_aie2_external_known_good,
+            "VE2 must never be AIE2 known-good"
+        );
+        assert!(r.do_not_invent_pdi_layout);
+        assert!(!r.public_pdi_image_decode);
+        assert_eq!(r.detail, "refuse_not_aie2_or_ve2");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "xclbin_extract_research_dry_run"
+        ));
+        assert!(residual_note_has_exact_token(&n, "magic_xclbin2=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "platform_not_aie2_known_good=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "eligible_as_aie2_external_known_good=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "eligible_as_aie2_external_known_good=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "product_known_good=1"));
+
+        // Claim helpers: case-insensitive refuse; carve2 must not false-positive.
+        assert!(platform_claim_is_not_aie2_known_good(
+            "NOT_AIE2_KNOWN_GOOD=1"
+        ));
+        assert!(platform_claim_is_not_aie2_known_good("PLATFORM=VE2_EDGE"));
+        assert!(platform_claim_is_not_aie2_known_good(
+            "testdata/ve2_latency/x.xclbin"
+        ));
+        assert!(platform_claim_is_not_aie2_known_good("ve2"));
+        assert!(!platform_claim_is_not_aie2_known_good("carve2_board"));
+        assert!(!platform_claim_is_not_aie2_known_good(""));
+        assert!(!platform_claim_is_working_public_aie2_research(
+            "PLATFORM=VE2_EDGE xrt"
+        ));
+    }
+
+    #[test]
+    fn xclbin_extract_working_public_research_eligible_not_pass() {
+        // Positive research path: magic + AIE_PARTITION + working public claim.
+        // Soft still product_known_good=0 invent_pass=0 (eligible ≠ Pass).
+        let header = *XCLBIN2_MAGIC;
+        let info = "Sections: BITSTREAM, AIE_PARTITION, IP_LAYOUT\n";
+        let r = research_xclbin_extract_dry_run(
+            &header,
+            Some(info),
+            Some("Source stack: working public XRT / DynamicDispatch AIE2 npu4"),
+        );
+        assert!(r.magic_xclbin2);
+        assert!(r.has_aie_partition_marker);
+        assert!(!r.platform_not_aie2_known_good);
+        assert!(r.eligible_as_aie2_external_known_good);
+        assert_eq!(r.detail, "research_eligible_not_product_pass");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "eligible_as_aie2_external_known_good=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        // Mutated decode/invent fields must not leak into soft note.
+        let mut mutated = r.clone();
+        mutated.do_not_invent_pdi_layout = false;
+        mutated.public_pdi_image_decode = true;
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "public_pdi_image_decode=1"
+        ));
+
+        // Magic alone without working claim → not eligible.
+        let await_claim = research_xclbin_extract_dry_run(&header, Some(info), None);
+        assert!(!await_claim.eligible_as_aie2_external_known_good);
+        assert_eq!(
+            await_claim.detail,
+            "markers_ok_awaiting_working_stack_claim"
+        );
+
+        // Bare single-token "xrt" / "aie2" without working/source-stack → not eligible.
+        assert!(!platform_claim_is_working_public_aie2_research("xrt"));
+        assert!(!platform_claim_is_working_public_aie2_research("aie2"));
+        assert!(!platform_claim_is_working_public_aie2_research("npu4"));
+        let bare_xrt = research_xclbin_extract_dry_run(&header, Some(info), Some("xrt"));
+        assert!(
+            !bare_xrt.eligible_as_aie2_external_known_good,
+            "bare xrt must not over-flip eligibility"
+        );
+        assert_eq!(bare_xrt.detail, "markers_ok_awaiting_working_stack_claim");
+        // Working marker without AIE2-ish whole-token also incomplete.
+        assert!(!platform_claim_is_working_public_aie2_research(
+            "working public only"
+        ));
+    }
+
+    #[test]
+    fn xclbin_extract_refuse_edges_magic_and_empty() {
+        // Non-xclbin2 header → magic_not_xclbin2; never eligible.
+        let bad = research_xclbin_extract_dry_run(
+            b"ELF\0xxxx",
+            Some("Sections: AIE_PARTITION, BITSTREAM\n"),
+            Some("Source stack: working public XRT AIE2 npu4"),
+        );
+        assert!(!bad.magic_xclbin2);
+        assert!(!bad.eligible_as_aie2_external_known_good);
+        assert_eq!(bad.detail, "magic_not_xclbin2");
+        let n = bad.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "magic_xclbin2=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "eligible_as_aie2_external_known_good=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "eligible_as_aie2_external_known_good=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+
+        // Empty inputs → default_no_input; all eligibility false.
+        let empty = research_xclbin_extract_dry_run(&[], None, None);
+        assert!(!empty.magic_xclbin2);
+        assert_eq!(empty.section_marker_count, 0);
+        assert!(!empty.has_aie_partition_marker);
+        assert!(!empty.eligible_as_aie2_external_known_good);
+        assert_eq!(empty.detail, "default_no_input");
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(&en, "magic_xclbin2=0"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "eligible_as_aie2_external_known_good=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &en,
+            "eligible_as_aie2_external_known_good=1"
+        ));
+
+        // Default bag soft note matches empty-input honesty.
+        let def = XclbinExtractResearchDryRun::default();
+        assert_eq!(def.detail, "default_no_input");
+        assert!(!def.eligible_as_aie2_external_known_good);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure CU/PDI section identity (public section names only; stamp 7a5ab864)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cu_pdi_section_kind_classify_public_markers() {
+        assert_eq!(
+            classify_xclbin_section_kind("AIE_PARTITION"),
+            XclbinSectionKind::CuPdiIdentity
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("BITSTREAM"),
+            XclbinSectionKind::CuPdiIdentity
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("MEM_TOPOLOGY"),
+            XclbinSectionKind::Topology
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("IP_LAYOUT"),
+            XclbinSectionKind::Topology
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("CONNECTIVITY"),
+            XclbinSectionKind::Topology
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("BUILD_METADATA"),
+            XclbinSectionKind::Metadata
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("SYSTEM_METADATA"),
+            XclbinSectionKind::Metadata
+        );
+        assert_eq!(classify_xclbin_section_kind(""), XclbinSectionKind::Unknown);
+        assert_eq!(
+            classify_xclbin_section_kind("NOT_A_SECTION"),
+            XclbinSectionKind::Unknown
+        );
+        // Case-sensitive public tokens (xclbinutil style).
+        assert_eq!(
+            classify_xclbin_section_kind("aie_partition"),
+            XclbinSectionKind::Unknown
+        );
+        // Identity table is exactly AIE_PARTITION + BITSTREAM.
+        assert_eq!(XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS.len(), 2);
+        assert!(XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS.contains(&"AIE_PARTITION"));
+        assert!(XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS.contains(&"BITSTREAM"));
+        // Trimmed padded names classify the same as exact table tokens.
+        assert_eq!(
+            classify_xclbin_section_kind(" AIE_PARTITION "),
+            XclbinSectionKind::CuPdiIdentity
+        );
+        assert_eq!(
+            classify_xclbin_section_kind("  BITSTREAM\t"),
+            XclbinSectionKind::CuPdiIdentity
+        );
+    }
+
+    #[test]
+    fn cu_pdi_section_kind_tables_union_equals_research_scan() {
+        // Kind tables partition the public research scan set (no drift).
+        let mut union: Vec<&str> = Vec::new();
+        union.extend_from_slice(XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS);
+        union.extend_from_slice(XCLBIN_TOPOLOGY_SECTION_MARKERS);
+        union.extend_from_slice(XCLBIN_METADATA_SECTION_MARKERS);
+        union.sort_unstable();
+        let mut scan: Vec<&str> = XCLBIN_RESEARCH_SECTION_MARKERS.to_vec();
+        scan.sort_unstable();
+        assert_eq!(
+            union, scan,
+            "union of kind tables must equal XCLBIN_RESEARCH_SECTION_MARKERS"
+        );
+        // Pairwise disjoint.
+        for a in XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS {
+            assert!(!XCLBIN_TOPOLOGY_SECTION_MARKERS.contains(a));
+            assert!(!XCLBIN_METADATA_SECTION_MARKERS.contains(a));
+        }
+        for a in XCLBIN_TOPOLOGY_SECTION_MARKERS {
+            assert!(!XCLBIN_METADATA_SECTION_MARKERS.contains(a));
+            assert!(!XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS.contains(a));
+        }
+        for a in XCLBIN_METADATA_SECTION_MARKERS {
+            assert!(!XCLBIN_TOPOLOGY_SECTION_MARKERS.contains(a));
+            assert!(!XCLBIN_CU_PDI_IDENTITY_SECTION_MARKERS.contains(a));
+        }
+        // Every research marker has a non-Unknown kind.
+        for m in XCLBIN_RESEARCH_SECTION_MARKERS {
+            assert_ne!(
+                classify_xclbin_section_kind(m),
+                XclbinSectionKind::Unknown,
+                "research marker {m} must classify"
+            );
+        }
+    }
+
+    #[test]
+    fn cu_pdi_section_identity_from_info_text_not_pass() {
+        let info = "\
+Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
+          BUILD_METADATA, AIE_PARTITION
+";
+        let r = research_cu_pdi_section_identity_from_text(info);
+        assert!(r.has_aie_partition);
+        assert!(r.has_bitstream);
+        assert!(r.has_cu_pdi_identity_surface);
+        assert_eq!(r.cu_pdi_identity_marker_count, 2);
+        assert!(r.topology_marker_count >= 2);
+        assert!(r.metadata_marker_count >= 1);
+        assert!(!r.section_identity_alone_closes_fw_residual);
+        assert!(r.do_not_invent_pdi_layout);
+        assert!(!r.public_pdi_image_decode);
+        assert_eq!(r.detail, "cu_pdi_identity_surface_aie_and_bitstream");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "cu_pdi_section_identity_research"
+        ));
+        assert!(residual_note_has_exact_token(&n, "has_aie_partition=1"));
+        assert!(residual_note_has_exact_token(&n, "has_bitstream=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "has_cu_pdi_identity_surface=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "section_identity_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Mutated invent/close fields must not leak into soft note.
+        let mut mutated = r.clone();
+        mutated.section_identity_alone_closes_fw_residual = true;
+        mutated.do_not_invent_pdi_layout = false;
+        mutated.public_pdi_image_decode = true;
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "section_identity_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "section_identity_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "public_pdi_image_decode=1"
+        ));
+        assert!(!residual_note_has_exact_token(&mn, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&mn, "product_known_good=1"));
+
+        // Topology-only → no CU/PDI identity surface.
+        let topo = research_cu_pdi_section_identity_from_text(
+            "Sections: MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY\n",
+        );
+        assert!(!topo.has_cu_pdi_identity_surface);
+        assert!(!topo.has_aie_partition);
+        assert!(!topo.has_bitstream);
+        assert_eq!(topo.detail, "topology_or_metadata_only_no_cu_pdi_identity");
+        let tn = topo.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &tn,
+            "has_cu_pdi_identity_surface=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &tn,
+            "section_identity_alone_closes_fw_residual=0"
+        ));
+
+        // Empty / default honesty.
+        let empty = research_cu_pdi_section_identity_from_text("   ");
+        assert!(!empty.has_cu_pdi_identity_surface);
+        assert_eq!(empty.detail, "default_no_markers");
+        let def = CuPdiSectionIdentityResearch::default();
+        assert_eq!(def.detail, "default_no_markers");
+        assert!(!def.section_identity_alone_closes_fw_residual);
+
+        // AIE_PARTITION alone still counts as identity surface (name only).
+        let aie_only = research_cu_pdi_section_identity_from_markers(&["AIE_PARTITION"]);
+        assert!(aie_only.has_cu_pdi_identity_surface);
+        assert_eq!(
+            aie_only.detail,
+            "cu_pdi_identity_surface_aie_partition_only"
+        );
+        let bs_only = research_cu_pdi_section_identity_from_markers(&["BITSTREAM"]);
+        assert!(bs_only.has_cu_pdi_identity_surface);
+        assert_eq!(bs_only.detail, "cu_pdi_identity_surface_bitstream_only");
+
+        // Padded markers: classify trims; identity flags must use the same trim
+        // (public from_markers API consistency).
+        let padded = research_cu_pdi_section_identity_from_markers(&[
+            " AIE_PARTITION ",
+            "\tBITSTREAM ",
+            " MEM_TOPOLOGY ",
+        ]);
+        assert!(padded.has_aie_partition);
+        assert!(padded.has_bitstream);
+        assert!(padded.has_cu_pdi_identity_surface);
+        assert_eq!(padded.cu_pdi_identity_marker_count, 2);
+        assert_eq!(padded.topology_marker_count, 1);
+        assert_eq!(padded.detail, "cu_pdi_identity_surface_aie_and_bitstream");
+        let pn = padded.format_soft_note();
+        assert!(residual_note_has_exact_token(&pn, "has_aie_partition=1"));
+        assert!(residual_note_has_exact_token(&pn, "has_bitstream=1"));
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "has_cu_pdi_identity_surface=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "section_identity_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&pn, "product_known_good=0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure BITSTREAM / AIE_PARTITION section-offset map (stamp a5787723)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal synthetic xclbin2 prefix with section headers only.
+    ///
+    /// Layout matches public `struct axlf` / `axlf_section_header` (LE, natural
+    /// align). Section **bodies** are not included — research header walk only.
+    fn synth_axlf_with_sections(sections: &[(u32, &str, u64, u64)]) -> Vec<u8> {
+        #[allow(clippy::cast_possible_truncation)]
+        let n = u32::try_from(sections.len()).unwrap_or(u32::MAX);
+        let total =
+            AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + sections.len() * AXLF_SECTION_HEADER_SIZE;
+        let mut buf = vec![0_u8; total];
+        // magic
+        buf[..8].copy_from_slice(XCLBIN2_MAGIC);
+        // m_signature_length = -1
+        buf[8..12].copy_from_slice(&(-1_i32).to_le_bytes());
+        // m_numSections
+        let ns_off = AXLF_NUM_SECTIONS_ABS_OFFSET;
+        buf[ns_off..ns_off + 4].copy_from_slice(&n.to_le_bytes());
+        // section headers
+        let mut off = AXLF_FIRST_SECTION_HEADER_ABS_OFFSET;
+        for &(kind, name, soff, ssize) in sections {
+            buf[off..off + 4].copy_from_slice(&kind.to_le_bytes());
+            let nb = name.as_bytes();
+            let take = nb.len().min(16);
+            buf[off + 4..off + 4 + take].copy_from_slice(&nb[..take]);
+            // pad 4 at 20..24 already zero
+            buf[off + 24..off + 32].copy_from_slice(&soff.to_le_bytes());
+            buf[off + 32..off + 40].copy_from_slice(&ssize.to_le_bytes());
+            off += AXLF_SECTION_HEADER_SIZE;
+        }
+        buf
+    }
+
+    #[test]
+    fn xclbin_section_offset_map_layout_constants_public() {
+        // Public header sizes / offsets stay stable for research walk.
+        assert_eq!(AXLF_SECTION_HEADER_SIZE, 40);
+        assert_eq!(AXLF_HEADER_SIZE, 152);
+        assert_eq!(AXLF_M_HEADER_ABS_OFFSET, 304);
+        assert_eq!(AXLF_NUM_SECTIONS_ABS_OFFSET, 448);
+        assert_eq!(AXLF_FIRST_SECTION_HEADER_ABS_OFFSET, 456);
+        assert_eq!(AXLF_SECTION_KIND_BITSTREAM, 0);
+        assert_eq!(AXLF_SECTION_KIND_AIE_PARTITION, 32);
+        assert_eq!(axlf_section_kind_public_name(0), Some("BITSTREAM"));
+        assert_eq!(axlf_section_kind_public_name(32), Some("AIE_PARTITION"));
+        assert_eq!(axlf_section_kind_public_name(6), Some("MEM_TOPOLOGY"));
+        assert_eq!(axlf_section_kind_public_name(999), None);
+    }
+
+    #[test]
+    fn xclbin_section_offset_map_parse_header_fields() {
+        // Manual 40-byte header: kind=32, name=aie_partition, off=0x100, size=0x40
+        let mut raw = [0_u8; 40];
+        raw[0..4].copy_from_slice(&32_u32.to_le_bytes());
+        raw[4..4 + 13].copy_from_slice(b"aie_partition");
+        raw[24..32].copy_from_slice(&0x100_u64.to_le_bytes());
+        raw[32..40].copy_from_slice(&0x40_u64.to_le_bytes());
+        let h = parse_axlf_section_header(&raw).expect("40-byte header");
+        assert_eq!(h.kind, AXLF_SECTION_KIND_AIE_PARTITION);
+        assert_eq!(h.name, "aie_partition");
+        assert_eq!(h.offset, 0x100);
+        assert_eq!(h.size, 0x40);
+        assert!(parse_axlf_section_header(&raw[..39]).is_none());
+        assert!(parse_axlf_section_header(&[]).is_none());
+    }
+
+    #[test]
+    fn xclbin_section_offset_map_synth_bitstream_and_aie_not_pass() {
+        let bytes = synth_axlf_with_sections(&[
+            (AXLF_SECTION_KIND_BITSTREAM, "behav", 0x400, 0x1000),
+            (6, "", 0x1400, 88),
+            (
+                AXLF_SECTION_KIND_AIE_PARTITION,
+                "aie_partition",
+                0x2000,
+                416,
+            ),
+        ]);
+        assert!(xclbin_magic_is_xclbin2(&bytes));
+        assert_eq!(parse_axlf_num_sections(&bytes), Some(3));
+        let headers = walk_axlf_section_headers(&bytes);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0].kind, AXLF_SECTION_KIND_BITSTREAM);
+        assert_eq!(headers[0].offset, 0x400);
+        assert_eq!(headers[0].size, 0x1000);
+        assert_eq!(headers[2].kind, AXLF_SECTION_KIND_AIE_PARTITION);
+        assert_eq!(headers[2].offset, 0x2000);
+        assert_eq!(headers[2].size, 416);
+
+        let r = research_xclbin_cu_pdi_section_offset_map(&bytes);
+        assert!(r.magic_xclbin2);
+        assert_eq!(r.num_sections, Some(3));
+        assert_eq!(r.section_headers_parsed, 3);
+        assert!(r.has_bitstream_section);
+        assert!(r.has_aie_partition_section);
+        assert!(r.has_cu_pdi_offset_surface);
+        assert_eq!(r.bitstream_offset, Some(0x400));
+        assert_eq!(r.bitstream_size, Some(0x1000));
+        assert_eq!(r.aie_partition_offset, Some(0x2000));
+        assert_eq!(r.aie_partition_size, Some(416));
+        assert!(!r.section_offset_map_alone_closes_fw_residual);
+        assert!(r.do_not_invent_pdi_layout);
+        assert!(!r.public_pdi_image_decode);
+        assert_eq!(
+            r.detail,
+            "cu_pdi_offset_surface_bitstream_and_aie_partition"
+        );
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "cu_pdi_section_offset_map_research"
+        ));
+        assert!(residual_note_has_exact_token(&n, "magic_xclbin2=1"));
+        assert!(residual_note_has_exact_token(&n, "num_sections=3"));
+        assert!(residual_note_has_exact_token(&n, "bitstream_offset=1024"));
+        assert!(residual_note_has_exact_token(&n, "bitstream_size=4096"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "aie_partition_offset=8192"
+        ));
+        assert!(residual_note_has_exact_token(&n, "aie_partition_size=416"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "has_cu_pdi_offset_surface=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "section_offset_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Mutated invent/close fields must not leak into soft note.
+        let mut mutated = r.clone();
+        mutated.section_offset_map_alone_closes_fw_residual = true;
+        mutated.do_not_invent_pdi_layout = false;
+        mutated.public_pdi_image_decode = true;
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "section_offset_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "section_offset_map_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(&mn, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&mn, "product_known_good=1"));
+    }
+
+    #[test]
+    fn xclbin_section_offset_map_empty_magic_truncated_not_pass() {
+        let empty = research_xclbin_cu_pdi_section_offset_map(&[]);
+        assert!(!empty.magic_xclbin2);
+        assert_eq!(empty.detail, "default_empty_bytes");
+        assert!(!empty.has_cu_pdi_offset_surface);
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &en,
+            "bitstream_offset=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "aie_partition_offset=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "section_offset_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&en, "product_known_good=0"));
+
+        let bad = research_xclbin_cu_pdi_section_offset_map(b"ELF\0notxclbin");
+        assert!(!bad.magic_xclbin2);
+        assert_eq!(bad.detail, "magic_not_xclbin2");
+        assert!(!bad.has_cu_pdi_offset_surface);
+
+        // Magic only — header truncated before num_sections.
+        let mut magic_only = vec![0_u8; 32];
+        magic_only[..8].copy_from_slice(XCLBIN2_MAGIC);
+        let trunc = research_xclbin_cu_pdi_section_offset_map(&magic_only);
+        assert!(trunc.magic_xclbin2);
+        assert_eq!(trunc.detail, "header_truncated");
+        assert!(trunc.num_sections.is_none());
+
+        // Magic + num_sections but no room for section headers.
+        let mut hdr_only = vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET];
+        hdr_only[..8].copy_from_slice(XCLBIN2_MAGIC);
+        let ns_off = AXLF_NUM_SECTIONS_ABS_OFFSET;
+        hdr_only[ns_off..ns_off + 4].copy_from_slice(&2_u32.to_le_bytes());
+        let no_sec = research_xclbin_cu_pdi_section_offset_map(&hdr_only);
+        assert!(no_sec.magic_xclbin2);
+        assert_eq!(no_sec.num_sections, Some(2));
+        assert_eq!(no_sec.section_headers_parsed, 0);
+        assert_eq!(no_sec.detail, "section_headers_truncated");
+
+        // Topology-only sections → no CU/PDI offset surface.
+        let topo = synth_axlf_with_sections(&[(6, "", 0x100, 8), (8, "", 0x200, 16)]);
+        let t = research_xclbin_cu_pdi_section_offset_map(&topo);
+        assert!(!t.has_cu_pdi_offset_surface);
+        assert_eq!(t.detail, "no_cu_pdi_section_headers");
+        assert!(residual_note_has_exact_token(
+            &t.format_soft_note(),
+            "has_cu_pdi_offset_surface=0"
+        ));
+
+        // BITSTREAM alone still counts as offset surface (header only).
+        let bs = synth_axlf_with_sections(&[(AXLF_SECTION_KIND_BITSTREAM, "behav", 100, 50)]);
+        let b = research_xclbin_cu_pdi_section_offset_map(&bs);
+        assert!(b.has_bitstream_section);
+        assert!(!b.has_aie_partition_section);
+        assert!(b.has_cu_pdi_offset_surface);
+        assert_eq!(b.detail, "cu_pdi_offset_surface_bitstream_only");
+
+        let def = CuPdiSectionOffsetMapResearch::default();
+        assert_eq!(def.detail, "default_empty_bytes");
+        assert!(!def.section_offset_map_alone_closes_fw_residual);
+    }
+
+    #[test]
+    fn xclbin_section_offset_map_aie_partition_only_not_pass() {
+        // Unit-lock detail branch that synth both/bitstream-only paths skip.
+        let bytes = synth_axlf_with_sections(&[(
+            AXLF_SECTION_KIND_AIE_PARTITION,
+            "aie_partition",
+            0x3000,
+            416,
+        )]);
+        let r = research_xclbin_cu_pdi_section_offset_map(&bytes);
+        assert!(r.magic_xclbin2);
+        assert_eq!(r.num_sections, Some(1));
+        assert_eq!(r.section_headers_parsed, 1);
+        assert!(!r.has_bitstream_section);
+        assert!(r.has_aie_partition_section);
+        assert!(r.has_cu_pdi_offset_surface);
+        assert_eq!(r.bitstream_offset, None);
+        assert_eq!(r.bitstream_size, None);
+        assert_eq!(r.aie_partition_offset, Some(0x3000));
+        assert_eq!(r.aie_partition_size, Some(416));
+        assert_eq!(r.detail, "cu_pdi_offset_surface_aie_partition_only");
+        assert!(!r.section_offset_map_alone_closes_fw_residual);
+        assert!(r.do_not_invent_pdi_layout);
+        assert!(!r.public_pdi_image_decode);
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "has_bitstream_section=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "has_aie_partition_section=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "has_cu_pdi_offset_surface=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "aie_partition_offset=12288"
+        ));
+        assert!(residual_note_has_exact_token(&n, "aie_partition_size=416"));
+        assert!(residual_note_has_exact_token(&n, "bitstream_offset=absent"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "section_offset_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Soft force-lock survives mutated close/invent fields.
+        let mut mutated = r.clone();
+        mutated.section_offset_map_alone_closes_fw_residual = true;
+        mutated.do_not_invent_pdi_layout = false;
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "section_offset_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "section_offset_map_alone_closes_fw_residual=1"
+        ));
+    }
+
+    #[test]
+    fn xclbin_section_offset_map_ve2_fixture_when_present_not_aie2_known_good() {
+        // VE2 validate.xclbin is a real public axlf — parse offsets for research
+        // only. Always NOT product known-good / NOT AIE2 bag (platform refuse).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/ve2_latency/sources/ve2_runner_latency_validate.xclbin");
+        if !path.is_file() {
+            eprintln!("OFFLINE_ASSET_SKIP: no ve2 validate.xclbin");
+            return;
+        }
+        // Read only the header + section table (not full 9 MiB body).
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: open failed: {e}");
+                return;
+            }
+        };
+        use std::io::Read;
+        // 456 + 256*40 is well under a page*2; VE2 has 10 sections.
+        let mut prefix =
+            vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + 16 * AXLF_SECTION_HEADER_SIZE];
+        let n = match f.read(&mut prefix) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: read failed: {e}");
+                return;
+            }
+        };
+        prefix.truncate(n);
+        let r = research_xclbin_cu_pdi_section_offset_map(&prefix);
+        assert!(r.magic_xclbin2, "VE2 xclbin must be xclbin2");
+        assert_eq!(r.num_sections, Some(10));
+        assert_eq!(r.section_headers_parsed, 10);
+        assert!(r.has_bitstream_section);
+        assert!(r.has_aie_partition_section);
+        assert!(r.has_cu_pdi_offset_surface);
+        // Locked public offsets from this fixture (header walk only).
+        assert_eq!(r.bitstream_offset, Some(856));
+        assert_eq!(r.bitstream_size, Some(9_717_811));
+        assert_eq!(r.aie_partition_offset, Some(9_731_640));
+        assert_eq!(r.aie_partition_size, Some(416));
+        assert!(!r.section_offset_map_alone_closes_fw_residual);
+        assert!(r.do_not_invent_pdi_layout);
+        assert!(!r.public_pdi_image_decode);
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "section_offset_map_alone_closes_fw_residual=0"
+        ));
+        // VE2 platform claim still refuses as AIE2 known-good (orthogonal).
+        assert!(platform_claim_is_not_aie2_known_good(
+            "PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure axlf section body bounds + journal tokens (stamp 2c4b96bf)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn axlf_section_body_window_pure_bounds_overflow_and_oob() {
+        // Empty file: only zero-size at offset 0 is in-bounds.
+        assert!(axlf_section_body_window_in_bounds(0, 0, 0));
+        assert!(!axlf_section_body_window_in_bounds(0, 0, 1));
+        assert!(!axlf_section_body_window_in_bounds(0, 1, 0));
+
+        let ok = check_axlf_section_body_bounds(100, 40, 60);
+        assert!(ok.in_bounds);
+        assert_eq!(ok.detail, "in_bounds");
+        assert_eq!(ok.file_len, 100);
+        assert_eq!(ok.offset, 40);
+        assert_eq!(ok.size, 60);
+
+        let past = check_axlf_section_body_bounds(100, 101, 0);
+        assert!(!past.in_bounds);
+        assert_eq!(past.detail, "oob_offset_past_file");
+
+        let end_past = check_axlf_section_body_bounds(100, 50, 51);
+        assert!(!end_past.in_bounds);
+        assert_eq!(end_past.detail, "oob_end_past_file");
+
+        // size overflow: offset near max + large size.
+        let overflow = check_axlf_section_body_bounds(u64::MAX, u64::MAX - 1, 10);
+        assert!(!overflow.in_bounds);
+        assert_eq!(overflow.detail, "oob_size_overflow");
+
+        // Exact fit end == file_len is in-bounds (half-open).
+        assert!(axlf_section_body_window_in_bounds(100, 0, 100));
+        assert!(axlf_section_body_window_in_bounds(100, 100, 0));
+        assert!(!axlf_section_body_window_in_bounds(100, 100, 1));
+    }
+
+    #[test]
+    fn xclbin_section_body_bounds_synth_in_bounds_and_oob_not_pass() {
+        // Header-only synth: claimed bodies past buffer end → OOB (honest).
+        let header_only = synth_axlf_with_sections(&[
+            (AXLF_SECTION_KIND_BITSTREAM, "behav", 0x400, 0x1000),
+            (
+                AXLF_SECTION_KIND_AIE_PARTITION,
+                "aie_partition",
+                0x2000,
+                416,
+            ),
+        ]);
+        let oob = research_xclbin_cu_pdi_section_body_bounds(&header_only);
+        assert!(oob.magic_xclbin2);
+        assert!(oob.has_cu_pdi_offset_surface);
+        assert_eq!(oob.bitstream_in_bounds, Some(false));
+        assert_eq!(oob.aie_partition_in_bounds, Some(false));
+        assert!(oob.any_oob);
+        assert!(!oob.all_present_in_bounds);
+        assert_eq!(oob.detail, "cu_pdi_body_windows_oob");
+        assert!(!oob.body_bounds_alone_closes_fw_residual);
+        assert!(oob.do_not_invent_pdi_layout);
+        assert!(!oob.public_pdi_image_decode);
+        let on = oob.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &on,
+            "cu_pdi_section_body_bounds_research"
+        ));
+        assert!(residual_note_has_exact_token(&on, "any_oob=1"));
+        assert!(residual_note_has_exact_token(
+            &on,
+            "all_present_in_bounds=0"
+        ));
+        assert!(residual_note_has_exact_token(&on, "bitstream_in_bounds=0"));
+        assert!(residual_note_has_exact_token(
+            &on,
+            "aie_partition_in_bounds=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &on,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&on, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&on, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&on, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &on,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &on,
+            "public_pdi_image_decode=0"
+        ));
+        // Mutated invent/close fields must not leak into soft note.
+        let mut mutated = oob.clone();
+        mutated.body_bounds_alone_closes_fw_residual = true;
+        mutated.do_not_invent_pdi_layout = false;
+        mutated.public_pdi_image_decode = true;
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "body_bounds_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(&mn, "invent_pass=1"));
+
+        // Pad buffer so claimed windows fit — still research only, not Pass.
+        let mut padded = header_only;
+        let need = 0x2000_u64 + 416;
+        #[allow(clippy::cast_possible_truncation)]
+        let need_usize = need as usize;
+        if padded.len() < need_usize {
+            padded.resize(need_usize, 0);
+        }
+        let ok = research_xclbin_cu_pdi_section_body_bounds(&padded);
+        assert!(ok.magic_xclbin2);
+        assert_eq!(ok.bitstream_in_bounds, Some(true));
+        assert_eq!(ok.aie_partition_in_bounds, Some(true));
+        assert!(!ok.any_oob);
+        assert!(ok.all_present_in_bounds);
+        assert_eq!(ok.detail, "cu_pdi_body_windows_in_bounds");
+        assert!(!ok.body_bounds_alone_closes_fw_residual);
+        let ok_n = ok.format_soft_note();
+        assert!(residual_note_has_exact_token(&ok_n, "any_oob=0"));
+        assert!(residual_note_has_exact_token(
+            &ok_n,
+            "all_present_in_bounds=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ok_n,
+            "bitstream_in_bounds=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ok_n,
+            "aie_partition_in_bounds=1"
+        ));
+        assert!(residual_note_has_exact_token(&ok_n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&ok_n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &ok_n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        // In-bounds ≠ product known-good / residual closed.
+        assert!(!residual_note_has_exact_token(
+            &ok_n,
+            "product_known_good=1"
+        ));
+    }
+
+    #[test]
+    fn xclbin_section_body_bounds_partial_surface_and_empty_not_pass() {
+        // BITSTREAM alone, padded in-bounds.
+        let mut bs = synth_axlf_with_sections(&[(AXLF_SECTION_KIND_BITSTREAM, "behav", 100, 50)]);
+        if bs.len() < 150 {
+            bs.resize(150, 0);
+        }
+        let r = research_xclbin_cu_pdi_section_body_bounds(&bs);
+        assert_eq!(r.bitstream_in_bounds, Some(true));
+        assert!(r.aie_partition_in_bounds.is_none());
+        assert!(r.all_present_in_bounds);
+        assert!(!r.any_oob);
+        assert_eq!(r.detail, "cu_pdi_body_window_in_bounds_partial_surface");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "aie_partition_in_bounds=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+
+        // Partial OOB: BITSTREAM fits, AIE_PARTITION does not.
+        let mut mixed = synth_axlf_with_sections(&[
+            (AXLF_SECTION_KIND_BITSTREAM, "behav", 100, 20),
+            (
+                AXLF_SECTION_KIND_AIE_PARTITION,
+                "aie_partition",
+                10_000,
+                416,
+            ),
+        ]);
+        if mixed.len() < 120 {
+            mixed.resize(120, 0);
+        }
+        let m = research_xclbin_cu_pdi_section_body_bounds(&mixed);
+        assert_eq!(m.bitstream_in_bounds, Some(true));
+        assert_eq!(m.aie_partition_in_bounds, Some(false));
+        assert!(m.any_oob);
+        assert!(!m.all_present_in_bounds);
+        assert_eq!(m.detail, "cu_pdi_body_windows_partial_oob");
+
+        // Empty / non-magic / topology-only.
+        let empty = research_xclbin_cu_pdi_section_body_bounds(&[]);
+        assert_eq!(empty.detail, "default_empty_bytes");
+        assert!(!empty.has_cu_pdi_offset_surface);
+        assert!(residual_note_has_exact_token(
+            &empty.format_soft_note(),
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &empty.format_soft_note(),
+            "product_known_good=0"
+        ));
+
+        let bad = research_xclbin_cu_pdi_section_body_bounds(b"ELF\0notxclbin");
+        assert!(!bad.magic_xclbin2);
+        assert_eq!(bad.detail, "magic_not_xclbin2");
+
+        let topo = synth_axlf_with_sections(&[(6, "", 0x100, 8)]);
+        let t = research_xclbin_cu_pdi_section_body_bounds(&topo);
+        assert!(!t.has_cu_pdi_offset_surface);
+        assert_eq!(t.detail, "no_cu_pdi_section_headers");
+        assert!(t.bitstream_in_bounds.is_none());
+        assert!(t.aie_partition_in_bounds.is_none());
+
+        // from_offset_map with explicit file_len (header map + long file).
+        let map = research_xclbin_cu_pdi_section_offset_map(&synth_axlf_with_sections(&[(
+            AXLF_SECTION_KIND_AIE_PARTITION,
+            "aie_partition",
+            0x3000,
+            416,
+        )]));
+        let long = research_cu_pdi_section_body_bounds_from_offset_map(&map, 0x3000 + 416);
+        assert_eq!(long.aie_partition_in_bounds, Some(true));
+        assert!(long.all_present_in_bounds);
+        assert_eq!(long.detail, "cu_pdi_body_window_in_bounds_partial_surface");
+        assert!(!long.body_bounds_alone_closes_fw_residual);
+
+        let def = CuPdiSectionBodyBoundsResearch::default();
+        assert_eq!(def.detail, "default_empty_bytes");
+        assert!(!def.body_bounds_alone_closes_fw_residual);
+        assert!(def.do_not_invent_pdi_layout);
+    }
+
+    #[test]
+    fn xclbin_section_body_bounds_ve2_prefix_oob_not_aie2_known_good() {
+        // VE2 header prefix is shorter than BITSTREAM body → OOB vs prefix len.
+        // Full-file windows would fit; we never load full multi-MiB body here.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/ve2_latency/sources/ve2_runner_latency_validate.xclbin");
+        if !path.is_file() {
+            eprintln!("OFFLINE_ASSET_SKIP: no ve2 validate.xclbin");
+            return;
+        }
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: open failed: {e}");
+                return;
+            }
+        };
+        use std::io::Read;
+        let mut prefix =
+            vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + 16 * AXLF_SECTION_HEADER_SIZE];
+        let n = match f.read(&mut prefix) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: read failed: {e}");
+                return;
+            }
+        };
+        prefix.truncate(n);
+        let r = research_xclbin_cu_pdi_section_body_bounds(&prefix);
+        assert!(r.magic_xclbin2);
+        assert!(r.has_cu_pdi_offset_surface);
+        // Prefixed buffer cannot contain multi-MiB BITSTREAM → OOB vs prefix.
+        assert_eq!(r.bitstream_in_bounds, Some(false));
+        assert!(r.any_oob);
+        assert!(!r.all_present_in_bounds);
+        assert!(!r.body_bounds_alone_closes_fw_residual);
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(platform_claim_is_not_aie2_known_good(
+            "PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"
+        ));
+    }
+
+    #[test]
+    fn journal_failed_cmd_chain_status_token_parsers_unit_locked() {
+        // C2 locked journal lines (primary load-reject + chain INVALID_PARAM).
+        let fail_line = "amdxdna: Failed cmd idx 0, status 0x3000003";
+        let chain_line = "amdxdna: Status 0x4000003";
+        assert_eq!(
+            parse_failed_cmd_status_token(fail_line),
+            Some(AIE2_FW_APP_LOAD_PDI_FAIL)
+        );
+        assert_eq!(parse_chain_status_token(fail_line), None, "not chain line");
+        assert_eq!(
+            parse_chain_status_token(chain_line),
+            Some(AIE2_FW_INVALID_PARAM)
+        );
+        assert_eq!(
+            parse_failed_cmd_status_token(chain_line),
+            None,
+            "chain line is not failed-cmd"
+        );
+        assert_eq!(
+            first_hex_status_token(fail_line),
+            Some(AIE2_FW_APP_LOAD_PDI_FAIL)
+        );
+        assert_eq!(
+            first_hex_status_token(chain_line),
+            Some(AIE2_FW_INVALID_PARAM)
+        );
+
+        // Underscore form + case.
+        assert_eq!(
+            parse_failed_cmd_status_token("FAILED_CMD status 0x3000003"),
+            Some(0x3_000_003)
+        );
+        assert_eq!(
+            parse_chain_status_token("  STATUS 0x4000003  "),
+            Some(0x4_000_003)
+        );
+
+        // Negatives: no invent from unrelated text / missing hex / empty.
+        assert!(parse_failed_cmd_status_token("").is_none());
+        assert!(parse_chain_status_token("").is_none());
+        assert!(parse_failed_cmd_status_token("status 0x3000003").is_none());
+        assert!(parse_chain_status_token("failed cmd without hex").is_none());
+        assert!(parse_failed_cmd_status_token("failed cmd without hex").is_none());
+        assert!(parse_chain_status_token("no status token here").is_none());
+        assert!(first_hex_status_token("no hex here").is_none());
+
+        // Multi-line pair via pure helpers (same as parse_journal_fw_status_pair).
+        let locked = c2_locked_app_load_journal_text();
+        let pair = parse_journal_fw_status_pair(locked);
+        assert_eq!(pair.failed_cmd_status, Some(AIE2_FW_APP_LOAD_PDI_FAIL));
+        assert_eq!(pair.chain_status, Some(AIE2_FW_INVALID_PARAM));
+        assert!(pair.is_c2_app_load_pair());
+        let pn = pair.format_soft_note();
+        assert!(residual_note_has_exact_token(&pn, "failed_cmd=0x3000003"));
+        assert!(residual_note_has_exact_token(&pn, "chain_status=0x4000003"));
+        assert!(residual_note_has_exact_token(&pn, "c2_app_load_pair=1"));
+        assert!(residual_note_has_exact_token(&pn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&pn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&pn, "not_ran_on_npu=1"));
+        // Soft pair note never invents residual-closed / Pass.
+        assert!(!residual_note_has_exact_token(&pn, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&pn, "root_cause_closed=1"));
+
+        // last_apply detail is userspace-only: no failed_cmd / chain tokens.
+        let last_apply =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd/last_apply.json");
+        if last_apply.is_file() {
+            let text = std::fs::read_to_string(&last_apply).unwrap_or_default();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(detail) = v.get("detail").and_then(|d| d.as_str()) {
+                    let p = parse_journal_fw_status_pair(detail);
+                    assert!(
+                        p.failed_cmd_status.is_none(),
+                        "last_apply detail must not invent failed_cmd"
+                    );
+                    assert!(
+                        p.chain_status.is_none(),
+                        "last_apply detail must not invent chain_status"
+                    );
+                    assert!(!p.is_c2_app_load_pair());
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Soft e2e fixture path + bag-drop checklist (stamp 8e898123)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn external_known_good_bag_drop_check_fail_closed_incomplete() {
+        // Absent bytes + no provenance → incomplete.
+        let absent = check_external_known_good_bag_drop(false, None, None, None);
+        assert!(!absent.bag_drop_complete);
+        assert!(!absent.ctrltext_bytes_present);
+        assert!(!absent.provenance_research_ready);
+        assert!(!absent.bag_drop_alone_closes_fw_residual);
+        assert_eq!(absent.detail, "bag_drop_absent_bytes_and_provenance");
+        let n = absent.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_known_good_bag_drop_check"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "bag_drop_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "bag_drop_complete=0"));
+
+        // Bytes without research-ready PROVENANCE → incomplete.
+        let no_prov = check_external_known_good_bag_drop(
+            true,
+            Some("empty notes without markers"),
+            Some("working_stack_ctrltext.bin"),
+            None,
+        );
+        assert!(!no_prov.bag_drop_complete);
+        assert!(no_prov.ctrltext_bytes_present);
+        assert!(!no_prov.provenance_research_ready);
+        assert_eq!(no_prov.detail, "bag_drop_provenance_not_research_ready");
+
+        // Refused local post-patch basename even with ready PROVENANCE.
+        let ready = "Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack";
+        let post = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("instr_post_patch.bin"),
+            None,
+        );
+        assert!(!post.bag_drop_complete);
+        assert!(post.refused_local_post_patch_basename);
+        assert_eq!(post.detail, "bag_drop_refused_local_post_patch");
+
+        // VE2 / NOT_AIE2 refuse.
+        let ve2 = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("ve2_ctrltext.bin"),
+            Some("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"),
+        );
+        assert!(!ve2.bag_drop_complete);
+        assert!(ve2.refused_ve2_not_aie2);
+        assert_eq!(ve2.detail, "bag_drop_refused_ve2_not_aie2");
+
+        // Complete research-only drop still invent_pass=0 / product_known_good=0.
+        let ok = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("working_stack_ctrltext.bin"),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        assert!(ok.bag_drop_complete);
+        assert!(!ok.bag_drop_alone_closes_fw_residual);
+        assert_eq!(ok.detail, "bag_drop_complete_research_only");
+        let on = ok.format_soft_note();
+        assert!(residual_note_has_exact_token(&on, "bag_drop_complete=1"));
+        assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&on, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&on, "invent_pass=1"));
+    }
+
+    #[test]
+    fn external_known_good_bag_drop_check_honesty_hard_coded_not_mutable() {
+        // Mutating bag_drop_alone_closes / invent-ish fields must not flip soft note.
+        let ready = "Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack";
+        let mut incomplete = check_external_known_good_bag_drop(false, None, None, None);
+        incomplete.bag_drop_alone_closes_fw_residual = true;
+        incomplete.bag_drop_complete = true;
+        incomplete.ctrltext_bytes_present = true;
+        let n = incomplete.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "bag_drop_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // bag_drop_complete field is echoed from struct (not honesty lock).
+        assert!(residual_note_has_exact_token(&n, "bag_drop_complete=1"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "bag_drop_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+
+        let mut complete = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("working_stack_ctrltext.bin"),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        assert!(complete.bag_drop_complete);
+        complete.bag_drop_alone_closes_fw_residual = true;
+        let cn = complete.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &cn,
+            "bag_drop_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&cn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&cn, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&cn, "bag_drop_complete=1"));
+    }
+
+    #[test]
+    fn app_load_e2e_fixture_research_c2_locked_absent_bag() {
+        let r = research_app_load_e2e_fixture_c2_locked_absent_bag();
+        assert!(r.locked_app_load_after_aiebu);
+        assert!(r.userspace_elf_rela_ok);
+        assert_eq!(r.residual_class, "app_load_pdi_fail_after_aiebu");
+        assert_eq!(r.journal_failed_cmd, Some(AIE2_FW_APP_LOAD_PDI_FAIL));
+        assert_eq!(r.journal_chain_status, Some(AIE2_FW_INVALID_PARAM));
+        assert!(r.journal_c2_app_load_pair);
+        assert!(r.last_apply_detail_journal_absent);
+        assert!(!r.bag_drop_complete);
+        assert!(r.residual_not_closed);
+        assert!(!r.body_bounds_alone_closes_fw_residual);
+        assert_eq!(r.detail, "e2e_app_load_c2_pair_bag_absent_residual_open");
+
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "app_load_e2e_fixture_research"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "bag_drop_complete=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "journal_failed_cmd=0x3000003"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "journal_chain_status=0x4000003"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn app_load_e2e_fixture_research_last_apply_fixture_no_invent_journal() {
+        let last_apply =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd/last_apply.json");
+        if !last_apply.is_file() {
+            eprintln!("OFFLINE_ASSET_SKIP: no last_apply.json");
+            return;
+        }
+        let text = std::fs::read_to_string(&last_apply).unwrap_or_default();
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: last_apply parse: {e}");
+                return;
+            }
+        };
+        let status = v.get("status").and_then(|s| s.as_str());
+        let detail = v.get("detail").and_then(|d| d.as_str());
+        let aiebu = v.get("aiebu_elf").and_then(|a| a.as_bool());
+        let ert_err = v.get("ert_error").and_then(|e| e.as_bool());
+        let rela = v
+            .get("rela_count")
+            .and_then(|r| r.as_u64())
+            .map(|n| n as usize);
+        let class = classify_last_apply_residual_ex(status, detail, aiebu, ert_err, rela);
+        assert_eq!(class, SiliconResidualClass::AppLoadPdiFailAfterAiebu);
+
+        // Lab bag PROVENANCE may be research-ready template without bytes.
+        let bag_root = external_known_good_lab_root();
+        let prov = read_external_known_good_provenance_text(&bag_root.join("any.bin"));
+        let bag = check_external_known_good_bag_drop(
+            false, // no .bin in bag offline
+            prov.as_deref(),
+            None,
+            None,
+        );
+        assert!(!bag.bag_drop_complete, "bytes still absent offline");
+
+        let r = research_app_load_e2e_fixture_path(
+            class, detail, None, // no journal paste → no invent codes
+            None, &bag,
+        );
+        assert!(r.locked_app_load_after_aiebu);
+        assert!(r.userspace_elf_rela_ok);
+        assert!(r.journal_failed_cmd.is_none());
+        assert!(r.journal_chain_status.is_none());
+        assert!(!r.journal_c2_app_load_pair);
+        assert!(r.last_apply_detail_journal_absent);
+        assert!(r.residual_not_closed);
+        assert!(!r.bag_drop_complete);
+        assert_eq!(
+            r.detail,
+            "e2e_app_load_userspace_ok_bag_absent_residual_open"
+        );
+
+        // Optional body-bounds surface from VE2 header prefix (OOB honest).
+        let ve2 = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/ve2_latency/sources/ve2_runner_latency_validate.xclbin");
+        if ve2.is_file() {
+            let mut f = match std::fs::File::open(&ve2) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            use std::io::Read;
+            let mut prefix =
+                vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + 16 * AXLF_SECTION_HEADER_SIZE];
+            let n = f.read(&mut prefix).unwrap_or(0);
+            prefix.truncate(n);
+            let with_bounds = research_app_load_e2e_fixture_path(
+                class,
+                detail,
+                Some(c2_locked_app_load_journal_text()),
+                Some(&prefix),
+                &bag,
+            );
+            assert!(with_bounds.body_bounds_has_surface);
+            assert!(with_bounds.body_bounds_any_oob); // prefix OOB vs multi-MiB body
+            assert!(with_bounds.journal_c2_app_load_pair);
+            assert!(with_bounds.residual_not_closed);
+            assert!(!with_bounds.body_bounds_alone_closes_fw_residual);
+            let bn = with_bounds.format_soft_note();
+            assert!(residual_note_has_exact_token(&bn, "body_bounds_any_oob=1"));
+            assert!(residual_note_has_exact_token(&bn, "residual_not_closed=1"));
+            assert!(residual_note_has_exact_token(&bn, "invent_pass=0"));
+        }
+    }
+
+    #[test]
+    fn app_load_e2e_fixture_research_honesty_hard_coded_not_mutable() {
+        // Mutating residual_not_closed / invent-ish fields must not flip soft note.
+        let mut r = research_app_load_e2e_fixture_c2_locked_absent_bag();
+        r.residual_not_closed = false;
+        r.bag_drop_complete = true;
+        r.body_bounds_alone_closes_fw_residual = true;
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        // bag_drop_complete field is echoed from struct (not honesty lock);
+        // residual locks stay hard-coded.
+        assert!(residual_note_has_exact_token(&n, "bag_drop_complete=1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Offline progress scorecard + operator extract checklist (stamp 9cdfe8d0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn app_load_offline_progress_scorecard_c2_locked_absent_bag() {
+        let s = research_app_load_offline_progress_scorecard_c2_locked_absent_bag();
+        assert!(s.locked_app_load_after_aiebu);
+        assert!(s.userspace_elf_rela_ok);
+        assert_eq!(s.residual_class, "app_load_pdi_fail_after_aiebu");
+        assert!(!s.bag_drop_complete);
+        assert!(s.e2e_residual_not_closed);
+        assert!(s.residual_not_closed);
+        assert!(!s.scorecard_alone_closes_fw_residual);
+        assert!(!s.body_bounds_alone_closes_fw_residual);
+        assert!(s.journal_tokens_present);
+        assert!(s.journal_c2_app_load_pair);
+        assert_eq!(s.external_compare_status, ExternalCompareStatus::Absent);
+        assert!(!s.scorecard_research_surfaces_ready);
+        assert_eq!(s.detail, "scorecard_c2_locked_bag_absent_residual_open");
+
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "app_load_offline_progress_scorecard"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "bag_drop_complete=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_compare_status=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "journal_tokens_present=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn app_load_offline_progress_scorecard_no_invent_journal_from_detail_alone() {
+        let bag = check_external_known_good_bag_drop(false, None, None, None);
+        // last_apply-style userspace detail only — no journal paste on e2e.
+        let e2e = research_app_load_e2e_fixture_path(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            Some(
+                "ert_state=5(Error) aiebu_elf=1 rela_count=12 aiebu_rela_patched \
+                 ctrltext=1688B ran_on_npu=false",
+            ),
+            None, // no journal → no invent codes
+            None,
+            &bag,
+        );
+        assert!(e2e.journal_failed_cmd.is_none());
+        assert!(e2e.last_apply_detail_journal_absent);
+        let s = research_app_load_offline_progress_scorecard(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &bag,
+            &e2e,
+            None,
+            false,
+        );
+        assert!(!s.journal_tokens_present);
+        assert!(!s.journal_c2_app_load_pair);
+        assert!(s.residual_not_closed);
+        assert_eq!(s.external_compare_status, ExternalCompareStatus::Absent);
+        assert_eq!(
+            s.detail,
+            "scorecard_app_load_userspace_ok_bag_incomplete_residual_open"
+        );
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "journal_tokens_present=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+    }
+
+    #[test]
+    fn app_load_offline_progress_scorecard_compare_status_and_refuse() {
+        let ready = "Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack";
+        // Loaded: bytes present, bag incomplete (no provenance) → status loaded.
+        let bag_loaded = check_external_known_good_bag_drop(
+            true,
+            Some("not research ready"),
+            Some("working_stack_ctrltext.bin"),
+            None,
+        );
+        assert!(!bag_loaded.bag_drop_complete);
+        let e2e = research_app_load_e2e_fixture_c2_locked_absent_bag();
+        let st_loaded = external_compare_status_from_surfaces(&bag_loaded, None, false);
+        assert_eq!(st_loaded, ExternalCompareStatus::Loaded);
+        // Scorecard for Loaded (bytes present, no compare, bag incomplete).
+        let s_loaded = research_app_load_offline_progress_scorecard(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &bag_loaded,
+            &e2e,
+            None,
+            false,
+        );
+        assert_eq!(
+            s_loaded.external_compare_status,
+            ExternalCompareStatus::Loaded
+        );
+        assert!(!s_loaded.bag_drop_complete);
+        assert!(s_loaded.residual_not_closed);
+        assert!(!s_loaded.scorecard_alone_closes_fw_residual);
+        assert_eq!(
+            s_loaded.detail,
+            "scorecard_app_load_userspace_ok_bag_incomplete_residual_open"
+        );
+        let ln = s_loaded.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &ln,
+            "external_compare_status=loaded"
+        ));
+        assert!(residual_note_has_exact_token(&ln, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(&ln, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &ln,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+
+        // Loaded + bag_complete (provenance ready, no compare yet) → pending detail.
+        let bag_complete_no_cmp = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("working_stack_ctrltext.bin"),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        assert!(bag_complete_no_cmp.bag_drop_complete);
+        let s_pending = research_app_load_offline_progress_scorecard(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &bag_complete_no_cmp,
+            &e2e,
+            None,
+            false,
+        );
+        assert_eq!(
+            s_pending.external_compare_status,
+            ExternalCompareStatus::Loaded
+        );
+        assert_eq!(
+            s_pending.detail,
+            "scorecard_bag_complete_loaded_compare_pending_residual_open"
+        );
+        assert!(s_pending.residual_not_closed);
+        assert!(!s_pending.scorecard_alone_closes_fw_residual);
+        let pn = s_pending.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "external_compare_status=loaded"
+        ));
+        assert!(residual_note_has_exact_token(&pn, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(&pn, "invent_pass=0"));
+
+        // Refused: VE2 platform claim.
+        let bag_ve2 = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("ve2_ctrltext.bin"),
+            Some("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"),
+        );
+        assert!(bag_ve2.refused_ve2_not_aie2);
+        let st_ref = external_compare_status_from_surfaces(&bag_ve2, None, false);
+        assert_eq!(st_ref, ExternalCompareStatus::Refused);
+        let s_ref = research_app_load_offline_progress_scorecard(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &bag_ve2,
+            &e2e,
+            None,
+            false,
+        );
+        assert_eq!(
+            s_ref.external_compare_status,
+            ExternalCompareStatus::Refused
+        );
+        assert_eq!(s_ref.detail, "scorecard_external_refused_residual_open");
+        assert!(s_ref.residual_not_closed);
+
+        // external_load_refused even without bag refuse flags.
+        let bag_ok = check_external_known_good_bag_drop(false, None, None, None);
+        assert_eq!(
+            external_compare_status_from_surfaces(&bag_ok, None, true),
+            ExternalCompareStatus::Refused
+        );
+
+        // Match: compare reports external_present + sha_match (research only).
+        let mut cmp = ExternalCtrltextCompareResearch {
+            external_present: true,
+            known_good_absent: false,
+            sha_match: true,
+            detail: "unit_match".into(),
+            ..Default::default()
+        };
+        let bag_complete = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("working_stack_ctrltext.bin"),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        assert!(bag_complete.bag_drop_complete);
+        assert_eq!(
+            external_compare_status_from_surfaces(&bag_complete, Some(&cmp), false),
+            ExternalCompareStatus::Match
+        );
+        let s_match = research_app_load_offline_progress_scorecard(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &bag_complete,
+            &e2e,
+            Some(&cmp),
+            false,
+        );
+        assert!(s_match.scorecard_research_surfaces_ready);
+        assert!(s_match.residual_not_closed);
+        assert!(!s_match.scorecard_alone_closes_fw_residual);
+        assert_eq!(
+            s_match.detail,
+            "scorecard_surfaces_ready_residual_still_open"
+        );
+        let mn = s_match.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "external_compare_status=match"
+        ));
+        assert!(residual_note_has_exact_token(&mn, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+
+        // Mismatch: bag complete + compare ran with sha_match=false (mirror Match honesty).
+        cmp.sha_match = false;
+        assert_eq!(
+            external_compare_status_from_surfaces(&bag_complete, Some(&cmp), false),
+            ExternalCompareStatus::Mismatch
+        );
+        let s_mis = research_app_load_offline_progress_scorecard(
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu,
+            &bag_complete,
+            &e2e,
+            Some(&cmp),
+            false,
+        );
+        assert_eq!(
+            s_mis.external_compare_status,
+            ExternalCompareStatus::Mismatch
+        );
+        assert!(s_mis.bag_drop_complete);
+        assert!(!s_mis.scorecard_research_surfaces_ready);
+        assert!(s_mis.residual_not_closed);
+        assert!(!s_mis.scorecard_alone_closes_fw_residual);
+        assert_eq!(
+            s_mis.detail,
+            "scorecard_bag_complete_mismatch_residual_open"
+        );
+        let misn = s_mis.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &misn,
+            "external_compare_status=mismatch"
+        ));
+        assert!(residual_note_has_exact_token(
+            &misn,
+            "residual_not_closed=1"
+        ));
+        assert!(residual_note_has_exact_token(&misn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &misn,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &misn,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&misn, "bag_drop_complete=1"));
+        assert!(!residual_note_has_exact_token(&misn, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(
+            &misn,
+            "residual_not_closed=0"
+        ));
+    }
+
+    #[test]
+    fn app_load_offline_progress_scorecard_honesty_hard_coded_not_mutable() {
+        let mut s = research_app_load_offline_progress_scorecard_c2_locked_absent_bag();
+        s.residual_not_closed = false;
+        s.scorecard_alone_closes_fw_residual = true;
+        s.body_bounds_alone_closes_fw_residual = true;
+        s.scorecard_research_surfaces_ready = true;
+        s.bag_drop_complete = true;
+        s.external_compare_status = ExternalCompareStatus::Match;
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "body_bounds_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Mutable surface fields may echo; honesty locks stay hard-coded.
+        assert!(residual_note_has_exact_token(&n, "bag_drop_complete=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_compare_status=match"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn external_known_good_operator_extract_checklist_refuse_tokens() {
+        let t = format_external_known_good_operator_extract_checklist();
+        assert!(t.contains("external_known_good_operator_extract_checklist"));
+        assert!(t.contains("stamp=588c1c72"));
+        assert!(t.contains("lab_export_auto_feed=1"));
+        assert!(t.contains("feed_alone_closes_fw_residual=0"));
+        assert!(t.contains("step9=lab_export_fingerprint_auto_feed"));
+        assert!(t.contains("step10=soft_app_load_bag_feed_dry_run_scorecard"));
+        assert!(t.contains("step11=soft_app_load_extract_bag_scorecard_pipeline"));
+        assert!(t.contains("extract_alone_closes_fw_residual=0"));
+        assert!(t.contains("pipeline_alone_closes_fw_residual=0"));
+        // Key refuse tokens (unit-locked).
+        assert!(t.contains("refuse_local_post_patch=1"));
+        assert!(t.contains("refuse_instr_post_patch_bin=1"));
+        assert!(t.contains("refuse_ve2_not_aie2=1"));
+        assert!(t.contains("refuse_validate_xclbin_as_aie2_known_good=1"));
+        // Honesty footer.
+        assert!(t.contains("invent_pass=0"));
+        assert!(t.contains("not_c_ready=1"));
+        assert!(t.contains("not_ran_on_npu=1"));
+        assert!(t.contains("product_known_good=0"));
+        assert!(t.contains("residual_not_closed=1"));
+        assert!(t.contains("scorecard_alone_closes_fw_residual=0"));
+        assert!(t.contains("ctrltext_match_alone_closes_fw_residual=0"));
+        assert!(t.contains("dry_run_alone_closes_fw_residual=0"));
+        assert!(t.contains("blocked_on_external_bytes_when_bag_absent=1"));
+        assert!(t.contains("no_second_c_unlock=1"));
+        assert!(t.contains("c_unlock_b17b0119_consumed=1"));
+        assert!(t.contains("bag_drop_complete_neq_pass=1"));
+        // Steps present.
+        assert!(t.contains("step3=copy_bytes_to_testdata_xdna2_cmd_external_known_good"));
+        assert!(t.contains("step6=set_XDNA2_LAB_EXTERNAL_CTRLTEXT"));
+        assert!(t.contains("step8=soft_external_ctrltext_compare_dry_run"));
+    }
+
+    // -----------------------------------------------------------------------
+    // External ctrltext compare dry-run (stamp 6033158a)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_absent_blocked_on_external_bytes() {
+        let d = research_external_ctrltext_compare_dry_run_c2_locked_absent_bag();
+        assert!(!d.lab_export_ready);
+        assert!(!d.external_present);
+        assert!(d.blocked_on_external_bytes);
+        assert!(!d.refused_local_post_patch);
+        assert!(!d.refused_ve2_not_aie2);
+        assert!(!d.compare_ran);
+        assert!(!d.sha_match);
+        assert!(d.residual_not_closed);
+        assert!(!d.dry_run_alone_closes_fw_residual);
+        assert_eq!(d.detail, "dry_run_blocked_on_external_bytes");
+
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            EXTERNAL_CTRLTEXT_COMPARE_DRY_RUN_NOTE
+        ));
+        let blocked_1 = format!("{BLOCKED_ON_EXTERNAL_BYTES_TOKEN}=1");
+        let blocked_0 = format!("{BLOCKED_ON_EXTERNAL_BYTES_TOKEN}=0");
+        assert!(residual_note_has_exact_token(&n, &blocked_1));
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "external_present=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+        assert!(!residual_note_has_exact_token(&n, &blocked_0));
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_lab_ready_blocked_on_external() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        assert!(lab_fingerprint_export_is_ready(Some(&exp)));
+        let d = research_external_ctrltext_compare_dry_run(Some(&exp), None, None, None);
+        assert!(d.lab_export_ready);
+        assert!(d.blocked_on_external_bytes);
+        assert!(!d.external_present);
+        assert!(!d.compare_ran);
+        assert_eq!(
+            d.detail,
+            "dry_run_lab_export_ready_blocked_on_external_bytes"
+        );
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        // Empty external slice same as None.
+        let d_empty = research_external_ctrltext_compare_dry_run(Some(&exp), Some(&[]), None, None);
+        assert!(d_empty.blocked_on_external_bytes);
+        assert!(!d_empty.external_present);
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_refuse_local_post_patch() {
+        let d = research_external_ctrltext_compare_dry_run(
+            None,
+            Some(b"not-real-known-good"),
+            Some("instr_post_patch.bin"),
+            None,
+        );
+        assert!(d.refused_local_post_patch);
+        assert!(!d.blocked_on_external_bytes);
+        assert!(!d.external_present);
+        assert!(!d.compare_ran);
+        assert!(!d.sha_match);
+        assert_eq!(d.detail, "dry_run_refused_local_post_patch");
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "refused_local_post_patch=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        // Vendor post_patch basename also refused.
+        let d2 = research_external_ctrltext_compare_dry_run(
+            None,
+            None,
+            Some("instr_vendor_post_patch.bin"),
+            None,
+        );
+        assert!(d2.refused_local_post_patch);
+        assert_eq!(d2.detail, "dry_run_refused_local_post_patch");
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_refuse_ve2_platform_not_aie2() {
+        let d = research_external_ctrltext_compare_dry_run(
+            None,
+            Some(b"ve2-bytes"),
+            Some("ve2_ctrltext.bin"),
+            Some("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"),
+        );
+        assert!(d.refused_ve2_not_aie2);
+        assert!(d.platform_not_aie2);
+        assert!(!d.blocked_on_external_bytes);
+        assert!(!d.external_present);
+        assert!(!d.compare_ran);
+        assert_eq!(d.detail, "dry_run_refused_ve2_not_aie2");
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "refused_ve2_not_aie2=1"));
+        assert!(residual_note_has_exact_token(&n, "platform_not_aie2=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "xclbin_extract_refused_ve2=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+
+        // Companion xclbin header + VE2 claim (explicit path).
+        let d_x = research_external_ctrltext_compare_dry_run_ex(
+            None,
+            None,
+            None,
+            Some("ve2_latency validate.xclbin NOT_AIE2_KNOWN_GOOD=1"),
+            Some(XCLBIN2_MAGIC),
+            Some("AIE_PARTITION BITSTREAM"),
+            false,
+        );
+        assert!(d_x.refused_ve2_not_aie2);
+        assert!(d_x.platform_not_aie2);
+        assert!(d_x.xclbin_extract_refused_ve2);
+        assert!(!d_x.blocked_on_external_bytes);
+        let xn = d_x.format_soft_note();
+        assert!(residual_note_has_exact_token(&xn, "platform_not_aie2=1"));
+        assert!(residual_note_has_exact_token(&xn, "invent_pass=0"));
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_match_neq_pass() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        let d = research_external_ctrltext_compare_dry_run(Some(&exp), Some(&ctrltext), None, None);
+        assert!(d.lab_export_ready);
+        assert!(d.external_present);
+        assert!(!d.blocked_on_external_bytes);
+        assert!(d.compare_ran);
+        assert!(d.sha_match);
+        assert!(d.structural_match);
+        assert!(d.residual_not_closed);
+        assert!(!d.dry_run_alone_closes_fw_residual);
+        assert_eq!(
+            d.detail,
+            "dry_run_sha_and_structural_match_residual_still_open"
+        );
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "compare_ran=1"));
+        assert!(residual_note_has_exact_token(&n, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&n, "structural_match=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+
+        // Mismatch path still residual open.
+        let mut flipped = ctrltext.clone();
+        if let Some(b) = flipped.first_mut() {
+            *b ^= 0xff;
+        }
+        let d_mis =
+            research_external_ctrltext_compare_dry_run(Some(&exp), Some(&flipped), None, None);
+        assert!(d_mis.compare_ran);
+        assert!(!d_mis.sha_match);
+        assert!(!d_mis.blocked_on_external_bytes);
+        assert!(d_mis.residual_not_closed);
+        // Flipped first byte → sha_match=0; structural may still match (len/walk).
+        assert!(
+            d_mis.detail == "dry_run_compare_mismatch_residual_open"
+                || d_mis.detail == "dry_run_structural_match_sha_diff_residual_open",
+            "unexpected mismatch detail={}",
+            d_mis.detail
+        );
+        let mn = d_mis.format_soft_note();
+        assert!(residual_note_has_exact_token(&mn, "sha_match=0"));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&mn, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_honesty_hard_coded_not_mutable() {
+        let mut d = research_external_ctrltext_compare_dry_run_c2_locked_absent_bag();
+        d.residual_not_closed = false;
+        d.dry_run_alone_closes_fw_residual = true;
+        d.blocked_on_external_bytes = false;
+        d.sha_match = true;
+        d.compare_ran = true;
+        d.external_present = true;
+        d.lab_export_ready = true;
+        let n = d.format_soft_note();
+        // Honesty locks stay hard-coded even if fields mutated.
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Mutable surface fields may echo; honesty locks stay hard-coded.
+        assert!(residual_note_has_exact_token(&n, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&n, "compare_ran=1"));
+        let blocked_0 = format!("{BLOCKED_ON_EXTERNAL_BYTES_TOKEN}=0");
+        assert!(residual_note_has_exact_token(&n, &blocked_0));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_lab_not_ready_external_present() {
+        // External bytes without lab-ready export → no empty-sha compare.
+        let d = research_external_ctrltext_compare_dry_run(
+            None,
+            Some(b"external-bytes-present"),
+            None,
+            None,
+        );
+        assert!(!d.lab_export_ready);
+        assert!(d.external_present);
+        assert!(!d.blocked_on_external_bytes);
+        assert!(!d.compare_ran);
+        assert!(!d.sha_match);
+        assert!(!d.structural_match);
+        assert!(d.residual_not_closed);
+        assert!(!d.dry_run_alone_closes_fw_residual);
+        assert_eq!(d.detail, "dry_run_lab_export_not_ready_external_present");
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "external_present=1"));
+        assert!(residual_note_has_exact_token(&n, "compare_ran=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            &format!("{BLOCKED_ON_EXTERNAL_BYTES_TOKEN}=0")
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        // Default lab export (empty sha) is not ready either.
+        let empty_lab = CtrltextFingerprintExport::default();
+        assert!(!lab_fingerprint_export_is_ready(Some(&empty_lab)));
+        let d2 = research_external_ctrltext_compare_dry_run(
+            Some(&empty_lab),
+            Some(b"still-external"),
+            None,
+            None,
+        );
+        assert!(!d2.compare_ran);
+        assert!(d2.external_present);
+        assert_eq!(d2.detail, "dry_run_lab_export_not_ready_external_present");
+    }
+
+    #[test]
+    fn external_ctrltext_compare_dry_run_load_refused_distinct_detail() {
+        // Soft confinement/read refuse: still blocked_on_external_bytes, distinct detail.
+        let d = research_external_ctrltext_compare_dry_run_ex(
+            None,
+            None,
+            Some("allowed_name.ctrltext"),
+            Some("/tmp/allowed_name.ctrltext"),
+            None,
+            None,
+            true, // external_load_refused
+        );
+        assert!(d.blocked_on_external_bytes);
+        assert!(!d.external_present);
+        assert!(!d.refused_local_post_patch);
+        assert!(!d.refused_ve2_not_aie2);
+        assert!(!d.compare_ran);
+        assert_eq!(d.detail, "dry_run_external_load_refused_blocked_on_bytes");
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            &format!("{BLOCKED_ON_EXTERNAL_BYTES_TOKEN}=1")
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        // post_patch refuse still wins over load_refused flag.
+        let d_post = research_external_ctrltext_compare_dry_run_ex(
+            None,
+            None,
+            Some("instr_post_patch.bin"),
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(d_post.refused_local_post_patch);
+        assert!(!d_post.blocked_on_external_bytes);
+        assert_eq!(d_post.detail, "dry_run_refused_local_post_patch");
+        // lab-ready + load_refused still uses load-refused detail (bytes missing).
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        let d_lab = research_external_ctrltext_compare_dry_run_ex(
+            Some(&exp),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(d_lab.lab_export_ready);
+        assert!(d_lab.blocked_on_external_bytes);
+        assert_eq!(
+            d_lab.detail,
+            "dry_run_external_load_refused_blocked_on_bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lab export fingerprint auto-feed (stamp d2e287ab)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lab_export_fingerprint_feed_from_elf_ready_blocked_on_external() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        assert!(feed.lab_export_ready);
+        assert!(feed.lab_export_auto_feed);
+        assert_eq!(feed.feed_source, "elf_bytes");
+        assert!(!feed.refused_local_post_patch);
+        assert!(!feed.platform_not_aie2);
+        assert!(feed.residual_not_closed);
+        assert!(!feed.feed_alone_closes_fw_residual);
+        assert_eq!(feed.detail, "feed_elf_export_ready");
+        assert!(feed.ready_export().is_some());
+
+        let n = feed.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            LAB_EXPORT_FINGERPRINT_FEED_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        assert!(residual_note_has_exact_token(&n, "feed_source=elf_bytes"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+
+        // Auto-feed dry-run: lab ready + bag absent → blocked_on_external_bytes.
+        let dry = research_external_ctrltext_compare_dry_run_from_lab_feed(&feed, None, None, None);
+        assert!(dry.lab_export_ready);
+        assert!(dry.blocked_on_external_bytes);
+        assert!(!dry.external_present);
+        assert!(!dry.compare_ran);
+        assert!(dry.residual_not_closed);
+        assert_eq!(
+            dry.detail,
+            "dry_run_lab_export_ready_blocked_on_external_bytes"
+        );
+        let dn = dry.format_soft_note();
+        assert!(residual_note_has_exact_token(&dn, "lab_export_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "residual_not_closed=1"));
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_absent_both_sides() {
+        let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        assert!(!feed.lab_export_ready);
+        assert_eq!(feed.feed_source, "absent");
+        // Combined entry: distinct from ELF-only `feed_elf_absent`.
+        assert_eq!(feed.detail, "feed_absent_no_elf_no_signals");
+        assert!(feed.ready_export().is_none());
+        let n = feed.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "detail=feed_absent_no_elf_no_signals"
+        ));
+
+        let dry = research_external_ctrltext_compare_dry_run_from_lab_feed(&feed, None, None, None);
+        assert!(!dry.lab_export_ready);
+        assert!(dry.blocked_on_external_bytes);
+        assert_eq!(dry.detail, "dry_run_blocked_on_external_bytes");
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_last_apply_signals_incomplete_no_invent_sha() {
+        // aiebu + content size alone never invent unpatched sha / ready export.
+        let feed = research_lab_export_fingerprint_feed_from_last_apply_signals(
+            Some(true),
+            Some(1688),
+            Some(12),
+        );
+        assert!(!feed.lab_export_ready);
+        assert_eq!(feed.feed_source, "last_apply_signals");
+        assert_eq!(feed.last_apply_content_size_b, Some(1688));
+        assert_eq!(feed.last_apply_aiebu_elf, Some(true));
+        assert_eq!(feed.last_apply_rela_count, Some(12));
+        assert!(feed.export.is_none());
+        assert_eq!(
+            feed.detail,
+            "feed_last_apply_signals_incomplete_need_elf_bytes"
+        );
+        let n = feed.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_source=last_apply_signals"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "last_apply_content_size_b=1688"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=0"
+        ));
+
+        // Prefer ELF when both last_apply detail and ELF present.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let detail =
+            "aiebu_elf=1 rela_count=12 content_size=1688B start_npu_size=1688B bo_size=4096B";
+        let combined = research_lab_export_fingerprint_feed(Some(&synth), Some(detail), None, None);
+        assert!(combined.lab_export_ready);
+        assert_eq!(combined.feed_source, "elf_bytes");
+
+        // last_apply detail alone → incomplete signals feed.
+        let signals_only = research_lab_export_fingerprint_feed(None, Some(detail), None, None);
+        assert!(!signals_only.lab_export_ready);
+        assert_eq!(signals_only.feed_source, "last_apply_signals");
+        assert_eq!(signals_only.last_apply_content_size_b, Some(1688));
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_refuse_post_patch_and_ve2() {
+        let feed =
+            research_lab_export_fingerprint_feed(None, None, Some("instr_post_patch.bin"), None);
+        assert!(feed.refused_local_post_patch);
+        assert!(!feed.lab_export_ready);
+        assert_eq!(feed.feed_source, "refused_local_post_patch");
+        assert_eq!(feed.detail, "feed_refused_local_post_patch");
+        let n = feed.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "refused_local_post_patch=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+
+        let dry = research_external_ctrltext_compare_dry_run_from_lab_feed(
+            &feed,
+            Some(b"not-real"),
+            None,
+            None,
+        );
+        assert!(dry.refused_local_post_patch);
+        assert!(!dry.blocked_on_external_bytes);
+        assert_eq!(dry.detail, "dry_run_refused_local_post_patch");
+
+        // Issue 1: feed refuse must not drop when caller passes non-refused basename.
+        let dry_clobber = research_external_ctrltext_compare_dry_run_from_lab_feed(
+            &feed,
+            Some(b"not-real-external-bytes"),
+            Some("external_good.bin"),
+            None,
+        );
+        assert!(dry_clobber.refused_local_post_patch);
+        assert!(!dry_clobber.compare_ran);
+        assert!(!dry_clobber.blocked_on_external_bytes);
+        assert_eq!(dry_clobber.detail, "dry_run_refused_local_post_patch");
+        assert!(residual_note_has_exact_token(
+            &dry_clobber.format_soft_note(),
+            "refused_local_post_patch=1"
+        ));
+
+        let ve2 = research_lab_export_fingerprint_feed(
+            None,
+            None,
+            None,
+            Some("ve2_latency validate.xclbin NOT_AIE2_KNOWN_GOOD=1"),
+        );
+        assert!(ve2.platform_not_aie2);
+        assert!(!ve2.lab_export_ready);
+        assert_eq!(ve2.feed_source, "platform_not_aie2");
+        let vn = ve2.format_soft_note();
+        assert!(residual_note_has_exact_token(&vn, "platform_not_aie2=1"));
+        assert!(residual_note_has_exact_token(&vn, "invent_pass=0"));
+
+        let dry_ve2 =
+            research_external_ctrltext_compare_dry_run_from_lab_feed(&ve2, None, None, None);
+        assert!(dry_ve2.refused_ve2_not_aie2);
+        assert!(dry_ve2.platform_not_aie2);
+        assert!(!dry_ve2.blocked_on_external_bytes);
+        assert_eq!(dry_ve2.detail, "dry_run_refused_ve2_not_aie2");
+
+        // Issue 1: feed platform_not_aie2 must not drop when caller passes non-VE2 claim.
+        let dry_ve2_clobber = research_external_ctrltext_compare_dry_run_from_lab_feed(
+            &ve2,
+            Some(b"not-real-external-bytes"),
+            None,
+            Some("PLATFORM=AIE2_STX research_only"),
+        );
+        assert!(dry_ve2_clobber.refused_ve2_not_aie2);
+        assert!(dry_ve2_clobber.platform_not_aie2);
+        assert!(!dry_ve2_clobber.compare_ran);
+        assert!(!dry_ve2_clobber.blocked_on_external_bytes);
+        assert_eq!(dry_ve2_clobber.detail, "dry_run_refused_ve2_not_aie2");
+        assert!(residual_note_has_exact_token(
+            &dry_ve2_clobber.format_soft_note(),
+            "platform_not_aie2=1"
+        ));
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_honesty_hard_coded_not_mutable() {
+        let mut feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        feed.residual_not_closed = false;
+        feed.feed_alone_closes_fw_residual = true;
+        feed.lab_export_ready = true;
+        feed.lab_export_auto_feed = false;
+        let n = feed.format_soft_note();
+        // Honesty locks stay hard-coded even if fields mutated.
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // lab_export_auto_feed always hard-coded 1 in soft note.
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        // Mutable ready bit may echo.
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=1"
+        ));
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_match_neq_pass_via_auto_feed() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        assert!(feed.lab_export_ready);
+        let dry = research_external_ctrltext_compare_dry_run_from_lab_feed(
+            &feed,
+            Some(&ctrltext),
+            None,
+            None,
+        );
+        assert!(dry.lab_export_ready);
+        assert!(dry.external_present);
+        assert!(!dry.blocked_on_external_bytes);
+        assert!(dry.compare_ran);
+        assert!(dry.sha_match);
+        assert!(dry.structural_match);
+        assert!(dry.residual_not_closed);
+        assert!(!dry.dry_run_alone_closes_fw_residual);
+        assert_eq!(
+            dry.detail,
+            "dry_run_sha_and_structural_match_residual_still_open"
+        );
+        let n = dry.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_empty_elf_not_ready() {
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&[]));
+        assert!(!feed.lab_export_ready);
+        assert_eq!(feed.feed_source, "absent");
+        assert_eq!(feed.detail, "feed_elf_absent");
+        let non_aiebu = research_lab_export_fingerprint_feed_from_elf(Some(b"not-elf"));
+        assert!(!non_aiebu.lab_export_ready);
+        assert_eq!(non_aiebu.feed_source, "elf_bytes");
+        assert_eq!(non_aiebu.detail, "feed_elf_export_not_ready");
+        assert!(non_aiebu.export.is_some());
+        assert!(non_aiebu.ready_export().is_none());
+    }
+
+    #[test]
+    fn lab_export_fingerprint_feed_ready_export_requires_export_ready() {
+        // Hand-mutated bag: lab_export_ready=true with missing/empty export must not
+        // invent a ready export borrow for dry-run auto-feed.
+        let mut feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        feed.lab_export_ready = true;
+        feed.export = None;
+        assert!(feed.ready_export().is_none());
+        let dry = research_external_ctrltext_compare_dry_run_from_lab_feed(&feed, None, None, None);
+        assert!(!dry.lab_export_ready);
+        assert!(dry.blocked_on_external_bytes);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bag + feed + dry-run composition scorecard (stamp 2b01425e)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_c2_locked_absent_blocked() {
+        let s = research_app_load_bag_feed_dry_run_scorecard_c2_locked_absent_bag();
+        assert!(!s.bag_drop_complete);
+        assert!(!s.bag_ctrltext_bytes_present);
+        assert!(!s.lab_export_ready);
+        assert!(s.lab_export_auto_feed);
+        assert!(s.blocked_on_external_bytes);
+        assert!(!s.external_present);
+        assert!(!s.compare_ran);
+        assert!(!s.refused_local_post_patch);
+        assert!(!s.refused_ve2_not_aie2);
+        assert!(s.residual_not_closed);
+        assert!(!s.scorecard_alone_closes_fw_residual);
+        assert!(!s.feed_alone_closes_fw_residual);
+        assert!(!s.dry_run_alone_closes_fw_residual);
+        assert!(!s.bag_drop_alone_closes_fw_residual);
+        assert_eq!(
+            s.detail,
+            "scorecard_blocked_on_external_bytes_lab_not_ready"
+        );
+
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            APP_LOAD_BAG_FEED_DRY_RUN_SCORECARD_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "bag_drop_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_lab_ready_blocked_on_external() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let bag = check_external_known_good_bag_drop(false, None, None, None);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        assert!(feed.lab_export_ready);
+        let s = research_app_load_bag_feed_dry_run_scorecard(&bag, &feed, None, None, None);
+        assert!(s.lab_export_ready);
+        assert!(s.blocked_on_external_bytes);
+        assert!(!s.external_present);
+        assert!(!s.compare_ran);
+        assert!(s.residual_not_closed);
+        assert_eq!(s.detail, "scorecard_lab_ready_blocked_on_external_bytes");
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "detail=scorecard_lab_ready_blocked_on_external_bytes"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+    }
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_refuse_post_patch_and_ve2() {
+        let bag_post = check_external_known_good_bag_drop(
+            true,
+            Some("Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack"),
+            Some("instr_post_patch.bin"),
+            None,
+        );
+        assert!(bag_post.refused_local_post_patch_basename);
+        let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        let s_post = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_post,
+            &feed,
+            Some(b"not-real"),
+            Some("external_good.bin"), // non-refused caller — must not clobber bag refuse
+            None,
+        );
+        assert!(s_post.refused_local_post_patch);
+        assert!(!s_post.blocked_on_external_bytes);
+        assert!(!s_post.compare_ran);
+        assert_eq!(
+            s_post.detail,
+            "scorecard_refused_local_post_patch_residual_open"
+        );
+        assert!(residual_note_has_exact_token(
+            &s_post.format_soft_note(),
+            "refused_local_post_patch=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &s_post.format_soft_note(),
+            "invent_pass=0"
+        ));
+
+        // Feed refuse path (no bag refuse) still forces refuse.
+        let bag_ok = check_external_known_good_bag_drop(false, None, None, None);
+        let feed_post =
+            research_lab_export_fingerprint_feed(None, None, Some("instr_post_patch.bin"), None);
+        let s_feed = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_ok,
+            &feed_post,
+            Some(b"not-real"),
+            Some("external_good.bin"),
+            None,
+        );
+        assert!(s_feed.refused_local_post_patch);
+        assert!(!s_feed.blocked_on_external_bytes);
+        assert_eq!(
+            s_feed.detail,
+            "scorecard_refused_local_post_patch_residual_open"
+        );
+
+        // VE2 refuse + platform_not_aie2.
+        let bag_ve2 = check_external_known_good_bag_drop(
+            true,
+            Some("Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack"),
+            Some("ve2_ctrltext.bin"),
+            Some("PLATFORM=VE2_EDGE NOT_AIE2_KNOWN_GOOD=1"),
+        );
+        assert!(bag_ve2.refused_ve2_not_aie2);
+        let s_ve2 = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_ve2,
+            &feed,
+            Some(b"not-real"),
+            None,
+            Some("PLATFORM=AIE2_STX research_only"), // non-VE2 caller — must not clobber
+        );
+        assert!(s_ve2.refused_ve2_not_aie2);
+        assert!(s_ve2.platform_not_aie2);
+        assert!(!s_ve2.blocked_on_external_bytes);
+        assert!(!s_ve2.compare_ran);
+        assert_eq!(s_ve2.detail, "scorecard_refused_ve2_not_aie2_residual_open");
+        let vn = s_ve2.format_soft_note();
+        assert!(residual_note_has_exact_token(&vn, "platform_not_aie2=1"));
+        assert!(residual_note_has_exact_token(&vn, "refused_ve2_not_aie2=1"));
+        assert!(residual_note_has_exact_token(&vn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&vn, "residual_not_closed=1"));
+    }
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_match_neq_pass() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let ready = "Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack";
+        let bag = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("working_stack_ctrltext.bin"),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        assert!(bag.bag_drop_complete);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        let s =
+            research_app_load_bag_feed_dry_run_scorecard(&bag, &feed, Some(&ctrltext), None, None);
+        assert!(s.bag_drop_complete);
+        assert!(s.lab_export_ready);
+        assert!(s.external_present);
+        assert!(!s.blocked_on_external_bytes);
+        assert!(s.compare_ran);
+        assert!(s.sha_match);
+        assert!(s.structural_match);
+        assert!(s.residual_not_closed);
+        assert!(!s.scorecard_alone_closes_fw_residual);
+        assert_eq!(
+            s.detail,
+            "scorecard_sha_and_structural_match_residual_still_open"
+        );
+        let n = s.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&n, "compare_ran=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_honesty_hard_coded_not_mutable() {
+        let mut s = research_app_load_bag_feed_dry_run_scorecard_c2_locked_absent_bag();
+        s.residual_not_closed = false;
+        s.scorecard_alone_closes_fw_residual = true;
+        s.feed_alone_closes_fw_residual = true;
+        s.dry_run_alone_closes_fw_residual = true;
+        s.bag_drop_alone_closes_fw_residual = true;
+        s.lab_export_auto_feed = false;
+        s.blocked_on_external_bytes = false;
+        let n = s.format_soft_note();
+        // Honesty locks stay hard-coded even if fields mutated.
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "bag_drop_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        // Mutable blocked bit may echo false after mutation.
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=1"
+        ));
+    }
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_external_load_refused_detail() {
+        let bag = check_external_known_good_bag_drop(false, None, None, None);
+        let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        let s = research_app_load_bag_feed_dry_run_scorecard_ex(
+            &bag, &feed, None, None, None, true, // external_load_refused
+        );
+        assert!(s.blocked_on_external_bytes);
+        assert_eq!(s.detail, "scorecard_external_load_refused_blocked_on_bytes");
+        assert!(s.residual_not_closed);
+        assert!(residual_note_has_exact_token(
+            &s.format_soft_note(),
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &s.format_soft_note(),
+            "invent_pass=0"
+        ));
+    }
+
+    #[test]
+    fn app_load_bag_feed_dry_run_scorecard_compare_detail_tokens_and_lab_not_ready() {
+        // Lab not ready + external present → distinct residual-open detail (no invent Pass).
+        let bag_absent = check_external_known_good_bag_drop(false, None, None, None);
+        let feed_absent = research_lab_export_fingerprint_feed(None, None, None, None);
+        assert!(!feed_absent.lab_export_ready);
+        let s_lab = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_absent,
+            &feed_absent,
+            Some(b"external-present-lab-not-ready"),
+            None,
+            None,
+        );
+        assert!(!s_lab.lab_export_ready);
+        assert!(s_lab.external_present);
+        assert!(!s_lab.blocked_on_external_bytes);
+        assert!(!s_lab.compare_ran);
+        assert!(s_lab.residual_not_closed);
+        assert_eq!(
+            s_lab.detail,
+            "scorecard_lab_export_not_ready_external_present_residual_open"
+        );
+        let ln = s_lab.format_soft_note();
+        assert!(residual_note_has_exact_token(&ln, "external_present=1"));
+        assert!(residual_note_has_exact_token(&ln, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&ln, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&ln, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &ln,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+
+        // Classic lab + flipped first byte → structural may hold, sha differs.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        assert!(feed.lab_export_ready);
+        let mut flipped = ctrltext.clone();
+        if let Some(b) = flipped.first_mut() {
+            *b ^= 0xff;
+        }
+        let s_flip = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_absent,
+            &feed,
+            Some(&flipped),
+            None,
+            None,
+        );
+        assert!(s_flip.compare_ran);
+        assert!(!s_flip.sha_match);
+        assert!(!s_flip.blocked_on_external_bytes);
+        assert!(s_flip.residual_not_closed);
+        if s_flip.structural_match {
+            assert_eq!(
+                s_flip.detail,
+                "scorecard_structural_match_sha_diff_residual_open"
+            );
+            assert!(residual_note_has_exact_token(
+                &s_flip.format_soft_note(),
+                "structural_match=1"
+            ));
+        } else {
+            assert_eq!(s_flip.detail, "scorecard_mismatch_residual_open");
+        }
+        assert!(residual_note_has_exact_token(
+            &s_flip.format_soft_note(),
+            "sha_match=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &s_flip.format_soft_note(),
+            "invent_pass=0"
+        ));
+
+        // Pure mismatch: classic lab vs unrelated garbage (neither sha nor structural).
+        let garbage = b"not-classic-txn-garbage-payload-mismatch-path";
+        let s_mis = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_absent,
+            &feed,
+            Some(garbage),
+            None,
+            None,
+        );
+        assert!(s_mis.compare_ran);
+        assert!(!s_mis.sha_match);
+        assert!(!s_mis.structural_match);
+        assert_eq!(s_mis.detail, "scorecard_mismatch_residual_open");
+        assert!(s_mis.residual_not_closed);
+        let mn = s_mis.format_soft_note();
+        assert!(residual_note_has_exact_token(&mn, "sha_match=0"));
+        assert!(residual_note_has_exact_token(&mn, "structural_match=0"));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&mn, "residual_not_closed=1"));
+
+        // sha_match without structural: hand-built ready export (non-classic lab).
+        let same = b"fixed-garbage-bytes-for-sha-only-path";
+        let mut exp = CtrltextFingerprintExport::default();
+        exp.unpatched_sha256_hex = sha256_hex_lower(same);
+        exp.ctrltext_len = Some(same.len());
+        exp.classic_walk_ok = false;
+        exp.known_good_status = KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN;
+        let mut feed_sha = LabExportFingerprintFeed::default();
+        feed_sha.lab_export_ready = true;
+        feed_sha.export = Some(exp);
+        feed_sha.feed_source = "unit_hand_export".into();
+        assert!(feed_sha.ready_export().is_some());
+        let s_sha = research_app_load_bag_feed_dry_run_scorecard(
+            &bag_absent,
+            &feed_sha,
+            Some(same),
+            None,
+            None,
+        );
+        assert!(s_sha.compare_ran);
+        assert!(s_sha.sha_match);
+        assert!(!s_sha.structural_match);
+        assert_eq!(s_sha.detail, "scorecard_sha_match_residual_still_open");
+        assert!(s_sha.residual_not_closed);
+        let sn = s_sha.format_soft_note();
+        assert!(residual_note_has_exact_token(&sn, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&sn, "structural_match=0"));
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&sn, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+
+        // Default bag: blocked_on_external_bytes + honesty (not mutable invent Pass).
+        let d = AppLoadBagFeedDryRunScorecard::default();
+        assert!(d.blocked_on_external_bytes);
+        assert!(d.residual_not_closed);
+        assert!(!d.scorecard_alone_closes_fw_residual);
+        assert_eq!(d.detail, "scorecard_default_blocked_on_external_bytes");
+        let dn = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&dn, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Extract → bag-drop → composition scorecard pipeline (stamp 588c1c72)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_c2_locked_absent_blocked() {
+        let p = research_app_load_extract_bag_scorecard_pipeline_c2_locked_absent_bag();
+        assert!(!p.extract_magic_xclbin2);
+        assert!(!p.extract_has_aie_partition_marker);
+        assert_eq!(p.extract_section_marker_count, 0);
+        assert!(!p.extract_eligible_as_aie2_external_known_good);
+        assert!(!p.bag_drop_complete);
+        assert!(!p.bag_ctrltext_bytes_present);
+        assert!(!p.lab_export_ready);
+        assert!(p.lab_export_auto_feed);
+        assert!(p.blocked_on_external_bytes);
+        assert!(!p.external_present);
+        assert!(!p.compare_ran);
+        assert!(!p.refused_local_post_patch);
+        assert!(!p.refused_ve2_not_aie2);
+        assert!(p.residual_not_closed);
+        assert!(!p.pipeline_alone_closes_fw_residual);
+        assert!(!p.extract_alone_closes_fw_residual);
+        assert!(!p.scorecard_alone_closes_fw_residual);
+        assert_eq!(p.detail, "pipeline_blocked_on_external_bytes_lab_not_ready");
+
+        let n = p.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            APP_LOAD_EXTRACT_BAG_SCORECARD_PIPELINE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pipeline_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "extract_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_pdi_image_decode=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_lab_ready_blocked_on_external() {
+        // Common soft offline path: empty extract (no magic/markers), absent bag,
+        // lab ELF export ready for fingerprint feed, external bag bytes still missing.
+        // Locks distinct detail `pipeline_lab_ready_blocked_on_external_bytes` so a
+        // future blocked-detail ladder reorder cannot silently remap this path.
+        let extract = research_xclbin_extract_dry_run(&[], None, None);
+        assert!(!extract.magic_xclbin2);
+        assert!(!extract.has_aie_partition_marker);
+        assert_eq!(extract.section_marker_count, 0);
+        assert!(!extract.eligible_as_aie2_external_known_good);
+        let bag = check_external_known_good_bag_drop(false, None, None, None);
+        assert!(!bag.bag_drop_complete);
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        assert!(feed.lab_export_ready);
+        let p = research_app_load_extract_bag_scorecard_pipeline(
+            &extract, &bag, &feed, None, None, None,
+        );
+        assert!(p.lab_export_ready);
+        assert!(p.lab_export_auto_feed);
+        assert!(p.blocked_on_external_bytes);
+        assert!(!p.external_present);
+        assert!(!p.compare_ran);
+        assert!(!p.extract_magic_xclbin2);
+        assert!(!p.extract_has_aie_partition_marker);
+        assert!(!p.extract_eligible_as_aie2_external_known_good);
+        assert!(!p.bag_drop_complete);
+        assert!(!p.refused_local_post_patch);
+        assert!(!p.refused_ve2_not_aie2);
+        assert!(p.residual_not_closed);
+        assert!(!p.pipeline_alone_closes_fw_residual);
+        assert!(!p.extract_alone_closes_fw_residual);
+        assert!(!p.scorecard_alone_closes_fw_residual);
+        assert_eq!(p.detail, "pipeline_lab_ready_blocked_on_external_bytes");
+
+        let n = p.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            APP_LOAD_EXTRACT_BAG_SCORECARD_PIPELINE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "detail=pipeline_lab_ready_blocked_on_external_bytes"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_export_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pipeline_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "extract_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+        // Distinct from lab-not-ready and marker-blocked tokens.
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "detail=pipeline_blocked_on_external_bytes_lab_not_ready"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "detail=pipeline_extract_magic_only_blocked_on_external_bytes"
+        ));
+    }
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_markers_present_still_blocked() {
+        // Public section markers without ctrltext bytes → still blocked, residual open.
+        let header = XCLBIN2_MAGIC.as_slice();
+        let section_text = "Section: AIE_PARTITION\nSection: BITSTREAM\nSection: MEM_TOPOLOGY\n";
+        let extract = research_xclbin_extract_dry_run(
+            header,
+            Some(section_text),
+            Some("Source stack: working public XRT AIE2 DynamicDispatch"),
+        );
+        assert!(extract.magic_xclbin2);
+        assert!(extract.has_aie_partition_marker);
+        assert!(extract.eligible_as_aie2_external_known_good);
+        let bag = check_external_known_good_bag_drop(false, None, None, None);
+        let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        let p = research_app_load_extract_bag_scorecard_pipeline(
+            &extract, &bag, &feed, None, None, None,
+        );
+        assert!(p.extract_magic_xclbin2);
+        assert!(p.extract_has_aie_partition_marker);
+        assert!(p.extract_eligible_as_aie2_external_known_good);
+        assert!(!p.bag_drop_complete);
+        assert!(p.blocked_on_external_bytes);
+        assert!(!p.compare_ran);
+        assert!(p.residual_not_closed);
+        assert!(!p.pipeline_alone_closes_fw_residual);
+        assert!(!p.extract_alone_closes_fw_residual);
+        assert_eq!(
+            p.detail,
+            "pipeline_extract_eligible_research_only_blocked_on_external_bytes"
+        );
+        let n = p.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "extract_eligible_as_aie2_external_known_good=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "extract_has_aie_partition_marker=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pipeline_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "extract_alone_closes_fw_residual=0"
+        ));
+
+        // Markers present, not research-eligible (no working-stack claim) — distinct token.
+        let markers_only = research_xclbin_extract_dry_run(header, Some(section_text), None);
+        assert!(!markers_only.eligible_as_aie2_external_known_good);
+        assert!(markers_only.has_aie_partition_marker);
+        let p2 = research_app_load_extract_bag_scorecard_pipeline(
+            &markers_only,
+            &bag,
+            &feed,
+            None,
+            None,
+            None,
+        );
+        assert!(p2.blocked_on_external_bytes);
+        assert_eq!(
+            p2.detail,
+            "pipeline_extract_markers_present_blocked_on_external_bytes"
+        );
+        assert!(residual_note_has_exact_token(
+            &p2.format_soft_note(),
+            "detail=pipeline_extract_markers_present_blocked_on_external_bytes"
+        ));
+
+        // Magic only (no section markers) — distinct token.
+        let magic_only = research_xclbin_extract_dry_run(header, None, None);
+        assert!(magic_only.magic_xclbin2);
+        assert!(!magic_only.has_aie_partition_marker);
+        let p3 = research_app_load_extract_bag_scorecard_pipeline(
+            &magic_only,
+            &bag,
+            &feed,
+            None,
+            None,
+            None,
+        );
+        assert!(p3.blocked_on_external_bytes);
+        assert_eq!(
+            p3.detail,
+            "pipeline_extract_magic_only_blocked_on_external_bytes"
+        );
+    }
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_refuse_post_patch_and_ve2() {
+        let extract_ok = research_xclbin_extract_dry_run(&[], None, None);
+        let bag_post = check_external_known_good_bag_drop(
+            true,
+            Some("Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack"),
+            Some("instr_post_patch.bin"),
+            None,
+        );
+        assert!(bag_post.refused_local_post_patch_basename);
+        let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        let p_post = research_app_load_extract_bag_scorecard_pipeline(
+            &extract_ok,
+            &bag_post,
+            &feed,
+            Some(b"not-real"),
+            Some("external_good.bin"), // non-refused caller — must not clobber bag refuse
+            None,
+        );
+        assert!(p_post.refused_local_post_patch);
+        assert!(!p_post.blocked_on_external_bytes);
+        assert!(!p_post.compare_ran);
+        assert_eq!(
+            p_post.detail,
+            "pipeline_refused_local_post_patch_residual_open"
+        );
+        assert!(residual_note_has_exact_token(
+            &p_post.format_soft_note(),
+            "refused_local_post_patch=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &p_post.format_soft_note(),
+            "invent_pass=0"
+        ));
+
+        // Extract VE2 refuse forces pipeline refuse even with non-VE2 caller platform.
+        let extract_ve2 = research_xclbin_extract_ve2_fixture_refused(&[], None);
+        assert!(extract_ve2.platform_not_aie2_known_good);
+        let bag_ok = check_external_known_good_bag_drop(false, None, None, None);
+        let p_ve2 = research_app_load_extract_bag_scorecard_pipeline(
+            &extract_ve2,
+            &bag_ok,
+            &feed,
+            Some(b"not-real"),
+            None,
+            Some("PLATFORM=AIE2_STX research_only"), // non-VE2 caller — must not clobber
+        );
+        assert!(p_ve2.refused_ve2_not_aie2);
+        assert!(p_ve2.platform_not_aie2);
+        assert!(p_ve2.extract_platform_not_aie2_known_good);
+        assert!(!p_ve2.blocked_on_external_bytes);
+        assert!(!p_ve2.compare_ran);
+        assert_eq!(p_ve2.detail, "pipeline_refused_ve2_not_aie2_residual_open");
+        let vn = p_ve2.format_soft_note();
+        assert!(residual_note_has_exact_token(&vn, "platform_not_aie2=1"));
+        assert!(residual_note_has_exact_token(&vn, "refused_ve2_not_aie2=1"));
+        assert!(residual_note_has_exact_token(
+            &vn,
+            "extract_platform_not_aie2_known_good=1"
+        ));
+        assert!(residual_note_has_exact_token(&vn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&vn, "residual_not_closed=1"));
+    }
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_match_neq_pass() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let ready = "Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack";
+        let bag = check_external_known_good_bag_drop(
+            true,
+            Some(ready),
+            Some("working_stack_ctrltext.bin"),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        assert!(bag.bag_drop_complete);
+        let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
+        let header = XCLBIN2_MAGIC.as_slice();
+        let section_text = "AIE_PARTITION BITSTREAM";
+        let extract = research_xclbin_extract_dry_run(
+            header,
+            Some(section_text),
+            Some("Source stack: working public XRT AIE2"),
+        );
+        let p = research_app_load_extract_bag_scorecard_pipeline(
+            &extract,
+            &bag,
+            &feed,
+            Some(&ctrltext),
+            None,
+            None,
+        );
+        assert!(p.bag_drop_complete);
+        assert!(p.lab_export_ready);
+        assert!(p.external_present);
+        assert!(!p.blocked_on_external_bytes);
+        assert!(p.compare_ran);
+        assert!(p.sha_match);
+        assert!(p.structural_match);
+        assert!(p.residual_not_closed);
+        assert!(!p.pipeline_alone_closes_fw_residual);
+        assert!(!p.extract_alone_closes_fw_residual);
+        assert_eq!(
+            p.detail,
+            "pipeline_sha_and_structural_match_residual_still_open"
+        );
+        let n = p.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&n, "compare_ran=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pipeline_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+    }
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_honesty_hard_coded_not_mutable() {
+        let mut p = research_app_load_extract_bag_scorecard_pipeline_c2_locked_absent_bag();
+        p.residual_not_closed = false;
+        p.pipeline_alone_closes_fw_residual = true;
+        p.extract_alone_closes_fw_residual = true;
+        p.scorecard_alone_closes_fw_residual = true;
+        p.feed_alone_closes_fw_residual = true;
+        p.dry_run_alone_closes_fw_residual = true;
+        p.bag_drop_alone_closes_fw_residual = true;
+        p.lab_export_auto_feed = false;
+        p.blocked_on_external_bytes = false;
+        let n = p.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "residual_not_closed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "pipeline_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "extract_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "scorecard_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "feed_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "dry_run_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "bag_drop_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "ctrltext_match_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "lab_export_auto_feed=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_pdi_layout=1"
+        ));
+        // Mutable blocked bit may echo false after mutation.
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
+        assert!(!residual_note_has_exact_token(
+            &n,
+            "pipeline_alone_closes_fw_residual=1"
+        ));
+    }
+
+    #[test]
+    fn app_load_extract_bag_scorecard_pipeline_external_load_refused_and_from_inputs() {
+        let extract = research_xclbin_extract_dry_run(&[], None, None);
+        let bag = check_external_known_good_bag_drop(false, None, None, None);
+        let feed = research_lab_export_fingerprint_feed(None, None, None, None);
+        let p = research_app_load_extract_bag_scorecard_pipeline_ex(
+            &extract, &bag, &feed, None, None, None, true, // external_load_refused
+        );
+        assert!(p.blocked_on_external_bytes);
+        assert_eq!(p.detail, "pipeline_external_load_refused_blocked_on_bytes");
+        assert!(p.residual_not_closed);
+        assert!(residual_note_has_exact_token(
+            &p.format_soft_note(),
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &p.format_soft_note(),
+            "invent_pass=0"
+        ));
+
+        // from_inputs convenience: markers → blocked without inventing Pass.
+        let header = XCLBIN2_MAGIC.as_slice();
+        let p2 = research_app_load_extract_bag_scorecard_pipeline_from_inputs(
+            header,
+            Some("AIE_PARTITION"),
+            None,
+            &bag,
+            &feed,
+            None,
+            None,
+            None,
+        );
+        assert!(p2.extract_magic_xclbin2);
+        assert!(p2.extract_has_aie_partition_marker);
+        assert!(p2.blocked_on_external_bytes);
+        assert_eq!(
+            p2.detail,
+            "pipeline_extract_markers_present_blocked_on_external_bytes"
+        );
+        assert!(p2.residual_not_closed);
+        assert!(!p2.pipeline_alone_closes_fw_residual);
+
+        // Default bag honesty.
+        let d = AppLoadExtractBagScorecardPipeline::default();
+        assert!(d.blocked_on_external_bytes);
+        assert!(d.residual_not_closed);
+        assert!(!d.pipeline_alone_closes_fw_residual);
+        assert_eq!(d.detail, "pipeline_default_blocked_on_external_bytes");
+        let dn = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "pipeline_alone_closes_fw_residual=0"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Journal partition-id field map (0x3000003 surface; stamp 7a5ab864)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn app_load_partition_id_field_map_c2_locked_absent_id() {
+        let r = research_app_load_partition_id_field_map_c2_locked();
+        assert_eq!(r.failed_cmd_status, Some(AIE2_FW_APP_LOAD_PDI_FAIL));
+        assert_eq!(r.chain_status, Some(AIE2_FW_INVALID_PARAM));
+        assert!(r.failed_cmd_is_app_load);
+        assert!(r.chain_is_invalid_param);
+        assert!(r.c2_app_load_pair);
+        assert_eq!(r.partition_id_public, APP_LOAD_PARTITION_ID_PUBLIC_TOKEN);
+        assert_eq!(r.partition_id_public, "absent_public");
+        assert!(r.do_not_invent_partition_id);
+        assert!(!r.field_map_alone_closes_fw_residual);
+        assert!(!r.root_cause_closed);
+        assert_eq!(r.detail, "c2_pair_mapped_partition_id_absent");
+        // Public field name constants stay stable for soft notes / docs.
+        assert_eq!(APP_LOAD_JOURNAL_FIELD_FAILED_CMD, "failed_cmd_status");
+        assert_eq!(APP_LOAD_JOURNAL_FIELD_CHAIN_STATUS, "chain_status");
+
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "app_load_partition_id_field_map"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "partition_id_public=absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "do_not_invent_partition_id=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "field_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "root_cause_closed=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "partition_surface_public=status_name_only"
+        ));
+        assert!(residual_note_has_exact_token(&n, "failed_cmd=0x3000003"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "failed_cmd_name=APP_LOAD_PDI_FAIL"
+        ));
+        assert!(residual_note_has_exact_token(&n, "chain_status=0x4000003"));
+        assert!(residual_note_has_exact_token(&n, "c2_app_load_pair=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "journal_field_failed_cmd=failed_cmd_status"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "journal_field_chain_status=chain_status"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        // Mutated close/invent fields must not leak.
+        let mut mutated = r.clone();
+        mutated.field_map_alone_closes_fw_residual = true;
+        mutated.root_cause_closed = true;
+        mutated.do_not_invent_partition_id = false;
+        mutated.partition_id_public = "invented_id_0";
+        let mn = mutated.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "partition_id_public=absent_public"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "do_not_invent_partition_id=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "field_map_alone_closes_fw_residual=0"
+        ));
+        assert!(residual_note_has_exact_token(&mn, "root_cause_closed=0"));
+        assert!(!residual_note_has_exact_token(&mn, "root_cause_closed=1"));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "field_map_alone_closes_fw_residual=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &mn,
+            "partition_id_public=invented_id_0"
+        ));
+        assert!(!residual_note_has_exact_token(&mn, "invent_pass=1"));
+    }
+
+    #[test]
+    fn app_load_partition_id_field_map_absent_and_partial() {
+        let empty = research_app_load_partition_id_field_map(None);
+        assert!(empty.failed_cmd_status.is_none());
+        assert!(empty.chain_status.is_none());
+        assert!(!empty.c2_app_load_pair);
+        assert_eq!(empty.partition_id_public, "absent_public");
+        assert_eq!(empty.detail, "default_no_journal");
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(&en, "failed_cmd=absent"));
+        assert!(residual_note_has_exact_token(&en, "chain_status=absent"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "partition_id_public=absent_public"
+        ));
+        assert!(residual_note_has_exact_token(&en, "root_cause_closed=0"));
+
+        // Partial: failed_cmd only.
+        let partial = research_app_load_partition_id_field_map_from_journal(Some(
+            "amdxdna: Failed cmd idx 0, status 0x3000003\n",
+        ));
+        assert!(partial.failed_cmd_is_app_load);
+        assert!(!partial.c2_app_load_pair);
+        assert_eq!(partial.detail, "failed_cmd_app_load_partition_id_absent");
+        assert_eq!(partial.partition_id_public, "absent_public");
+
+        // Oversized journal → treat as absent (no invent).
+        let big = "x".repeat(MAX_APP_LOAD_JOURNAL_TEXT_BYTES + 1);
+        let over = research_app_load_partition_id_field_map_from_journal(Some(&big));
+        assert!(over.failed_cmd_status.is_none());
+        assert_eq!(over.detail, "default_no_journal");
+
+        let def = AppLoadPartitionIdFieldMap::default();
+        assert!(!def.root_cause_closed);
+        assert!(!def.field_map_alone_closes_fw_residual);
+        assert_eq!(def.partition_id_public, APP_LOAD_PARTITION_ID_PUBLIC_TOKEN);
+    }
+
+    #[test]
+    fn construction_path_silicon_lab_elf_when_present() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf");
+        if !path.is_file() {
+            eprintln!("OFFLINE_ASSET_SKIP: no silicon_lab lab_instr.elf");
+            return;
+        }
+        let elf = match std::fs::read(&path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: read failed: {e}");
+                return;
+            }
+        };
+        let r = research_construction_path_lab_vs_public(&elf);
+        assert!(
+            r.lab_has_instr_ctrltext,
+            "silicon_lab must peel classic+rela: detail={}",
+            r.detail
+        );
+        assert!(!r.lab_has_cu_pdi_config, "never invent CONFIG_CU");
+        assert!(r.public_stack_requires_cu_pdi_step);
+        assert!(r.construction_gap_cu_pdi);
+        assert_eq!(r.lab_ctrltext_len, Some(1688));
+        assert_eq!(r.lab_rela_count, Some(12));
+        assert_eq!(r.detail, "classic_ctrltext_ok");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "construction_path_research"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "construction_gap_cu_pdi=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_has_instr=1"));
+        assert!(residual_note_has_exact_token(&n, "lab_has_cu_pdi_config=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "public_stack_cu_pdi_step=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "lab_ctrltext_len=1688"));
+        assert!(residual_note_has_exact_token(&n, "lab_rela_count=12"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(!n.contains("ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        // Construction research never opens C / invents Pass.
+        assert!(!n.contains("c_unlock"));
+    }
+
+    #[test]
+    fn fingerprint_empty_none() {
+        assert!(fingerprint_patched_ctrltext_after_rela(&[], 1, 2, 3, 4).is_none());
+        assert!(fingerprint_patched_ctrltext_after_rela_c2_locked(&[]).is_none());
+        // Non-ELF still returns a bag (not None); soft note must not claim paddr sha.
+        let g = fingerprint_patched_ctrltext_after_rela(b"not-elf", 1, 2, 3, 4)
+            .expect("non-empty non-elf bag");
+        assert!(g.patched_sha256_hex.is_empty());
+        let gn = g.format_soft_note();
+        assert!(residual_note_has_exact_token(&gn, "patched_sha=absent"));
+        assert!(!residual_note_has_exact_token(
+            &gn,
+            "patched_sha_depends_on_paddrs=1"
+        ));
+        assert!(residual_note_has_exact_token(&gn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&gn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&gn, "not_ran_on_npu=1"));
+    }
+
+    #[test]
+    fn fingerprint_synthetic_c2_locked() {
+        // Synthetic aiebu + rela + walkable noop: C2-locked paddrs for userspace-ok shape.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let f1 =
+            fingerprint_patched_ctrltext_after_rela_c2_locked(&synth).expect("synth fingerprint");
+        assert!(
+            f1.classic_walk_ok,
+            "synthetic noop+rela must classic-walk: detail={}",
+            f1.detail
+        );
+        assert_eq!(f1.rela_count, Some(1));
+        assert!(!f1.patched_sha256_hex.is_empty());
+        assert!(!f1.unpatched_sha256_hex.is_empty());
+        let f2 = fingerprint_patched_ctrltext_after_rela_c2_locked(&synth)
+            .expect("synth fingerprint re-run");
+        assert_eq!(f1.patched_sha256_hex, f2.patched_sha256_hex);
+        assert_eq!(f1.unpatched_sha256_hex, f2.unpatched_sha256_hex);
+        let sn = f1.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "patched_ctrltext_fingerprint"
+        ));
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&sn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&sn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "patched_sha_depends_on_paddrs=1"
+        ));
+        assert!(!sn.contains("ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&sn, "ran_on_npu=1"));
+    }
+
+    #[test]
+    fn fingerprint_silicon_lab_structural_when_present() {
+        // Optional full staged silicon_lab corpus (structural lock; unpatched sha stable).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf");
+        if !path.is_file() {
+            eprintln!("OFFLINE_ASSET_SKIP: no silicon_lab for fingerprint");
+            return;
+        }
+        let elf = match std::fs::read(&path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: read failed: {e}");
+                return;
+            }
+        };
+        // Fixed synthetic valid paddrs (nonzero, not u64::MAX) — same style as txn tests.
+        let ifm = 0x1111_0000_u64;
+        let wts = 0x2222_0000_u64;
+        let ofm = 0x3333_0000_u64;
+        let ctrl = 0x4444_0000_u64;
+        let fp = fingerprint_patched_ctrltext_after_rela(&elf, ifm, wts, ofm, ctrl)
+            .expect("silicon_lab fingerprint");
+        assert_eq!(fp.patched_len, Some(1688));
+        assert!(fp.classic_walk_ok, "detail={}", fp.detail);
+        assert_eq!(fp.rela_count, Some(12));
+        assert!(fp.staged_mladf_classic_profile);
+        assert_eq!(fp.txn_num_ops, Some(40));
+        // gen4 / 8×6 classic header fields (staged mladf profile).
+        assert_eq!(fp.txn_dev_gen, Some(4));
+        assert_eq!(fp.txn_num_cols, Some(8));
+        assert_eq!(fp.txn_num_rows, Some(6));
+        assert_eq!(fp.patched_sha256_hex.len(), 64);
+        assert_eq!(fp.unpatched_sha256_hex.len(), 64);
+        // Stability under same paddrs.
+        let fp2 =
+            fingerprint_patched_ctrltext_after_rela(&elf, ifm, wts, ofm, ctrl).expect("re-run");
+        assert_eq!(fp.patched_sha256_hex, fp2.patched_sha256_hex);
+        assert_eq!(fp.unpatched_sha256_hex, fp2.unpatched_sha256_hex);
+        // Unpatched sha is independent of paddrs (structural identity of corpus).
+        let fp_other = fingerprint_patched_ctrltext_after_rela(
+            &elf,
+            0xaaaa_0000,
+            0xbbbb_0000,
+            0xcccc_0000,
+            0xdddd_0000,
+        )
+        .expect("other paddrs");
+        assert_eq!(
+            fp.unpatched_sha256_hex, fp_other.unpatched_sha256_hex,
+            "unpatched peel sha must not depend on IO paddrs"
+        );
+        assert_ne!(
+            fp.patched_sha256_hex, fp_other.patched_sha256_hex,
+            "patched sha must change with paddrs (documents dependence)"
+        );
+        let n = fp.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "patched_len=1688"));
+        assert!(residual_note_has_exact_token(&n, "rela_count=12"));
+        assert!(residual_note_has_exact_token(&n, "txn_num_ops=40"));
+        assert!(residual_note_has_exact_token(&n, "classic_walk_ok=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(!n.contains("ran_on_npu=true"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Fingerprint export + external ctrltext compare (known-good absent offline)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fingerprint_export_empty_and_garbage_known_good_absent() {
+        let e = export_ctrltext_fingerprint_research(&[]);
+        assert!(e.is_known_good_absent());
+        assert!(!e.known_good_present);
+        assert_eq!(e.known_good_status, KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN);
+        assert_eq!(e.detail, "elf_empty");
+        assert!(e.unpatched_sha256_hex.is_empty());
+        let n = e.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            CTRLTEXT_FINGERPRINT_EXPORT_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&n, "known_good_absent=1"));
+        assert!(residual_note_has_exact_token(&n, "known_good_present=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "known_good_status=absent_awaiting_capture"
+        ));
+        assert!(residual_note_has_exact_token(&n, "unpatched_sha=absent"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+
+        let g = export_ctrltext_fingerprint_research(b"not-elf");
+        assert!(g.is_known_good_absent());
+        assert_eq!(g.detail, "not_aiebu_elf_ctrltext");
+        assert!(g.rela_count.is_none());
+        assert!(g.unpatched_sha256_hex.is_empty());
+        let gn = g.format_soft_note();
+        assert!(residual_note_has_exact_token(&gn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&gn, "known_good_absent=1"));
+        // Export text is soft-note with newlines (portable bag).
+        let xt = e.format_export_text();
+        assert!(xt.contains('\n'));
+        assert!(xt.lines().any(|l| l == "not_c_ready=1"));
+        assert!(xt.lines().any(|l| l == "invent_pass=0"));
+        assert!(xt.lines().any(|l| l == "known_good_absent=1"));
+    }
+
+    #[test]
+    fn fingerprint_export_synthetic_classic_and_compare_absent() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        assert!(exp.classic_walk_ok, "detail={}", exp.detail);
+        assert_eq!(exp.rela_count, Some(1));
+        assert_eq!(exp.ctrltext_len, Some(ctrltext.len()));
+        assert_eq!(exp.unpatched_sha256_hex.len(), 64);
+        assert!(exp.is_known_good_absent());
+        assert_eq!(exp.detail, "classic_unpatched_ok");
+        // Unpatched sha must match peel of ctrltext (not whole ELF).
+        assert_eq!(exp.unpatched_sha256_hex, sha256_hex_lower(&ctrltext));
+        let n = exp.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "known_good_absent=1"));
+        assert!(!n.contains("ran_on_npu=true"));
+
+        // Compare with no external → still awaiting capture.
+        let c0 = compare_external_ctrltext_to_lab_export(&exp, None);
+        assert!(c0.known_good_absent);
+        assert!(!c0.external_present);
+        assert!(!c0.sha_match);
+        assert!(!c0.structural_match);
+        assert_eq!(c0.detail, "external_absent_awaiting_capture");
+        assert_eq!(c0.lab_unpatched_sha256_hex, exp.unpatched_sha256_hex);
+        let cn = c0.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &cn,
+            EXTERNAL_CTRLTEXT_COMPARE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&cn, "known_good_absent=1"));
+        assert!(residual_note_has_exact_token(&cn, "known_good_present=0"));
+        assert!(residual_note_has_exact_token(&cn, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&cn, "external_present=0"));
+        assert!(residual_note_has_exact_token(&cn, "sha_match=0"));
+        assert!(residual_note_has_exact_token(&cn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&cn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&cn, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&cn, "ran_on_npu=1"));
+
+        // Empty slice same as None.
+        let c_empty = compare_external_ctrltext_to_lab_export(&exp, Some(&[]));
+        assert!(c_empty.known_good_absent);
+        assert!(!c_empty.external_present);
+    }
+
+    #[test]
+    fn fingerprint_export_zero_rela_aiebu_known_good_absent() {
+        // Zero-rela aiebu: peel + classic walk still OK; rela_count=Some(0);
+        // known-good still absent (export never invents product capture).
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[]);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        assert!(exp.classic_walk_ok, "detail={}", exp.detail);
+        assert_eq!(exp.rela_count, Some(0));
+        assert_eq!(exp.ctrltext_len, Some(ctrltext.len()));
+        assert_eq!(exp.unpatched_sha256_hex, sha256_hex_lower(&ctrltext));
+        assert!(exp.is_known_good_absent());
+        assert!(!exp.known_good_present);
+        assert_eq!(exp.known_good_status, KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN);
+        let n = exp.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "rela_count=0"));
+        assert!(residual_note_has_exact_token(&n, "known_good_absent=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        let c0 = compare_external_ctrltext_to_lab_export(&exp, None);
+        assert!(c0.known_good_absent);
+        assert!(!c0.external_present);
+        assert!(residual_note_has_exact_token(
+            &c0.format_soft_note(),
+            "product_known_good=0"
+        ));
+    }
+
+    #[test]
+    fn fingerprint_export_compare_match_and_mismatch_honesty() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+
+        // Exact unpatched peel match — research only; invent_pass still 0.
+        let cm = compare_external_ctrltext_to_lab_export(&exp, Some(&ctrltext));
+        assert!(cm.external_present);
+        assert!(!cm.known_good_absent);
+        assert!(cm.sha_match);
+        assert!(cm.len_match);
+        assert!(cm.structural_match);
+        assert!(cm.external_classic_walk_ok);
+        assert_eq!(cm.detail, "sha_and_structural_match_lab_unpatched");
+        let mn = cm.format_soft_note();
+        assert!(residual_note_has_exact_token(&mn, "sha_match=1"));
+        assert!(residual_note_has_exact_token(&mn, "structural_match=1"));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&mn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&mn, "not_ran_on_npu=1"));
+        // Research external present ≠ product known-good.
+        assert!(residual_note_has_exact_token(&mn, "known_good_present=0"));
+        assert!(residual_note_has_exact_token(&mn, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&mn, "known_good_absent=0"));
+        // Match ≠ product Pass tokens.
+        assert!(!residual_note_has_exact_token(&mn, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&mn, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&mn, "c_ready=1"));
+        // Staged profile bits on soft note for silicon_lab debug parity.
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "lab_staged_mladf_classic_profile=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "external_staged_mladf_classic_profile=0"
+        ));
+
+        // Different content same length class → sha_match=0.
+        let mut flipped = ctrltext.clone();
+        if let Some(b) = flipped.last_mut() {
+            *b ^= 0x5a;
+        }
+        let cdiff = compare_external_ctrltext_to_lab_export(&exp, Some(&flipped));
+        assert!(cdiff.external_present);
+        assert!(!cdiff.sha_match);
+        assert!(cdiff.len_match);
+        assert_ne!(cdiff.external_sha256_hex, exp.unpatched_sha256_hex);
+        let dn = cdiff.format_soft_note();
+        assert!(residual_note_has_exact_token(&dn, "sha_match=0"));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&dn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&dn, "product_known_good=0"));
+
+        // Length mismatch.
+        let short = &ctrltext[..ctrltext.len().saturating_sub(8).max(1)];
+        let clen = compare_external_ctrltext_to_lab_export(&exp, Some(short));
+        assert!(!clen.len_match);
+        assert!(!clen.sha_match);
+        assert!(!clen.structural_match);
+        assert_eq!(clen.detail, "external_differs_from_lab");
+
+        // Dual non-walkable same-length garbage must NOT claim structural_match.
+        let garbage = vec![0xABu8; 64];
+        let lab_garbage = CtrltextFingerprintExport {
+            ctrltext_len: Some(64),
+            classic_walk_ok: false,
+            staged_mladf_classic_profile: false,
+            unpatched_sha256_hex: sha256_hex_lower(&garbage),
+            known_good_present: false,
+            known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
+            detail: "test_non_walkable".into(),
+            ..CtrltextFingerprintExport::default()
+        };
+        let c_garb = compare_external_ctrltext_to_lab_export(&lab_garbage, Some(&garbage));
+        assert!(c_garb.sha_match);
+        assert!(c_garb.len_match);
+        assert!(
+            !c_garb.structural_match,
+            "dual garbage must not structural_match"
+        );
+        assert_eq!(c_garb.detail, "sha_match_lab_unpatched");
+        assert!(residual_note_has_exact_token(
+            &c_garb.format_soft_note(),
+            "structural_match=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &c_garb.format_soft_note(),
+            "product_known_good=0"
+        ));
+    }
+
+    #[test]
+    fn fingerprint_export_silicon_lab_structural_when_present() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf");
+        if !path.is_file() {
+            eprintln!("OFFLINE_ASSET_SKIP: no silicon_lab for fingerprint export");
+            return;
+        }
+        let elf = match std::fs::read(&path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("OFFLINE_ASSET_SKIP: read failed: {e}");
+                return;
+            }
+        };
+        let exp = export_ctrltext_fingerprint_research(&elf);
+        assert!(exp.is_known_good_absent(), "never invent known-good");
+        assert_eq!(exp.ctrltext_len, Some(1688));
+        assert_eq!(exp.rela_count, Some(12));
+        assert!(exp.classic_walk_ok, "detail={}", exp.detail);
+        assert!(exp.staged_mladf_classic_profile);
+        assert_eq!(exp.txn_num_ops, Some(40));
+        assert_eq!(exp.txn_dev_gen, Some(4));
+        assert_eq!(exp.txn_num_cols, Some(8));
+        assert_eq!(exp.txn_num_rows, Some(6));
+        assert_eq!(exp.unpatched_sha256_hex.len(), 64);
+        assert_eq!(exp.detail, "silicon_lab_structural_ok");
+        // Export identity must match PatchedCtrltextFingerprint unpatched sha.
+        let ifm = 0x1111_0000_u64;
+        let wts = 0x2222_0000_u64;
+        let ofm = 0x3333_0000_u64;
+        let ctrl = 0x4444_0000_u64;
+        let fp = fingerprint_patched_ctrltext_after_rela(&elf, ifm, wts, ofm, ctrl)
+            .expect("fingerprint");
+        assert_eq!(exp.unpatched_sha256_hex, fp.unpatched_sha256_hex);
+        let n = exp.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "ctrltext_len=1688"));
+        assert!(residual_note_has_exact_token(&n, "rela_count=12"));
+        assert!(residual_note_has_exact_token(&n, "txn_num_ops=40"));
+        assert!(residual_note_has_exact_token(&n, "known_good_absent=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "known_good_status=absent_awaiting_capture"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+
+        // Local pure-direct post-patch oracle is NOT external known-good: when
+        // supplied as external, compare may sha-diff (patched vs unpatched).
+        // Absent external remains the honest default offline.
+        let c_abs = compare_external_ctrltext_to_lab_export(&exp, None);
+        assert!(c_abs.known_good_absent);
+        assert!(residual_note_has_exact_token(
+            &c_abs.format_soft_note(),
+            "known_good_absent=1"
+        ));
+
+        // Peel unpatched matches export (research self-check).
+        let peeled = super::super::txn::instruction_payload_bytes(&elf).expect("peel");
+        let c_peel = compare_external_ctrltext_to_lab_export(&exp, Some(&peeled));
+        assert!(c_peel.sha_match);
+        assert!(c_peel.structural_match);
+        assert!(residual_note_has_exact_token(
+            &c_peel.format_soft_note(),
+            "invent_pass=0"
+        ));
+        // Self-match of failing corpus ≠ Pass.
+        assert!(!residual_note_has_exact_token(
+            &c_peel.format_soft_note(),
+            "ran_on_npu=1"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // External known-good path confinement + load (feed compare when present)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn external_known_good_path_refuses_etc_passwd_and_traversal() {
+        assert!(!external_known_good_path_is_allowed(Path::new(
+            "/etc/passwd"
+        )));
+        assert!(!external_known_good_load_path_is_allowed(Path::new(
+            "/etc/passwd"
+        )));
+        assert!(!external_known_good_path_is_allowed(Path::new(
+            "../../etc/passwd"
+        )));
+        assert!(!external_known_good_path_is_allowed(Path::new(
+            "/tmp/not_ctrltext.json"
+        )));
+        assert!(!external_known_good_path_is_allowed(Path::new(
+            "/tmp/evil.elf"
+        )));
+        // String prefix footgun: /tmp_evil is not under /tmp as components.
+        let evil = Path::new("/tmp_evil/known_good.bin");
+        if last_apply_temp_root() == Path::new("/tmp") || last_apply_temp_root().ends_with("tmp") {
+            assert!(
+                !external_known_good_path_is_allowed(evil),
+                "sibling prefix of temp must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn external_known_good_refuses_local_post_patch_oracles() {
+        assert!(is_refused_local_post_patch_as_known_good(Path::new(
+            "instr_post_patch.bin"
+        )));
+        assert!(is_refused_local_post_patch_as_known_good(Path::new(
+            "instr_vendor_post_patch.bin"
+        )));
+        assert!(is_refused_local_post_patch_as_known_good(Path::new(
+            "CTRL_POST_PATCH.BIN"
+        )));
+        assert!(!is_refused_local_post_patch_as_known_good(Path::new(
+            "working_stack_ctrltext.bin"
+        )));
+
+        // Even under temp root, refuse oracle basenames.
+        let tmp_oracle = last_apply_temp_root().join("instr_post_patch.bin");
+        assert!(
+            !external_known_good_path_is_allowed(&tmp_oracle),
+            "local pure-direct post_patch must never be known-good"
+        );
+        assert!(!external_known_good_load_path_is_allowed(&tmp_oracle));
+
+        // gt_capture absolute under lab (outside external_known_good/) refused.
+        let gt = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/gt_capture/instr_post_patch.bin");
+        assert!(
+            !external_known_good_path_is_allowed(&gt),
+            "gt_capture post_patch outside dedicated bag root"
+        );
+        let vendor = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/gt_capture/instr_vendor_post_patch.bin");
+        assert!(!external_known_good_path_is_allowed(&vendor));
+    }
+
+    #[test]
+    fn external_known_good_allows_temp_and_load_compare_honesty() {
+        let dir =
+            last_apply_temp_root().join(format!("dragon_npu_ext_kg_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("research_ctrltext.bin");
+        let _ = std::fs::remove_file(&path);
+
+        // Synthetic classic ctrltext for round-trip load + compare.
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        std::fs::write(&path, &ctrltext).expect("write temp ctrltext");
+
+        assert!(
+            external_known_good_path_is_allowed(&path),
+            "temp under clamped root must be allowed"
+        );
+        assert!(
+            external_known_good_load_path_is_allowed(&path),
+            "temp load does not require PROVENANCE"
+        );
+
+        let loaded = load_external_ctrltext_for_compare(&path).expect("load temp");
+        assert_eq!(loaded, ctrltext);
+
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        let cmp = compare_external_ctrltext_to_lab_export(&exp, Some(&loaded));
+        assert!(cmp.external_present);
+        assert!(cmp.sha_match);
+        // Research load/match still never product known-good / Pass.
+        let n = cmp.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "known_good_present=0"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+
+        // Extension refuse under same temp dir.
+        let bad_ext = dir.join("research_ctrltext.json");
+        std::fs::write(&bad_ext, b"{}").expect("write");
+        assert!(!external_known_good_path_is_allowed(&bad_ext));
+        assert!(load_external_ctrltext_for_compare(&bad_ext).is_err());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bad_ext);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn external_known_good_load_refuses_symlink_when_present() {
+        let dir =
+            last_apply_temp_root().join(format!("dragon_npu_ext_kg_link_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("target_ctrltext.bin");
+        let link = dir.join("link_ctrltext.bin");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&link);
+        std::fs::write(&target, b"\0\0\0\0research").expect("write target");
+        if std::os::unix::fs::symlink(&target, &link).is_ok() {
+            assert!(
+                external_known_good_path_is_allowed(&link),
+                "path roots may still allow lexical name"
+            );
+            assert!(
+                !external_known_good_load_path_is_allowed(&link),
+                "load must refuse final-component symlink"
+            );
+            assert!(load_external_ctrltext_for_compare(&link).is_err());
+            let _ = std::fs::remove_file(&link);
+        }
+        // Mid-path symlink escape: dir/evil_mid → /etc, then /etc/passwd style.
+        // Create mid-dir symlink pointing outside temp if OS allows.
+        let mid_link = dir.join("evil_mid");
+        let outside = Path::new("/etc");
+        let _ = std::fs::remove_file(&mid_link);
+        let _ = std::fs::remove_dir(&mid_link);
+        if std::os::unix::fs::symlink(outside, &mid_link).is_ok() {
+            // Lexical path under temp, but parent canonicalize → /etc.
+            let attack = mid_link.join("passwd");
+            // passwd has no .bin extension → already refuse; also use a .bin name.
+            let attack_bin = mid_link.join("shadow.bin");
+            assert!(
+                !external_known_good_path_is_allowed(&attack_bin)
+                    || !external_known_good_load_path_is_allowed(&attack_bin),
+                "mid-path symlink must not escape confinement"
+            );
+            // Stronger: path_is_allowed must fail after parent canonicalize.
+            assert!(
+                !external_known_good_path_is_allowed(&attack_bin),
+                "canonical parent outside roots must refuse"
+            );
+            let _ = attack; // silence unused if not asserted
+            let _ = std::fs::remove_file(&mid_link);
+        }
+        assert!(external_known_good_load_path_is_allowed(&target));
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn external_known_good_lab_bag_requires_provenance_when_present() {
+        let bag = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd")
+            .join(EXTERNAL_KNOWN_GOOD_SUBDIR);
+        // Tracked PROVENANCE.md is required by this stamp — hard-assert (not soft-skip).
+        let prov = bag.join("PROVENANCE.md");
+        assert!(
+            prov.is_file(),
+            "tracked external_known_good/PROVENANCE.md must exist"
+        );
+        let prov_text = std::fs::read_to_string(&prov).expect("read PROVENANCE");
+        assert!(
+            !prov_text.trim().is_empty(),
+            "tracked PROVENANCE.md must be non-empty"
+        );
+        assert!(
+            external_known_good_provenance_present(&bag.join("any.bin")),
+            "template PROVENANCE must be non-empty"
+        );
+        // Template must be research-ready (fields + refuse invent) — load path gate.
+        assert!(
+            external_known_good_provenance_research_ready(&bag.join("any.bin")),
+            "tracked PROVENANCE template must pass field validation"
+        );
+        let chk = validate_external_known_good_provenance_text(&prov_text);
+        assert!(chk.research_present_eligible, "detail={}", chk.detail);
+        assert!(chk.has_research_only_marker);
+        assert!(chk.has_source_stack_marker);
+        assert!(chk.refuses_product_pass_claim);
+        // Path under bag root with good extension is allowed (lexical).
+        let candidate = bag.join("working_stack_ctrltext.bin");
+        assert!(
+            external_known_good_path_is_allowed(&candidate),
+            "lab bag root + .bin allowed"
+        );
+        // Load of missing file still errors (not invent empty known-good).
+        if !candidate.is_file() {
+            assert!(load_external_ctrltext_for_compare(&candidate).is_err());
+        }
+        // Refuse oracle basename even if planted under bag.
+        let planted = bag.join("instr_post_patch.bin");
+        assert!(!external_known_good_path_is_allowed(&planted));
+    }
+
+    #[test]
+    fn external_known_good_provenance_field_validation_fail_closed() {
+        // Empty / whitespace.
+        let empty = validate_external_known_good_provenance_text("");
+        assert!(!empty.non_empty);
+        assert!(!empty.research_present_eligible);
+        assert_eq!(empty.detail, "empty");
+        let ws = validate_external_known_good_provenance_text("  \n\t  ");
+        assert!(!ws.research_present_eligible);
+
+        // Research marker only — missing source/stack.
+        let no_src = validate_external_known_good_provenance_text(
+            "Research only. Not product Pass. Not C-ready.",
+        );
+        assert!(no_src.has_research_only_marker);
+        assert!(!no_src.has_source_stack_marker);
+        assert!(!no_src.research_present_eligible);
+        assert_eq!(no_src.detail, "missing_source_stack_marker");
+
+        // Source only — missing research-only honesty.
+        let no_res = validate_external_known_good_provenance_text(
+            "Source stack: XRT shim public stack capture note only.",
+        );
+        assert!(no_res.has_source_stack_marker);
+        assert!(!no_res.has_research_only_marker);
+        assert!(!no_res.research_present_eligible);
+        assert_eq!(no_res.detail, "missing_research_only_marker");
+
+        // Product invent tokens refused even with markers.
+        let invent = validate_external_known_good_provenance_text(
+            "Research only. Source stack: XRT. invent_pass=1 not_c_ready=1",
+        );
+        assert!(!invent.refuses_product_pass_claim);
+        assert!(!invent.research_present_eligible);
+        assert_eq!(invent.detail, "product_pass_claim_refused");
+        let ron = validate_external_known_good_provenance_text(
+            "Research only. Public stack. ran_on_npu=true",
+        );
+        assert!(!ron.research_present_eligible);
+        // Issue 1: mixed-case invent claims must refuse (ascii-lower exact tokens).
+        let invent_case = validate_external_known_good_provenance_text(
+            "Research only. Source stack: XRT. INVENT_PASS=1 not_c_ready=1",
+        );
+        assert!(!invent_case.research_present_eligible);
+        assert_eq!(invent_case.detail, "product_pass_claim_refused");
+        let ron_case = validate_external_known_good_provenance_text(
+            "Research only. Public stack. ran_on_npu=TRUE",
+        );
+        assert!(!ron_case.research_present_eligible);
+        assert_eq!(ron_case.detail, "product_pass_claim_refused");
+        // Issue 9: standalone c_ready=1 refuse.
+        let c_ready = validate_external_known_good_provenance_text(
+            "Research only. Source stack: DynamicDispatch. c_ready=1",
+        );
+        assert!(!c_ready.research_present_eligible);
+        assert_eq!(c_ready.detail, "product_pass_claim_refused");
+        let c_ready_case = validate_external_known_good_provenance_text(
+            "Research only. Source stack: XRT. C_READY=1",
+        );
+        assert!(!c_ready_case.research_present_eligible);
+        // Issue 7: product_known_good=1 / invent_pass=true refuse.
+        let pkg = validate_external_known_good_provenance_text(
+            "Research only. Public stack. product_known_good=1",
+        );
+        assert!(!pkg.research_present_eligible);
+        assert_eq!(pkg.detail, "product_pass_claim_refused");
+        let inv_true = validate_external_known_good_provenance_text(
+            "Research only. Source stack: XRT. invent_pass=true",
+        );
+        assert!(!inv_true.research_present_eligible);
+        // Issue 2: not_c_ready=0 must not count as research marker; refuse invent-style.
+        let ncr0 = validate_external_known_good_provenance_text(
+            "not_c_ready=0 invent_pass=0 Source stack: XRT",
+        );
+        assert!(
+            !ncr0.has_research_only_marker,
+            "substring not_c_ready must not match =0 as research marker"
+        );
+        assert!(!ncr0.research_present_eligible);
+        assert_eq!(ncr0.detail, "product_pass_claim_refused");
+        // Exact not_c_ready=1 + source is eligible (without invent).
+        let ncr1 = validate_external_known_good_provenance_text(
+            "not_c_ready=1 invent_pass=0 Source stack: XRT",
+        );
+        assert!(ncr1.has_research_only_marker);
+        assert!(
+            ncr1.research_present_eligible,
+            "exact not_c_ready=1 + source must pass: detail={}",
+            ncr1.detail
+        );
+        // Issue 8: bare "xrt" substring inside other words is not a source marker.
+        let no_xrt_word = validate_external_known_good_provenance_text(
+            "Research only. Not product Pass. capture texture extract notes.",
+        );
+        assert!(!no_xrt_word.has_source_stack_marker);
+        assert!(!no_xrt_word.research_present_eligible);
+        // Issue 6: pure lab-bag load gate locks refuse when text not research-eligible.
+        assert!(!external_known_good_lab_bag_provenance_allows_load(None));
+        assert!(!external_known_good_lab_bag_provenance_allows_load(Some(
+            ""
+        )));
+        assert!(!external_known_good_lab_bag_provenance_allows_load(Some(
+            "not_c_ready=0 invent_pass=0 Source stack: XRT"
+        )));
+        assert!(!external_known_good_lab_bag_provenance_allows_load(Some(
+            "Research only. Source stack: XRT. invent_pass=1"
+        )));
+        assert!(external_known_good_lab_bag_provenance_allows_load(Some(
+            "Research only. Not product Pass. Source stack: XRT.\n\
+             invent_pass=0 not_c_ready=1 not_ran_on_npu=1 product_known_good=0"
+        )));
+        // not_ran_on_npu=1 must not false-positive refuse.
+        let ok_not = validate_external_known_good_provenance_text(
+            "Research only. Not product Pass. Source stack: XRT / DynamicDispatch.\n\
+             not_ran_on_npu=1 invent_pass=0 not_c_ready=1",
+        );
+        assert!(
+            ok_not.research_present_eligible,
+            "honesty tokens must pass: detail={}",
+            ok_not.detail
+        );
+        let n = ok_not.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            "research_present_eligible=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // test-only env isolation for external ctrltext
+    fn external_known_good_env_absent_is_none() {
+        // Ensure unset path: remove for this test process if present.
+        let prev = std::env::var(ENV_LAB_EXTERNAL_CTRLTEXT).ok();
+        // SAFETY: unit-test isolation only; restored below.
+        unsafe {
+            std::env::remove_var(ENV_LAB_EXTERNAL_CTRLTEXT);
+        }
+        let r = load_external_ctrltext_from_env().expect("unset ok");
+        assert!(r.is_none(), "absent env → None (honest known-good absent)");
+        // Empty / whitespace-only also honest None.
+        unsafe {
+            std::env::set_var(ENV_LAB_EXTERNAL_CTRLTEXT, "   \t  ");
+        }
+        let r_ws = load_external_ctrltext_from_env().expect("whitespace ok");
+        assert!(r_ws.is_none(), "whitespace env → None");
+        // SAFETY: restore prior env for other tests.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_EXTERNAL_CTRLTEXT, v),
+                None => std::env::remove_var(ENV_LAB_EXTERNAL_CTRLTEXT),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // test-only env isolation for external ctrltext
+    fn external_known_good_env_set_confined_and_refused() {
+        let prev = std::env::var(ENV_LAB_EXTERNAL_CTRLTEXT).ok();
+        let dir =
+            last_apply_temp_root().join(format!("dragon_npu_ext_kg_env_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("env_ctrltext.bin");
+        let _ = std::fs::remove_file(&path);
+        let payload = b"\0\0\0\0ext_env_research_bytes";
+        std::fs::write(&path, payload).expect("write temp");
+
+        // (1) Confined temp path → Ok(Some(bytes)).
+        unsafe {
+            std::env::set_var(ENV_LAB_EXTERNAL_CTRLTEXT, path.as_os_str());
+        }
+        let loaded = load_external_ctrltext_from_env()
+            .expect("confined env load")
+            .expect("Some(bytes)");
+        assert_eq!(loaded, payload);
+
+        // (2) Outside roots → Err.
+        unsafe {
+            std::env::set_var(ENV_LAB_EXTERNAL_CTRLTEXT, "/etc/passwd");
+        }
+        assert!(
+            load_external_ctrltext_from_env().is_err(),
+            "/etc/passwd must refuse"
+        );
+
+        // (3) Refused oracle basename under temp → Err.
+        let oracle = dir.join("instr_post_patch.bin");
+        std::fs::write(&oracle, payload).expect("write oracle name");
+        unsafe {
+            std::env::set_var(ENV_LAB_EXTERNAL_CTRLTEXT, oracle.as_os_str());
+        }
+        assert!(
+            load_external_ctrltext_from_env().is_err(),
+            "post_patch basename must refuse even under temp"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&oracle);
+        let _ = std::fs::remove_dir(&dir);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_EXTERNAL_CTRLTEXT, v),
+                None => std::env::remove_var(ENV_LAB_EXTERNAL_CTRLTEXT),
+            }
         }
     }
 

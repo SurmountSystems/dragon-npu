@@ -41,12 +41,14 @@ bash tools/diff_vendor_instr_parity.sh   # offline; unpatched A = body match ≠
 # C2 one-shot C_UNLOCK=b17b0119 CONSUMED — see HITL_C_APP_LOAD_RECIPE.md
 ```
 
-Highest-value next after unpatched body green: **maintain offline gates**
-(gate-only `b6a66dee`; prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**) for **APP_LOAD_PDI_FAIL**
-(INSTR_BO true post-patch research **closed offline**; unlock **≠** Pass) —
-**ban** more env C applies (`XDNA2_LAB_KERNEL_ARG_LAYOUT` /
-`XDNA2_LAB_INSTR_SIZE_MODE` / `XDNA2_LAB_RELA_MODE` spam closed). Further live C
-needs a **new agent unlock**.
+Highest-value next after unpatched body green: **construction / byte research**
+for **APP_LOAD_PDI_FAIL** `0x3000003` (map how a working public stack builds
+loadable bytes → compare to our failing image). Empty gate-only maintain stamps
+are **frozen**. `C_UNLOCK=b17b0119` **CONSUMED** (unlock **≠** Pass).
+INSTR_BO true post-patch research **closed offline**. **Ban** more env C applies
+(`XDNA2_LAB_KERNEL_ARG_LAYOUT` / `XDNA2_LAB_INSTR_SIZE_MODE` /
+`XDNA2_LAB_RELA_MODE` spam closed). Further live C needs a **new host-minted
+unlock** after a named offline delta.
 
 **Optional OFM golden re-lock only (commented — not HV under CONSUMED):**
 
@@ -58,15 +60,16 @@ needs a **new agent unlock**.
 
 ---
 
-## Milestone C — Pass apply (**CONSUMED** — `C_UNLOCK=b17b0119`; gate-only `b6a66dee`)
+## Milestone C — Pass apply (**CONSUMED** — `C_UNLOCK=b17b0119`)
 
 **Canonical recipe (prereqs, offline gates, sandwich, success, bans):**
 [HITL_C_APP_LOAD_RECIPE.md](./HITL_C_APP_LOAD_RECIPE.md).
 
-**Agent unlock:** `C_UNLOCK=b17b0119` **CONSUMED** (see [RESIDUAL.md](../RESIDUAL.md) gate-only `b6a66dee`).
-Permission for **one** L3 sandwich + `hitl_c` only. **Not** permanent open
-season. Unlock **≠** Pass / **≠** `ran_on_npu`. **L3** = `exec_cmd_allow`
-(restore to 0); **userspace ALLOW** = `XDNA2_ALLOW_EXEC_CMD` (leave unset/0).
+**Agent unlock:** `C_UNLOCK=b17b0119` **CONSUMED** (see [RESIDUAL.md](../RESIDUAL.md)
+LIVE freeze). Was permission for **one** sandwich + `hitl_c` only. **Not**
+permanent open season. Do **not** reopen under consumed unlock. Unlock **≠**
+Pass / **≠** `ran_on_npu`. **Execute-allow** = driver `exec_cmd_allow` (restore
+to 0); **userspace ALLOW** = `XDNA2_ALLOW_EXEC_CMD` (leave unset/0).
 Further C needs a **new agent unlock** (evidence may justify; never auto-unlocks).
 Prep stamp `de4d9fa4` added `tools/hitl_c2_once.sh` (does **not** complete C2
 without operator sudo).
@@ -127,10 +130,10 @@ outcome until root cause fixed — not an offline-gate failure.
 
 Env residual trials (`content` + `xrt3`) already **closed** with identical
 `APP_LOAD_PDI_FAIL`. Unpatched classic body may already exist (CLASS A body
-match). Next value: **maintain gates** (gate-only `b6a66dee`; prior `dd35ae15`; unlock CONSUMED) then
-`c3_post_c2_classify.sh` (C3 when `C3_EVIDENCE=1`) + `c4_pass_check.sh`
-(offline **PassCandidate** audit only — **≠ invent product Pass**) + maintain
-pure-direct offline gates. Not unpatched A / registry / parity alone.
+match). Next value: **construction research** (public stack loadable bytes vs
+our image), not empty gate-only stamps. Unlock CONSUMED. Soft offline:
+`c3_post_c2_classify.sh` + `c4_pass_check.sh` (audit only — **≠ invent product
+Pass**). Not unpatched A / registry / parity alone.
 
 **Ban live** `XDNA2_LAB_RELA_MODE=add` (and other env C spam) until the agent
 explicitly unlocks a new offline-justified experiment — align RESIDUAL env HITL
@@ -162,7 +165,9 @@ bash tools/silicon_lab_operator.sh extract-paddrs   # last_apply → paddrs JSON
 ## Honesty
 
 - B offline ≠ live XRT BO dump; B vendor OFM golden optional  
-- **Highest-value now = maintain gates** (gate-only `b6a66dee`; prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**) (APP_LOAD residual; post-patch dump research **closed offline**); capture-instr **optional** for logs only; maintain pure-direct offline gates meanwhile  
+- **Highest-value now = construction / byte research** for APP_LOAD residual
+  (`0x3000003`); empty maintain stamps **frozen**; `C_UNLOCK=b17b0119` **CONSUMED**;
+  post-patch dump research **closed offline**; capture-instr **optional** logs only
 - C exit 0 only if product `ran_on_npu=true` (live decide); **C2 CONSUMED** under `C_UNLOCK=b17b0119` (unpatched A / parity / registry / residual_class / CLASSIFY_SOFT_OK / checklist / OFFLINE_GATES_OK / `C3_SKIP` / `C4_SKIP` / offline `C4_PASS_CANDIDATE` alone ≠ product Pass / ≠ further unlock)  
 - Never leave `exec_cmd_allow=1` (L3); never leave sticky `XDNA2_ALLOW_EXEC_CMD=1`  
 - Offline `c4_pass_check` **PassCandidate** audit ≠ invent product Pass  

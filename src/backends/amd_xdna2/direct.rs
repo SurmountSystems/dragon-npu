@@ -185,6 +185,54 @@ pub struct amdxdna_drm_sync_bo {
     pub size: u64,
 }
 
+// === CONFIG_HWCTX / CONFIG_CU (public KMQ path; pure-direct lab optional) ===
+
+/// `enum amdxdna_drm_config_hwctx_param` — first value is CONFIG_CU.
+pub const DRM_AMDXDNA_HWCTX_CONFIG_CU: u32 = 0;
+
+/// `sizeof(struct amdxdna_cu_config)` — locked by unit test.
+pub const AMDXDNA_CU_CONFIG_SIZE: usize = 8;
+
+/// Header of `amdxdna_hwctx_param_config_cu` (before flexible `cu_configs[]`).
+pub const AMDXDNA_HWCTX_PARAM_CONFIG_CU_HEADER_SIZE: usize = 8;
+
+/// `sizeof(struct amdxdna_drm_config_hwctx)` — ioctl arg size (24).
+pub const AMDXDNA_DRM_CONFIG_HWCTX_SIZE: usize = 24;
+
+/// Kernel max size for `param_val` buffer on CONFIG_HWCTX (PAGE_SIZE).
+pub const AMDXDNA_CONFIG_HWCTX_PARAM_VAL_MAX: usize = 4096;
+
+/// Direct port of `struct amdxdna_cu_config`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct amdxdna_cu_config {
+    pub cu_bo: u32,
+    pub cu_func: u8,
+    pub pad: [u8; 3],
+}
+
+/// Direct port of `struct amdxdna_drm_config_hwctx`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(missing_docs)]
+pub struct amdxdna_drm_config_hwctx {
+    pub handle: u32,
+    pub param_type: u32,
+    pub param_val: u64,
+    pub param_val_size: u32,
+    pub pad: u32,
+}
+
+/// Env path to opaque PDI bytes for optional lab `CONFIG_CU` (`XDNA2_LAB_PDI_BLOB`).
+///
+/// Research only. Wrong overlay OK for machinery smoke. **Not** product known-good.
+/// **Not** Pass / **not** `ran_on_npu`. Default: unset → lab never issues CONFIG_CU.
+pub const ENV_LAB_PDI_BLOB: &str = "XDNA2_LAB_PDI_BLOB";
+
+/// Optional CU function id for lab CONFIG_CU (`XDNA2_LAB_CU_FUNC`, default `0`).
+pub const ENV_LAB_CU_FUNC: &str = "XDNA2_LAB_CU_FUNC";
+
 // === Useful query / info structs (for get_info and diagnostics) ===
 
 // -----------------------------------------------------------------------------
@@ -991,6 +1039,15 @@ impl DirectSubmission for SharedRealDirectSubmission {
 
     fn destroy_hwctx(&self, fd: RawFd, handle: u32) -> Result<(), DirectError> {
         self.inner.destroy_hwctx(fd, handle)
+    }
+
+    fn config_hwctx_cu(
+        &self,
+        fd: RawFd,
+        hwctx: u32,
+        cu_entries: &[(u32, u8)],
+    ) -> Result<(), DirectError> {
+        self.inner.config_hwctx_cu(fd, hwctx, cu_entries)
     }
 
     fn destroy_buffer(&self, fd: RawFd, handle: u32) -> Result<(), DirectError> {
@@ -1914,6 +1971,53 @@ impl DirectSubmission for RealDirectSubmission {
         {
             let _ = handle;
             Ok(())
+        }
+    }
+
+    #[allow(unsafe_code, clippy::cast_possible_truncation)]
+    fn config_hwctx_cu(
+        &self,
+        _fd: RawFd,
+        hwctx: u32,
+        cu_entries: &[(u32, u8)],
+    ) -> Result<(), DirectError> {
+        #[cfg(feature = "amd-xdna2")]
+        {
+            let param_buf = pack_hwctx_param_config_cu(cu_entries)?;
+            let param_len = param_buf.len();
+            let mut req = amdxdna_drm_config_hwctx {
+                handle: hwctx,
+                param_type: DRM_AMDXDNA_HWCTX_CONFIG_CU,
+                // SAFETY: pointer valid for synchronous ioctl; buffer not moved until after call.
+                param_val: param_buf.as_ptr() as u64,
+                param_val_size: param_len as u32,
+                pad: 0,
+            };
+            // SAFETY: param_val points at param_buf for the full ioctl (XRT parity).
+            let ret = unsafe {
+                ioctl::ioctl(
+                    self.fd,
+                    ioctl::DRM_IOCTL_AMDXDNA_CONFIG_HWCTX,
+                    &raw mut req,
+                )
+            };
+            // Keep buffer live across ioctl evaluation.
+            drop(param_buf);
+            match ret {
+                Ok(_) => Ok(()),
+                Err(e) => Err(DirectError::IoctlFailed(format!(
+                    "CONFIG_HWCTX(CONFIG_CU) failed hwctx={hwctx} num_cus={} param_size={param_len}: {e}",
+                    cu_entries.len()
+                ))),
+            }
+        }
+
+        #[cfg(not(feature = "amd-xdna2"))]
+        {
+            let _ = (hwctx, cu_entries);
+            Err(DirectError::Unsupported(
+                "config_hwctx_cu requires the amd-xdna2 feature".to_string(),
+            ))
         }
     }
 
@@ -2864,6 +2968,197 @@ pub fn ert_cmd_state_name(state: u32) -> &'static str {
 #[must_use]
 pub fn ert_cmd_state_is_completed(state: u32) -> bool {
     state == ErtCmdState::Completed as u32
+}
+
+/// Pack one `amdxdna_cu_config` as 8 little-endian bytes (pure / offline).
+#[must_use]
+pub fn pack_amdxdna_cu_config(cu_bo: u32, cu_func: u8) -> [u8; AMDXDNA_CU_CONFIG_SIZE] {
+    let mut out = [0u8; AMDXDNA_CU_CONFIG_SIZE];
+    out[0..4].copy_from_slice(&cu_bo.to_le_bytes());
+    out[4] = cu_func;
+    // pad[3] already zero
+    out
+}
+
+/// Pack `amdxdna_hwctx_param_config_cu` (header + flexible CU array) for CONFIG_HWCTX.
+///
+/// Pure offline helper — does not issue ioctls. Buffer must fit in one page
+/// ([`AMDXDNA_CONFIG_HWCTX_PARAM_VAL_MAX`]) per public uAPI.
+///
+/// # Errors
+///
+/// Empty `entries`, or packed size exceeds page max.
+pub fn pack_hwctx_param_config_cu(entries: &[(u32, u8)]) -> Result<Vec<u8>, DirectError> {
+    if entries.is_empty() {
+        return Err(DirectError::InvalidArgument(
+            "pack_hwctx_param_config_cu refuses empty CU list".into(),
+        ));
+    }
+    if entries.len() > u16::MAX as usize {
+        return Err(DirectError::InvalidArgument(format!(
+            "pack_hwctx_param_config_cu: {} CUs exceeds u16 num_cus",
+            entries.len()
+        )));
+    }
+    let total = AMDXDNA_HWCTX_PARAM_CONFIG_CU_HEADER_SIZE
+        .checked_add(entries.len().saturating_mul(AMDXDNA_CU_CONFIG_SIZE))
+        .ok_or_else(|| {
+            DirectError::InvalidArgument("pack_hwctx_param_config_cu size overflow".into())
+        })?;
+    if total > AMDXDNA_CONFIG_HWCTX_PARAM_VAL_MAX {
+        return Err(DirectError::InvalidArgument(format!(
+            "pack_hwctx_param_config_cu size {total} > page max {AMDXDNA_CONFIG_HWCTX_PARAM_VAL_MAX}"
+        )));
+    }
+    let mut buf = vec![0u8; total];
+    let n = entries.len() as u16;
+    buf[0..2].copy_from_slice(&n.to_le_bytes());
+    // pad[3] of u16 already zero at bytes 2..8
+    for (i, &(cu_bo, cu_func)) in entries.iter().enumerate() {
+        let off = AMDXDNA_HWCTX_PARAM_CONFIG_CU_HEADER_SIZE + i * AMDXDNA_CU_CONFIG_SIZE;
+        buf[off..off + AMDXDNA_CU_CONFIG_SIZE]
+            .copy_from_slice(&pack_amdxdna_cu_config(cu_bo, cu_func));
+    }
+    Ok(buf)
+}
+
+/// Parse `XDNA2_LAB_CU_FUNC` (default 0). Fail-closed on non-u8.
+///
+/// # Errors
+///
+/// Non-empty unparsable value.
+pub fn lab_cu_func_from_env() -> Result<u8, DirectError> {
+    match std::env::var(ENV_LAB_CU_FUNC) {
+        Err(_) => Ok(0),
+        Ok(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(0);
+            }
+            t.parse::<u8>().map_err(|_| {
+                DirectError::InvalidArgument(format!(
+                    "unknown {ENV_LAB_CU_FUNC}={s:?}; expected 0..=255"
+                ))
+            })
+        }
+    }
+}
+
+/// True when `XDNA2_LAB_PDI_BLOB` is set (non-empty after trim) — lab should attempt CONFIG_CU.
+#[must_use]
+pub fn lab_pdi_blob_env_requested() -> bool {
+    std::env::var(ENV_LAB_PDI_BLOB)
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Result of optional lab CONFIG_CU attach (research; not Pass).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabConfigCuAttach {
+    /// GEM handle of the PDI BO (keep alive for hwctx lifetime).
+    pub pdi_bo: u32,
+    /// Opaque PDI byte length written.
+    pub pdi_bytes: usize,
+    /// `cu_func` passed to CONFIG_CU.
+    pub cu_func: u8,
+}
+
+impl LabConfigCuAttach {
+    /// Soft detail token for timed result / last_apply (never invents Pass).
+    #[must_use]
+    pub fn detail_token(&self) -> String {
+        format!(
+            "config_cu=1 pdi_bytes={} cu_bo={} cu_func={} invent_pass=0 not_ran_on_npu=1",
+            self.pdi_bytes, self.pdi_bo, self.cu_func
+        )
+    }
+}
+
+/// Guard that GEM_CLOSEs a lab PDI BO on drop (all early exits safe).
+pub struct LabPdiBoGuard<'a> {
+    submission: &'a dyn DirectSubmission,
+    handle: Option<u32>,
+}
+
+impl<'a> LabPdiBoGuard<'a> {
+    /// Track `handle` for destroy on drop.
+    #[must_use]
+    pub fn new(submission: &'a dyn DirectSubmission, handle: u32) -> Self {
+        Self {
+            submission,
+            handle: Some(handle),
+        }
+    }
+
+    /// Empty guard (no BO).
+    #[must_use]
+    pub fn empty(submission: &'a dyn DirectSubmission) -> Self {
+        Self {
+            submission,
+            handle: None,
+        }
+    }
+}
+
+impl Drop for LabPdiBoGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = self.submission.destroy_buffer(0, h);
+        }
+    }
+}
+
+/// After CREATE_HWCTX: if `XDNA2_LAB_PDI_BLOB` is set, CREATE_BO + fill opaque PDI + CONFIG_CU.
+///
+/// - Unset env → `Ok(None)` (default lab path; no CONFIG_CU).
+/// - Set env → fail-closed on read/create/write/ioctl errors (`Err`).
+/// - Blob treated as **opaque** (no PDI field decode).
+/// - BO type: [`BufferType::Dev`] (XRT CACHEABLE + dev mem → DEV).
+/// - Never sets Pass / `ran_on_npu`.
+///
+/// # Errors
+///
+/// Missing file, empty blob, create/write/config failures, bad `XDNA2_LAB_CU_FUNC`.
+pub fn try_lab_attach_config_cu_from_env(
+    submission: &dyn DirectSubmission,
+    fd: RawFd,
+    hwctx: u32,
+) -> Result<Option<LabConfigCuAttach>, DirectError> {
+    let path = match std::env::var(ENV_LAB_PDI_BLOB) {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return Ok(None),
+    };
+    let path = path.trim();
+    let cu_func = lab_cu_func_from_env()?;
+    let bytes = super::mladf_pack::read_lab_file_capped(path, ENV_LAB_PDI_BLOB)?;
+    if bytes.is_empty() {
+        return Err(DirectError::InvalidArgument(format!(
+            "{ENV_LAB_PDI_BLOB} is empty (need non-empty opaque PDI): {path}"
+        )));
+    }
+    // XRT KMQ: CACHEABLE PDI → AMDXDNA_BO_DEV when device has dev mem.
+    let bo = submission.create_buffer(fd, bytes.len() as u64, BufferType::Dev)?;
+    if let Err(e) = submission.write_bo_bytes(fd, bo.0, 0, &bytes) {
+        let _ = submission.destroy_buffer(fd, bo.0);
+        return Err(DirectError::IoctlFailed(format!(
+            "lab CONFIG_CU: write PDI BO failed ({path}, {} B): {e}",
+            bytes.len()
+        )));
+    }
+    if let Err(e) = submission.config_hwctx_cu(fd, hwctx, &[(bo.0, cu_func)]) {
+        let _ = submission.destroy_buffer(fd, bo.0);
+        return Err(DirectError::IoctlFailed(format!(
+            "lab CONFIG_CU: CONFIG_HWCTX failed (hwctx={hwctx} cu_bo={} cu_func={cu_func} \
+             pdi_bytes={}): {e}",
+            bo.0,
+            bytes.len()
+        )));
+    }
+    Ok(Some(LabConfigCuAttach {
+        pdi_bo: bo.0,
+        pdi_bytes: bytes.len(),
+        cu_func,
+    }))
 }
 
 /// Number of leading CU-mask dwords in `amdxdna_cmd.data[]`.
@@ -4251,6 +4546,8 @@ pub fn timed_matmul_direct(
     // Residual trial tokens always stamped (Cell so early exits see latest parse).
     let diag_instr_size_mode = std::cell::Cell::new("na");
     let diag_rela_mode_tok = std::cell::Cell::new("na");
+    // Optional CONFIG_CU attach token (set after hwctx when XDNA2_LAB_PDI_BLOB used).
+    let diag_config_cu = std::cell::RefCell::new(String::new());
     let stamp = |r: &mut TimedOpResult,
                  tiles: u32,
                  qos: &QosInfo,
@@ -4260,6 +4557,15 @@ pub fn timed_matmul_direct(
                  layout: &'static str,
                  kargs: usize,
                  write_la: bool| {
+        if let Ok(tok) = diag_config_cu.try_borrow() {
+            if !tok.is_empty() && !r.detail.contains("config_cu=") {
+                if r.detail.is_empty() {
+                    r.detail = tok.clone();
+                } else {
+                    r.detail = format!("{tok}; {}", r.detail);
+                }
+            }
+        }
         super::silicon_contract::finalize_lab_timed_result(
             r,
             super::silicon_contract::LabBatchDiag {
@@ -4311,6 +4617,45 @@ pub fn timed_matmul_direct(
             return r;
         }
     };
+
+    // Optional lab CONFIG_CU + opaque PDI (XDNA2_LAB_PDI_BLOB). Default off.
+    // Research path change vs historical "never CONFIG_CU"; still ≠ Pass.
+    let pdi_guard = match try_lab_attach_config_cu_from_env(submission, 0, ctx.handle) {
+        Ok(None) => LabPdiBoGuard::empty(submission),
+        Ok(Some(att)) => {
+            if let Ok(mut t) = diag_config_cu.try_borrow_mut() {
+                *t = att.detail_token();
+            }
+            LabPdiBoGuard::new(submission, att.pdi_bo)
+        }
+        Err(e) => {
+            destroy_hwctx_and_owned_bos(submission, &ctx);
+            let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+            r.total_s = t0.elapsed().as_secs_f64();
+            r.host_prep_s = host_prep_s;
+            r.hwctx_s = hwctx_s;
+            r.status = "config_cu_failed".to_string();
+            r.detail = format!(
+                "XDNA2_LAB_PDI_BLOB set but CONFIG_CU attach failed (fail-closed; \
+                 invent_pass=0 not_ran_on_npu=1): {e}"
+            );
+            stamp(
+                &mut r,
+                tiles,
+                &qos,
+                None,
+                None,
+                false,
+                "na",
+                0,
+                write_la_default,
+            );
+            attach_host_ref(&mut r, m, n, k, dtype);
+            return r;
+        }
+    };
+    // Keep PDI BO alive for the rest of the function (drop at end of scope).
+    let _pdi_guard = pdi_guard;
 
     // CRITICAL SAFETY: see exec_cmd_is_enabled() / docs/XDNA2_NEVER_AGAIN.md.
     let try_submit = exec_cmd_is_enabled();
@@ -5669,6 +6014,27 @@ pub trait DirectSubmission {
     /// Destroy a previously created hardware context.
     fn destroy_hwctx(&self, fd: RawFd, handle: u32) -> Result<(), DirectError>;
 
+    /// Configure compute units on a hardware context (`DRM_AMDXDNA_CONFIG_HWCTX` /
+    /// `DRM_AMDXDNA_HWCTX_CONFIG_CU`).
+    ///
+    /// Public KMQ path after CREATE_HWCTX: one entry per CU with PDI BO handle +
+    /// function id. Pure-direct lab uses this only when `XDNA2_LAB_PDI_BLOB` is set
+    /// (see [`try_lab_attach_config_cu_from_env`]). Default: unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Empty list, pack overflow, or ioctl/driver failure.
+    fn config_hwctx_cu(
+        &self,
+        _fd: RawFd,
+        _hwctx: u32,
+        _cu_entries: &[(u32, u8)],
+    ) -> Result<(), DirectError> {
+        Err(DirectError::Unsupported(
+            "config_hwctx_cu not implemented for this submission backend".to_string(),
+        ))
+    }
+
     /// Destroy a buffer object.
     fn destroy_buffer(&self, _fd: RawFd, _handle: u32) -> Result<(), DirectError> {
         Err(DirectError::Unsupported(
@@ -5997,6 +6363,17 @@ impl DirectSubmission for StubDirectSubmission {
     }
 
     fn destroy_hwctx(&self, _fd: RawFd, _handle: u32) -> Result<(), DirectError> {
+        Ok(())
+    }
+
+    fn config_hwctx_cu(
+        &self,
+        _fd: RawFd,
+        _hwctx: u32,
+        cu_entries: &[(u32, u8)],
+    ) -> Result<(), DirectError> {
+        // Offline unit path: validate pack only; no ioctl.
+        let _ = pack_hwctx_param_config_cu(cu_entries)?;
         Ok(())
     }
 

@@ -17,7 +17,8 @@
 #   XDNA2_LAB_JOURNAL_TEXT=…   inline journal **paste text** (not a path); dual FW
 #                              codes only when hex literals parse; 256 KiB cap
 #   XDNA2_LAB_PRINT_C2_CMDBUF_RESEARCH=1|true
-#                              soft research lines (Tracks F/G/K/L/M/N/O):
+#                              soft research lines (Tracks F/G/K/L/M/N/O + later
+#                              offline bags; SSoT = example --help / construction map):
 #                                c2_cmdbuf_map= / c2_cmdlist_msg=
 #                                c2_cmdlist_fill_cross_check=
 #                                instr_pdi_load_research= (full staged ELF or SKIP)
@@ -28,7 +29,32 @@
 #                                app_load_maintain_reconfirm= (Track O A–N still closed;
 #                                  compose M+N; no FS/network/XRT walk;
 #                                  ≠ C-ready ≠ silicon progress / not new evidence)
+#                                app_load_offline_progress_scorecard= (stamp 9cdfe8d0;
+#                                  class + bag + e2e + compare status; alone ≠ close)
+#                                app_load_bag_feed_dry_run_scorecard= (stamp 2b01425e;
+#                                  bag-drop + lab feed + dry-run auto-feed composition;
+#                                  bag absent after feed → blocked_on_external_bytes=1;
+#                                  match ≠ Pass; scorecard alone ≠ residual closed)
+#                                app_load_extract_bag_scorecard_pipeline= (stamp 588c1c72;
+#                                  extract markers + bag-drop + composition scorecard;
+#                                  markers without ctrltext still blocked_on_external_bytes=1;
+#                                  extract alone ≠ close; pipeline alone ≠ residual closed)
+#                                external_known_good_operator_extract_checklist=
+#                                  (extract-to-bag steps + refuse tokens; no invent)
+#                                lab_export_fingerprint_feed= (stamp d2e287ab;
+#                                  auto-feed lab fingerprint from export ELF path +
+#                                  last_apply signals; ready when ELF has unpatched sha;
+#                                  signals alone incomplete; feed alone ≠ residual closed)
+#                                external_ctrltext_compare_dry_run= (stamp d2e287ab auto-feed;
+#                                  bag absent → blocked_on_external_bytes=1; lab_export_ready
+#                                  from feed; refuse post_patch/VE2; match ≠ Pass;
+#                                  dry-run alone ≠ close)
 #                              always invent_pass=0; must be exact 1/true (0/false/empty=off)
+#   XDNA2_LAB_XCLBIN_SECTION_TEXT=…  research paste of public xclbin section **names** only
+#                                  (cap 64 KiB); feeds extract half of
+#                                  app_load_extract_bag_scorecard_pipeline= under PRINT;
+#                                  never product known-good / never PDI decode; markers
+#                                  without bag bytes still blocked_on_external_bytes=1
 #
 # Soft default (for silicon_contract_check):
 #   - missing fixture → CLASSIFY_SKIP + exit 0
@@ -76,7 +102,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      sed -n '1,30p' "$0" | grep -E '^#([^!]|$)' | sed 's/^# \{0,1\}//'
+      # Include PRINT research token list (scorecard / extract / dry-run past line 30).
+      sed -n '1,60p' "$0" | grep -E '^#([^!]|$)' | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     -*)

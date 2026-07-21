@@ -3,7 +3,12 @@
 **Purpose:** One canonical operator sequence for a **single** Milestone C Pass
 apply against the locked **APP_LOAD_PDI_FAIL** residual.
 
-**Status (IMPL `b6a66dee` gate-only maintain):** `C_UNLOCK=b17b0119` **CONSUMED** (operator C2 2026-07-18). Further C needs **new agent unlock** + offline delta. Gate-only maintain ≠ Pass ≠ `ran_on_npu`.
+**Status:** `C_UNLOCK=b17b0119` **CONSUMED** (operator C2 2026-07-18). Empty
+empty reconfirm stamps and empty-folder implement loops are **frozen**
+(see `AGENTS.md` §6–9 / `RESIDUAL.md`
+LIVE). Further C needs a **new host-minted unlock** after a **named offline
+delta** (construction/byte evidence), not another reconfirm stamp. Offline green
+≠ Pass ≠ `ran_on_npu`.
 
 Post-C2 offline under CONSUMED = `tools/c3_post_c2_classify.sh` (C3_SKIP without new evidence) +
 `tools/c4_pass_check.sh` (C4_SKIP without PassCandidate snapshot).
@@ -30,10 +35,11 @@ contract: [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md).
 
 ## Unlock policy (hard)
 
-C runs **only if the agent explicitly says ready** with a **new** unlock stamp.
-`C_UNLOCK=b17b0119` is **CONSUMED** (gate-only `b6a66dee`; prior `dd35ae15`). **Further applies require a new agent unlock** — not open
-season. New offline last_apply/journal evidence may **justify** that unlock
-decision; evidence **never auto-unlocks** C.
+C runs **only if the agent explicitly says ready** with a **new host-minted**
+unlock stamp. `C_UNLOCK=b17b0119` is **CONSUMED**. **Further applies require a
+new unlock** after real offline delta — not open season, not empty gate-only
+hex. New last_apply/journal or construction/byte evidence may **justify** that
+unlock; evidence **never auto-unlocks** C.
 
 **Not** unlocked by any of (and none of these equal Pass either):
 
@@ -118,10 +124,11 @@ again. Manual offline prep above mirrors that path without L3.
 
 ---
 
-## Exact apply (CONSUMED — `C_UNLOCK=b17b0119`; gate-only `b6a66dee`)
+## Exact apply (CONSUMED — `C_UNLOCK=b17b0119`)
 
-> **Stamp CONSUMED.** Do **not** open L3 under `b17b0119`. Record-only / offline path only.
-> Live apply under this stamp is **closed**. Offline path = `c3` / `c4` / `run_offline_gates` only.
+> **Unlock CONSUMED.** Do **not** open execute-allow under `b17b0119`. Record-only /
+> offline path only. Live apply under this unlock is **closed**. Offline path =
+> `c3` / `c4` / `run_offline_gates` only. **Do not** mint empty maintain stamps.
 
 **Historical operator C2 (already ran).** Agent does **not** re-run this under `b17b0119`. Unlock **≠** Pass.
 
@@ -321,10 +328,11 @@ residual) or **C4** (only if OFM allclose + ERT Completed + `ran_on_npu=true`).
 
 ## Highest-value next (after this recipe)
 
-1. **Maintain offline gates** (gate-only `b6a66dee`; prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED`):
-   `bash tools/run_offline_gates.sh` (+ optional `hitl_c2_once.sh --print-only` for
-   CONSUMED NOTE). **No** live L3 sandwich under this stamp. Offline green alone
-   still does **not** equal Pass / C-ready / `ran_on_npu`. Further live C needs a
+1. **Construction / byte research offline** (named question — how a working
+   public stack builds loadable bytes; DynamicDispatch / XRT first → byte-compare
+   to our failing image). Empty gate-only maintain stamps are **frozen**.
+   `C_UNLOCK=b17b0119` **CONSUMED** — **no** live sandwich under it. Offline green
+   alone still does **not** equal Pass / C-ready / `ran_on_npu`. Further live C needs a
    **new agent unlock** (evidence may justify; never auto-unlocks).
 2. **Offline residual / Pass audit (CONSUMED path):** `bash tools/c3_post_c2_classify.sh`
    + `bash tools/c4_pass_check.sh` + `run_offline_gates.sh` → agent **C3** when

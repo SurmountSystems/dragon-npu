@@ -316,4 +316,6 @@ including `decide_ran_on_npu`, `NumericalVerifyCriteria`, `DEFAULT_VERIFY_*`).
 
 Structures described here are derived from **GPL-2.0** amd/xdna-driver sources for interoperability. This document is research notes for an independent open userspace client, not a copy of AMD proprietary toolchain docs.
 
-**Gate-only stamp `b6a66dee`** (prior gate-only `dd35ae15`; A–O closed; no new external public evidence). Track M/N/O — prior / historical. **No** Track P.
+**Policy:** empty gate-only maintain stamps **frozen** (A–O status catalogs closed;
+public enum names alone ≠ new research bag). Next = construction/byte research.
+`C_UNLOCK=b17b0119` **CONSUMED**. See `RESIDUAL.md` / `AGENTS.md` §6–9.

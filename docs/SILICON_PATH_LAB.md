@@ -1,4 +1,7 @@
-# Silicon path (gate-only `b6a66dee`; prior `dd35ae15`) lab (WTS → ctrl → gated EXEC)
+# Silicon path lab (WTS → ctrl → gated EXEC)
+
+> **Policy:** Empty gate-only maintain stamps **frozen**. `C_UNLOCK=b17b0119`
+> **CONSUMED**. Next real work = construction/byte research (see `RESIDUAL.md`).
 
 ## Plain English
 
@@ -29,9 +32,11 @@ under `b17b0119`), [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md),
 **Unpatched CLASS A / mere `diff rc=0` = body match only → ≠ Pass.**  
 Further C after the consumed one-shot needs a **new agent unlock** (evidence may justify; never auto-unlocks).
 
-**Highest-value now (single source of truth):** maintain `run_offline_gates` green + L3=`N` under gate-only
-`b6a66dee` (prior `dd35ae15`; `C_UNLOCK=b17b0119` **CONSUMED**); offline c3/c4 classify; **not** operator C2
-re-run. Further live C only after **new** unlock. Maintain pure-direct offline (not capture-golden as P1).
+**Highest-value now (single source of truth):** offline **construction research**
+(how a working public stack builds loadable bytes → byte-compare our failing
+image). Empty maintain stamps **frozen**. `C_UNLOCK=b17b0119` **CONSUMED** — do
+**not** re-run operator C2 under it. Further live C only after **new host-minted**
+unlock + named offline delta. Keep L3 closed (`exec_cmd_allow=N`) by default.
 
 ## Operator one-liner helper
 
