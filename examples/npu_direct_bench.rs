@@ -16,14 +16,14 @@
 //! Stub in-memory roundtrips never count as device path Pass.
 
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
+use earth_dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
 
 fn main() {
     #[cfg(not(feature = "amd-xdna2"))]
     {
         eprintln!("npu_direct_bench requires --features amd-xdna2");
         let v = serde_json::json!({
-            "schema_version": dragon_npu::TIMED_OP_JSON_SCHEMA_VERSION,
+            "schema_version": earth_dragon_npu::TIMED_OP_JSON_SCHEMA_VERSION,
             "status": "feature_disabled",
             "detail": "rebuild with --features amd-xdna2",
             "ran_on_npu": false,
@@ -65,7 +65,7 @@ fn print_checklist() {
         bo.status.as_str()
     };
     let v = serde_json::json!({
-        "schema_version": dragon_npu::TIMED_OP_JSON_SCHEMA_VERSION,
+        "schema_version": earth_dragon_npu::TIMED_OP_JSON_SCHEMA_VERSION,
         "capabilities": AmdXdna2Backend::direct_capability_ids(),
         "host": {
             "hardware_detected": backend.hardware_detected(),
@@ -92,13 +92,13 @@ fn print_checklist() {
                 "stub_or_no_device"
             },
             "destroy_hwctx": "wired",
-            "submit": if dragon_npu::backends::amd_xdna2::exec_cmd_is_enabled() {
+            "submit": if earth_dragon_npu::backends::amd_xdna2::exec_cmd_is_enabled() {
                 "enabled_dangerous_scaffold"
             } else {
                 "permanently_gated"
             },
-            "exec_cmd_enabled": dragon_npu::backends::amd_xdna2::exec_cmd_is_enabled(),
-            "exec_cmd_block_reason": dragon_npu::backends::amd_xdna2::exec_cmd_block_reason(),
+            "exec_cmd_enabled": earth_dragon_npu::backends::amd_xdna2::exec_cmd_is_enabled(),
+            "exec_cmd_block_reason": earth_dragon_npu::backends::amd_xdna2::exec_cmd_block_reason(),
             // Never "pass" for GEMM unless ran_on_npu (Phase 3 honesty).
             "timed_gemm": timed_gemm_note,
             "bo_roundtrip": bo_note,

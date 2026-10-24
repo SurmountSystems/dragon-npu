@@ -73,6 +73,8 @@ documented configs. Operator temporary override only.
 # Always wrap live device work. Outer timeout(1) + finite WAIT_CMD.
 export XDNA2_WAIT_TIMEOUT_MS=5000
 # Do NOT set XDNA2_WAIT_ALLOW_INFINITE unless you truly need infinite WAIT.
+# CONFIG_CU / silicon-mladf live: prefer outer --timeout-s 120 (default 30 is short;
+# 2026-08-09 shot was killed at 30s before last_apply). WAIT stays finite.
 
 # Live path (when L1 open): probe builds START_NPU, host-fills Cmd BO, then
 # submit_and_wait once — or refuses EXEC_CMD if fill fails (no empty fallback).
@@ -95,6 +97,12 @@ bash scripts/lab_exec_once.sh --apply --i-accept-wedge-risk --blob /path/to.bin
 - Prefer `timeout(1)` **and** finite `submit_and_wait_command(..., timeout_ms)`.
 - Prefer **`lab_exec_once.sh`** over ad-hoc enable/restore so gates cannot stay open.
 - `--timeout-s` / `--wait-timeout-ms` must be **≥ 1** (0 refused).
+- Lab default outer **30s** is for short dry paths. **CONFIG_CU silicon** first
+  shot should use **≥120s** outer (`--timeout-s 120`). `lab_exec_once` prints a
+  loud WARN when `--silicon-mladf` (or PDI blob) runs with outer ≤30s.
+- Progressive last_apply mid-path stamps (hwctx / CONFIG_CU / pre-submit) so an
+  outer kill after those stages still leaves a pin; mid-ioctl kill can still lose
+  the current stage.
 
 ### L3 `exec_cmd_allow` + finite WAIT (Phase 6 note)
 
@@ -126,11 +134,11 @@ Public constant: `DEFAULT_WAIT_CMD_TIMEOUT_MS` in `direct.rs` (re-exported from 
 | Host-filled payload only after fill success | Empty / scaffold instruction `buffer=0` loops |
 | `lab_exec_once.sh` dry-run then gated apply | Leaving `exec_cmd_allow=1` permanent |
 
-**Instruction blob capture (offline preferred):**  
-[`scripts/capture_instruction_blob_checklist.md`](../scripts/capture_instruction_blob_checklist.md) ·  
-[`docs/XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) ·  
-read-only inventory: `bash scripts/inventory_txn_sources.sh`  
-Staging: `testdata/xdna2_cmd/` (binaries gitignored).  
+**Instruction blob capture (offline preferred):**
+[`scripts/capture_instruction_blob_checklist.md`](../scripts/capture_instruction_blob_checklist.md) ·
+[`docs/XDNA2_TXN_RESEARCH.md`](./XDNA2_TXN_RESEARCH.md) ·
+read-only inventory: `bash scripts/inventory_txn_sources.sh`
+Staging: `testdata/xdna2_cmd/` (binaries gitignored).
 **Still refuse empty scaffold** Cmd BO / zero-size instruction submits.
 
 Rust entry points:

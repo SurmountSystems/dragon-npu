@@ -119,8 +119,10 @@ Other options:
   --allow-research-blob    Allow --blob whose sibling PROVENANCE.md marks NOT_AIE2_KNOWN_GOOD=1
                            (VE2 / research staging). Default: refuse on apply (exit 2).
   --refcnt-max N           Default 5
-  --timeout-s N            Outer timeout around live cargo (default 30)
-  --wait-timeout-ms N      XDNA2_WAIT_TIMEOUT_MS (default 5000)
+  --timeout-s N            Outer timeout around live cargo (default 30).
+                           CONFIG_CU / silicon-mladf live shots should use ≥120
+                           (30s outer killed a prior CONFIG_CU shot before last_apply).
+  --wait-timeout-ms N      XDNA2_WAIT_TIMEOUT_MS (default 5000; keep finite)
   --example NAME           Default: npu_direct_bench (charset [A-Za-z0-9_-]+)
   --cargo-args "…"         Args after -- for the example (quoted carefully)
   --print-sudo-only        Never invoke sudo; print human commands (exit 3 if root needed)
@@ -635,6 +637,19 @@ read_exec_cmd_allow() {
 enable_l3() {
   local cur
   cur="$(read_exec_cmd_allow)"
+  # Stock in-tree amdxdna (Garuda/mainline): no exec_cmd_allow sysfs param.
+  # Driver has no L3 gate — only our userspace double-gate (ALLOW + feature).
+  # Do not invent sudo steps or require --assume-l3-already-open.
+  if [[ "$cur" == "missing" ]]; then
+    echo "L3: stock amdxdna (exec_cmd_allow sysfs missing) — no driver L3 gate"
+    echo "L3: userspace XDNA2_ALLOW_EXEC_CMD only for this process; no sudo restore needed"
+    L3_WE_ENABLED=0
+    if [[ "$ALLOW_STOCK_KERNEL" -ne 1 ]]; then
+      echo "L3: auto --allow-stock-kernel (stock module detected; hardened L2+L3 patches absent)"
+      ALLOW_STOCK_KERNEL=1
+    fi
+    return 0
+  fi
   if [[ "$ASSUME_L3_OPEN" -eq 1 ]]; then
     case "$cur" in
       1|Y|y)
@@ -685,8 +700,12 @@ restore_l3() {
 
   # Only write sysfs when **this script** opened L3 (or assumed ownership).
   # Never clear a foreign operator session if we never enabled.
+  # Stock (val=missing, L3_WE_ENABLED=0): nothing to restore on sysfs.
   if [[ "$L3_WE_ENABLED" -eq 1 ]]; then
-    if [[ "$(id -u)" -eq 0 ]]; then
+    if [[ "$val" == "missing" ]]; then
+      # Should not happen if enable_l3 set L3_WE_ENABLED only for real param.
+      L3_WE_ENABLED=0
+    elif [[ "$(id -u)" -eq 0 ]]; then
       echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow 2>/dev/null || ok=0
     elif [[ "$PRINT_SUDO_ONLY" -eq 0 ]] && sudo_can_n; then
       timeout 15s sudo -n sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow' 2>/dev/null || ok=0
@@ -695,7 +714,7 @@ restore_l3() {
     fi
     val="$(read_exec_cmd_allow)"
     case "$val" in
-      0|N|n) ;;
+      0|N|n|missing) ;;
       *)
         ok=0
         ;;
@@ -789,6 +808,11 @@ main() {
     apply_silicon_mladf_env
   fi
   require_apply_flags
+  # Stock in-tree: detect before verify so hardened-host check can continue with WARN.
+  if [[ "$(read_exec_cmd_allow)" == "missing" && "$ALLOW_STOCK_KERNEL" -ne 1 ]]; then
+    echo "NOTE: stock amdxdna (exec_cmd_allow missing) — auto --allow-stock-kernel for verify/apply"
+    ALLOW_STOCK_KERNEL=1
+  fi
   if [[ "$SILICON_MLADF" -eq 1 ]]; then
     run_silicon_preflight
   fi
@@ -848,6 +872,23 @@ main() {
     [[ -n "${XDNA2_LAB_REQUIRE_CTRL:-}" ]] && RUN_ENV+=("XDNA2_LAB_REQUIRE_CTRL=$XDNA2_LAB_REQUIRE_CTRL")
     [[ -n "${XDNA2_LAB_CTRL_AUTO_PATCH:-}" ]] && RUN_ENV+=("XDNA2_LAB_CTRL_AUTO_PATCH=$XDNA2_LAB_CTRL_AUTO_PATCH")
   fi
+  # Explicit forward of residual / CONFIG_CU / evidence envs (do not rely on inherit alone).
+  # PDI path is the P4 measurement; last_apply pin preserves locked baseline for C3.
+  [[ -n "${XDNA2_LAB_PDI_BLOB:-}" ]] && RUN_ENV+=("XDNA2_LAB_PDI_BLOB=$XDNA2_LAB_PDI_BLOB")
+  [[ -n "${XDNA2_LAB_CU_FUNC:-}" ]] && RUN_ENV+=("XDNA2_LAB_CU_FUNC=$XDNA2_LAB_CU_FUNC")
+  [[ -n "${XDNA2_LAB_BO_DIAG:-}" ]] && RUN_ENV+=("XDNA2_LAB_BO_DIAG=$XDNA2_LAB_BO_DIAG")
+  [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]] && RUN_ENV+=("XDNA2_LAB_LAST_APPLY_JSON=$XDNA2_LAB_LAST_APPLY_JSON")
+  [[ -n "${XDNA2_LAB_INSTR_SIZE_MODE:-}" ]] && RUN_ENV+=("XDNA2_LAB_INSTR_SIZE_MODE=$XDNA2_LAB_INSTR_SIZE_MODE")
+  [[ -n "${XDNA2_LAB_RELA_MODE:-}" ]] && RUN_ENV+=("XDNA2_LAB_RELA_MODE=$XDNA2_LAB_RELA_MODE")
+  [[ -n "${XDNA2_LAB_KERNEL_ARG_LAYOUT:-}" ]] && RUN_ENV+=("XDNA2_LAB_KERNEL_ARG_LAYOUT=$XDNA2_LAB_KERNEL_ARG_LAYOUT")
+  # Research debug-BO: CREATE 4096 Dev (AMDXDNA_BO_DEV) + CONFIG_HWCTX ASSIGN/REMOVE.
+  # invent_pass=0; assign alone ≠ Pass. Shmem failed live 48da6e60 (driver type filter).
+  # Explicit forward (do not rely on inherit alone).
+  [[ -n "${XDNA2_LAB_RESEARCH_DEBUG_BO:-}" ]] && RUN_ENV+=("XDNA2_LAB_RESEARCH_DEBUG_BO=$XDNA2_LAB_RESEARCH_DEBUG_BO")
+  [[ -n "${XDNA2_LAB_SKIP_CONFIG_CU:-}" ]] && RUN_ENV+=("XDNA2_LAB_SKIP_CONFIG_CU=$XDNA2_LAB_SKIP_CONFIG_CU")
+  # Same-run address patch gate (W10-B / live-shot-effective Arm A). Must reach cargo
+  # child — do not rely on inherit alone. Env alone ≠ unlock ≠ Pass ≠ ran_on_npu.
+  [[ -n "${XDNA2_LAB_SAME_SHOT_RELA:-}" ]] && RUN_ENV+=("XDNA2_LAB_SAME_SHOT_RELA=$XDNA2_LAB_SAME_SHOT_RELA")
 
   if [[ "$SILICON_MLADF" -eq 1 ]]; then
     echo "SHAPE NOTE (silicon-mladf apply): example args ${CARGO_EXTRA[*]} are probe placeholders only."
@@ -855,7 +896,53 @@ main() {
     echo "  (typical M=1 K=1152 N=256; IFM=2304 WTS=174080 OFM=512 bf16)."
     echo "  TimedOpResult reports plan M/N/K — do not read m=n=k=1 as the silicon GEMM shape."
   fi
-  echo "EXEC: single-shot under timeout ${TIMEOUT_S}s (example=$EXAMPLE LAB_OFM=1 silicon_mladf=$SILICON_MLADF)"
+  if [[ -n "${XDNA2_LAB_PDI_BLOB:-}" ]]; then
+    _pdi_sz="?"
+    [[ -f "${XDNA2_LAB_PDI_BLOB}" ]] && _pdi_sz="$(wc -c <"${XDNA2_LAB_PDI_BLOB}" | tr -d ' ')"
+    echo "CONFIG_CU: XDNA2_LAB_PDI_BLOB=${XDNA2_LAB_PDI_BLOB} (${_pdi_sz} B) cu_func=${XDNA2_LAB_CU_FUNC:-0(default)}"
+    echo "  attach alone ≠ Pass ≠ ran_on_npu; wrong overlay may still 0x3000003"
+  else
+    echo "CONFIG_CU: XDNA2_LAB_PDI_BLOB unset (lab will not issue CONFIG_HWCTX CONFIG_CU)"
+  fi
+  if [[ -n "${XDNA2_LAB_RESEARCH_DEBUG_BO:-}" ]]; then
+    echo "RESEARCH_DEBUG_BO: XDNA2_LAB_RESEARCH_DEBUG_BO=${XDNA2_LAB_RESEARCH_DEBUG_BO} (4096 Shmem Assign/Remove; invent_pass=0; ≠ Pass)"
+  else
+    echo "RESEARCH_DEBUG_BO: unset (lab will not CONFIG_HWCTX DBG_BUF)"
+  fi
+  if [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]]; then
+    echo "LAST_APPLY: pin=${XDNA2_LAB_LAST_APPLY_JSON} (prefer ≠ locked baseline for C3 evidence)"
+  fi
+  # Loud same-run gate preflight (product Arm A / live-shot-effective).
+  case "${XDNA2_LAB_SAME_SHOT_RELA:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      echo "SAME_SHOT_RELA: XDNA2_LAB_SAME_SHOT_RELA=${XDNA2_LAB_SAME_SHOT_RELA} (in-process BO paddrs only; refuse stale disk UVAs)"
+      echo "  honesty: same_shot_gate alone ≠ Pass ≠ unlock ≠ ran_on_npu; invent_pass=0"
+      ;;
+    "")
+      if [[ "$SILICON_MLADF" -eq 1 ]]; then
+        # Bare lab_exec does not force same-shot (kit/hitl own product default=1).
+        # Loud WARN only — never invent Pass / unlock / ALLOW.
+        echo "WARN: XDNA2_LAB_SAME_SHOT_RELA unset on silicon-mladf apply; lab keeps default direct patch." >&2
+        echo "  Product Arm A expects hitl_c / operator_app_load_kit (export XDNA2_LAB_SAME_SHOT_RELA=1)." >&2
+        echo "  Env alone ≠ Pass ≠ unlock ≠ ran_on_npu; invent_pass=0." >&2
+      fi
+      ;;
+    *)
+      echo "SAME_SHOT_RELA: XDNA2_LAB_SAME_SHOT_RELA=${XDNA2_LAB_SAME_SHOT_RELA} (not enabled; token table wants 1/true/yes/on)"
+      ;;
+  esac
+  # Loud WARN: default 30s outer is too short for CONFIG_CU silicon (2026-08-09
+  # timeout kill left no last_apply). Prefer --timeout-s 120; WAIT stays finite.
+  if [[ "$SILICON_MLADF" -eq 1 && "$TIMEOUT_S" -le 30 ]]; then
+    echo "WARN: silicon-mladf apply with outer timeout ${TIMEOUT_S}s (lab default 30 is short)." >&2
+    echo "  CONFIG_CU silicon first shot should use --timeout-s 120 (or ≥120)." >&2
+    echo "  Outer kill (rc=124) → lab exit 4; progressive last_apply helps but mid-ioctl can still lose stage." >&2
+    echo "  WAIT stays finite (XDNA2_WAIT_TIMEOUT_MS=${WAIT_MS}; do not set infinite)." >&2
+  fi
+  if [[ -n "${XDNA2_LAB_PDI_BLOB:-}" && "$TIMEOUT_S" -le 30 ]]; then
+    echo "WARN: CONFIG_CU path (XDNA2_LAB_PDI_BLOB set) with outer timeout ${TIMEOUT_S}s — prefer ≥120s." >&2
+  fi
+  echo "EXEC: single-shot under timeout ${TIMEOUT_S}s (example=$EXAMPLE LAB_OFM=1 silicon_mladf=$SILICON_MLADF same_shot_rela=${XDNA2_LAB_SAME_SHOT_RELA:-(unset)})"
   set +e
   (cd "$ROOT" && timeout "${TIMEOUT_S}s" env \
     "${RUN_ENV[@]}" \

@@ -9,7 +9,7 @@
 //! prints whether the backend reports `simulated`. **Never** claims
 //! `ran_on_npu` or silicon GEMM Pass.
 
-use dragon_npu::DragonNpu;
+use earth_dragon_npu::DragonNpu;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

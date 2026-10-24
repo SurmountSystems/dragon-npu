@@ -7,11 +7,11 @@
 # Policy: run only when agent explicitly says ready. See RESIDUAL.md.
 # SSoT unlock: first C_UNLOCK=… line in RESIDUAL.md (soft NOTE only — never
 # hard-blocks apply, even when CONSUMED). Soft-parse matches hitl_c2_once.sh:
-#   Active: first match without CONSUMED on that line → one-shot (P4:
-#           C_UNLOCK=3a70fabf for one CONFIG_CU + XDNA2_LAB_PDI_BLOB sandwich).
+#   Active: first match without CONSUMED on that line → one-shot (CONFIG_CU +
+#           XDNA2_LAB_PDI_BLOB sandwich; prefer --timeout-s=120).
 #   Consumed: CONSUMED on first line / same stamp → historical; further C needs
 #             a new agent unlock + offline delta after this one-shot is used.
-# Historical: C_UNLOCK=b17b0119 CONSUMED (operator C2 2026-07-18) — do not reopen.
+# Historical: 3a70fabf / b17b0119 CONSUMED — do not reopen under those stamps.
 # Standing policy: CONSUMED is messaging honesty only (soft NOTE); it does NOT
 # refuse --assume-l3-already-open. Operator owns L3; hitl_c2_once prints
 # executable sandwich when active, HISTORICAL record-only when consumed.
@@ -28,7 +28,7 @@
 #
 # Fish-safe: run with bash.
 #
-# Usage (when RESIDUAL first C_UNLOCK= is active — P4 C_UNLOCK=3a70fabf):
+# Usage (when RESIDUAL first C_UNLOCK= is active):
 #   # CONFIG_CU pre-step (optional env; default off):
 #   # bash tools/operator_app_load_kit.sh a-prep
 #   # export XDNA2_LAB_PDI_BLOB=/path/from/a-prep
@@ -252,14 +252,16 @@ read_allow() {
 allow_now="$(read_allow)"
 echo "driver: exec_cmd_allow=$allow_now"
 
-# --assume-l3-already-open means YOU already opened L3. If N, fail early
-# (this is not a silicon Pass failure):
-#   - active unlock → print open/restore L3 sandwich recovery recipe
-#   - CONSUMED stamp → offline-only next steps + restore-only if L3 was left open
-#     (do not instruct opening L3 under the consumed stamp)
+# --assume-l3-already-open means YOU already opened L3 (hardened module).
+# Stock in-tree amdxdna has no exec_cmd_allow sysfs → treat as stock path, proceed.
+# If N/0 on hardened, fail early (not a silicon Pass failure).
 if [[ ${#ASSUME[@]} -gt 0 ]]; then
   case "$allow_now" in
     1|Y|y) ;;
+    missing)
+      echo "NOTE: stock amdxdna (exec_cmd_allow missing) — no L3 open/restore; userspace ALLOW only" >&2
+      echo "NOTE: wedge risk on stock is real (no L2 null-guards); --i-accept-wedge-risk still required via lab_exec" >&2
+      ;;
     *)
       echo "" >&2
       echo "ERROR: --assume-l3-already-open but exec_cmd_allow=$allow_now (L3 closed)." >&2
@@ -294,11 +296,13 @@ if [[ ${#ASSUME[@]} -gt 0 ]]; then
         echo "If L3 were left open after a prior failure, restore only:" >&2
         echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
       else
-        echo "Fish (recommended — open L3, apply, restore):" >&2
+        echo "Fish (recommended — open L3, apply, restore on **hardened** module):" >&2
         echo "  sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
         echo "  bash tools/hitl_c_pass_apply.sh --assume-l3-already-open" >&2
         echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
         echo "" >&2
+        echo "Stock module (no exec_cmd_allow): omit sudo; just run apply (lab_exec detects missing)." >&2
+        echo "  bash tools/hitl_c_pass_apply.sh --assume-l3-already-open" >&2
         echo "Or omit --assume-l3-already-open and let lab_exec try sudo -n / print human steps:" >&2
         echo "  bash tools/hitl_c_pass_apply.sh" >&2
       fi
@@ -312,28 +316,101 @@ EXTRA=()
 [[ -n "$TIMEOUT_S" ]] && EXTRA+=(--timeout-s "$TIMEOUT_S")
 
 # Residual trial env banner (paste-friendly).
+# CONFIG_CU / PDI preflight (loud; soft refuse only when --require-pdi set via env).
+# Pin last_apply away from locked baseline when PDI set so C3 can detect new evidence.
+_pdi="${XDNA2_LAB_PDI_BLOB:-}"
+_pdi_trim="${_pdi#"${_pdi%%[![:space:]]*}"}"
+_pdi_trim="${_pdi_trim%"${_pdi_trim##*[![:space:]]}"}"
+if [[ -n "${_pdi_trim}" ]]; then
+  if [[ ! -f "${_pdi_trim}" ]]; then
+    echo "ERROR: XDNA2_LAB_PDI_BLOB set but not a file: ${_pdi_trim}" >&2
+    echo "  re-run: bash tools/operator_app_load_kit.sh a-prep" >&2
+    exit 2
+  fi
+  _pdi_bytes="$(wc -c <"${_pdi_trim}" | tr -d ' ')"
+  if [[ "${_pdi_bytes}" -eq 0 ]]; then
+    echo "ERROR: XDNA2_LAB_PDI_BLOB is empty (0 B): ${_pdi_trim}" >&2
+    exit 2
+  fi
+  export XDNA2_LAB_PDI_BLOB="${_pdi_trim}"
+  echo "CONFIG_CU preflight: PDI_OK path=${_pdi_trim} bytes=${_pdi_bytes} cu_func=${XDNA2_LAB_CU_FUNC:-0}"
+  echo "  honesty: attach alone ≠ Pass ≠ ran_on_npu; research overlay may still 0x3000003"
+  # Prefer a shot-specific last_apply under /tmp so locked fixture stays C3 baseline.
+  if [[ -z "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]]; then
+    _la_tmp="${TMPDIR:-/tmp}"
+    _la_tmp="${_la_tmp%/}"
+    if [[ -z "${_la_tmp}" || "${_la_tmp}" == "/" ]]; then
+      _la_tmp="/tmp"
+    fi
+    export XDNA2_LAB_LAST_APPLY_JSON="${_la_tmp}/dragon_npu_last_apply_config_cu_$$.json"
+    echo "CONFIG_CU preflight: pinned LAST_APPLY=${XDNA2_LAB_LAST_APPLY_JSON}"
+    echo "  (locked baseline testdata/xdna2_cmd/last_apply.json preserved for C3 compare)"
+  else
+    echo "CONFIG_CU preflight: LAST_APPLY already set=${XDNA2_LAB_LAST_APPLY_JSON}"
+  fi
+else
+  echo "WARN: XDNA2_LAB_PDI_BLOB unset — this apply will NOT issue CONFIG_CU" >&2
+  echo "WARN: for active-unlock CONFIG_CU measurement, run a-prep + export first:" >&2
+  echo "WARN:   bash tools/hitl_config_cu_once.sh prep   # recommended one-shot prep" >&2
+  echo "WARN:   # or: bash tools/operator_app_load_kit.sh a-prep && set -gx XDNA2_LAB_PDI_BLOB …" >&2
+  if [[ "${XDNA2_HITL_REQUIRE_PDI:-}" == "1" ]]; then
+    echo "ERROR: XDNA2_HITL_REQUIRE_PDI=1 but PDI unset (fail closed)" >&2
+    exit 2
+  fi
+fi
+
+# Product Arm A / live-shot-effective: default same-run address gate when unset.
+# Operator may force off with XDNA2_LAB_SAME_SHOT_RELA=0. Env alone ≠ Pass ≠ unlock.
+# lab_exec_once must forward this into the cargo child (explicit RUN_ENV).
+if [[ -z "${XDNA2_LAB_SAME_SHOT_RELA+x}" || -z "${XDNA2_LAB_SAME_SHOT_RELA}" ]]; then
+  export XDNA2_LAB_SAME_SHOT_RELA=1
+fi
+case "${XDNA2_LAB_SAME_SHOT_RELA}" in
+  1|true|TRUE|yes|YES|on|ON)
+    echo "SAME_SHOT_RELA: XDNA2_LAB_SAME_SHOT_RELA=${XDNA2_LAB_SAME_SHOT_RELA} (in-process BO paddrs only; refuse stale disk UVAs)"
+    echo "  honesty: same_shot_gate alone ≠ Pass ≠ unlock ≠ ran_on_npu invent_pass=0"
+    ;;
+  *)
+    echo "SAME_SHOT_RELA: XDNA2_LAB_SAME_SHOT_RELA=${XDNA2_LAB_SAME_SHOT_RELA} (product Arm A prefers 1)"
+    ;;
+esac
+
 echo "RESIDUAL_ENV: INSTR_SIZE_MODE=${XDNA2_LAB_INSTR_SIZE_MODE:-content(default)} \
 RELA_MODE=${XDNA2_LAB_RELA_MODE:-overwrite(default)} \
 KERNEL_ARG_LAYOUT=${XDNA2_LAB_KERNEL_ARG_LAYOUT:-count4(default)} \
+PDI_BLOB=${XDNA2_LAB_PDI_BLOB:-(unset)} \
+CU_FUNC=${XDNA2_LAB_CU_FUNC:-0(default)} \
+LAST_APPLY=${XDNA2_LAB_LAST_APPLY_JSON:-(default fixture path)} \
+SAME_SHOT_RELA=${XDNA2_LAB_SAME_SHOT_RELA:-(unset)} \
 contract_status=$CONTRACT_STATUS"
 
 echo "--- apply (wedge risk accepted by flag; ELF forced last) ---"
+STOCK_EXTRA=()
+if [[ "$allow_now" == "missing" ]]; then
+  STOCK_EXTRA+=(--allow-stock-kernel)
+  echo "NOTE: passing --allow-stock-kernel (stock amdxdna; no hardened L2+L3)"
+fi
 set +e
 bash scripts/lab_exec_once.sh --silicon-mladf --require-pass-assets \
   --apply --i-accept-wedge-risk \
   "${ASSUME[@]}" \
+  "${STOCK_EXTRA[@]}" \
   "${EXTRA[@]}" \
   --blob "$ELF"
 rc=$?
 set -e
 
 allow="?"
-[[ -r /sys/module/amdxdna/parameters/exec_cmd_allow ]] && \
+if [[ -r /sys/module/amdxdna/parameters/exec_cmd_allow ]]; then
   allow="$(tr -d '[:space:]' </sys/module/amdxdna/parameters/exec_cmd_allow || true)"
+else
+  allow="missing"
+fi
 echo ""
 echo "POST: lab_exec rc=$rc  exec_cmd_allow=$allow"
 case "$allow" in
   0|N|n) echo "POST_OK: L3 closed" ;;
+  missing) echo "POST_OK: stock module (no L3 param to restore)" ;;
   *)
     echo "CRITICAL: restore L3:" >&2
     echo "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
@@ -346,11 +423,31 @@ esac
 echo ""
 echo "What to paste for the agent (if !ran_on_npu):"
 echo "  - status=… line / TimedOpResult JSON status field"
+echo "  - detail: config_cu= / config_cu_failed / pdi_bytes= / cu_func= (CONFIG_CU tokens)"
 echo "  - detail: aiebu_elf= rela_count= qos_gops= tiles= ert_state= ofm_stats= fw_status_hint="
 echo "  - residual: inst_size_mode= content_size= bo_size= start_npu_size= rela_mode= layout="
 echo "  - RESIDUAL_ENV banner line from this run"
-echo "  - optional: testdata/xdna2_cmd/last_apply.json or \$XDNA2_LAB_LAST_APPLY_JSON"
-echo "  - journal: journalctl -k -b --no-pager | rg -i 'Failed cmd|Status 0x|APP_LOAD|amdxdna' | tail -20"
+if [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]]; then
+  echo "  - last_apply: ${XDNA2_LAB_LAST_APPLY_JSON}"
+  if [[ -f "${XDNA2_LAB_LAST_APPLY_JSON}" ]]; then
+    echo "  - last_apply EXISTS ($(wc -c <"${XDNA2_LAB_LAST_APPLY_JSON}" | tr -d ' ') B)"
+  else
+    echo "  - last_apply MISSING at pin (timed path may not have written — still paste status/detail)"
+  fi
+else
+  echo "  - last_apply: testdata/xdna2_cmd/last_apply.json or \$XDNA2_LAB_LAST_APPLY_JSON"
+fi
+echo "  - journal: journalctl -k -b --no-pager | rg -i 'Failed cmd|Status 0x|APP_LOAD|amdxdna' | tail -30"
+echo "  - PDI provenance: path + bytes + sha256 + xclbin source (from a-prep)"
+echo "  - exec_cmd_allow after restore (must be 0/N, or missing on stock)"
+echo ""
+echo "Post-shot offline (no L3; paste outputs):"
+if [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" && -f "${XDNA2_LAB_LAST_APPLY_JSON}" ]]; then
+  echo "  bash tools/collect_post_c2_evidence.sh ${XDNA2_LAB_LAST_APPLY_JSON}"
+else
+  echo "  bash tools/collect_post_c2_evidence.sh"
+fi
 echo ""
 echo "Success signal: ran_on_npu=true (bench exit 0). Common: exit 4 until Pass."
+echo "Mark the active unlock used in RESIDUAL only after a real sandwich (not print-only)."
 exit "$rc"

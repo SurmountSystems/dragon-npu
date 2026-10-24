@@ -1,0 +1,9 @@
+0cadf32ec0472e3f55e9102a6175d005b1a95a8ea428907086e15ad44d825dad  /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/final.xclbin
+0cadf32ec0472e3f55e9102a6175d005b1a95a8ea428907086e15ad44d825dad  /tmp/whole-array-128-attempt5/build/final_128x128x128_16x16x16_4c.xclbin
+ae692499a79c74b46175cb4841f235edb0059175144941522f792105b758dec3  /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/insts.bin
+ae692499a79c74b46175cb4841f235edb0059175144941522f792105b758dec3  /tmp/whole-array-128-attempt5/build/insts_128x128x128_16x16x16_4c.bin
+previous 395d9d5a07550f42d289f699e44ebe4bbeba520be0f85b069ba5831dda93a54a  goal-scratch xclbin, bytes not found
+previous 286fe2324ef02cad008c99718cf648a6f0286aa5b6170dba62856ca1b90665c1  /tmp/whole-array-128-durable/work/build/final_128x128x128_16x16x16_4c.xclbin
+chosen /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/final.xclbin
+73327 /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/final.xclbin
+2592 /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/insts.bin

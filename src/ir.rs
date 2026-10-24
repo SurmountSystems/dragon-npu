@@ -1,4 +1,4 @@
-//! Phase 7 — Typed DragonNPU IR (alongside `ModelGraph` parallel Vecs).
+//! Phase 7 — Typed Earth Dragon NPU IR (alongside `ModelGraph` parallel Vecs).
 //!
 //! # Design
 //!
@@ -1905,7 +1905,7 @@ mod tests {
         assert_eq!(cost.host_ops, 1);
         assert_eq!(cost.rough_macs, 2 * 4 * 3); // M=2,N=4,K=3
         assert!(cost.notes.iter().any(|n| n.contains("heuristic")));
-        assert!(!cost.notes.is_empty());
+        assert_ne!(cost.notes, [] as [String; 0]);
     }
 
     #[test]

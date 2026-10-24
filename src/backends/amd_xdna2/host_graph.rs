@@ -1624,6 +1624,18 @@ mod tests {
     }
 
     #[test]
+    fn fixture_host_matmul_relu_add_known_output() {
+        let path = fixture_path("host_matmul_relu_add.json");
+        let backend = AmdXdna2Backend::new_with_real_stub();
+        let model = backend
+            .compile_model(&path, 0, "fp32")
+            .expect("compile checked-in fixture");
+        // Identity 2x2: [-1, 2] → MatMul same → Relu → [0, 2] → +[0.5, 1.5] → [0.5, 3.5]
+        let out = evaluate_host_graph(&model, &[-1.0, 2.0]).expect("host linear demo fixture");
+        assert_eq!(out, vec![0.5, 3.5]);
+    }
+
+    #[test]
     fn host_relu_add_mul_chain() {
         let path = write_temp_json(
             "dragon_npu_phase5_chain.json",
@@ -1854,7 +1866,7 @@ mod tests {
         let n = upload_weights_to_shmem_bos(&stub, -1, &model).expect("upload");
         // Success: count only; no live handles.
         assert_eq!(n, 1);
-        assert!(!stub.destroyed_bo_handles().is_empty());
+        assert_ne!(stub.destroyed_bo_handles(), [] as [u32; 0]);
     }
 
     /// Stub that fails `write_bo_bytes` after creating buffers (cleanup test).
@@ -1922,6 +1934,17 @@ mod tests {
             timeout_ms: u32,
         ) -> Result<(), DirectError> {
             self.inner.wait_command(fd, hwctx, seq, timeout_ms)
+        }
+        fn wait_command_with_syncobj(
+            &self,
+            fd: RawFd,
+            hwctx: u32,
+            seq: u64,
+            timeout_ms: u32,
+            syncobj_handle: u32,
+        ) -> Result<(), DirectError> {
+            self.inner
+                .wait_command_with_syncobj(fd, hwctx, seq, timeout_ms, syncobj_handle)
         }
         fn sync_buffer(
             &self,
@@ -2112,6 +2135,17 @@ mod tests {
                 timeout_ms: u32,
             ) -> Result<(), DirectError> {
                 self.inner.wait_command(fd, hwctx, seq, timeout_ms)
+            }
+            fn wait_command_with_syncobj(
+                &self,
+                fd: RawFd,
+                hwctx: u32,
+                seq: u64,
+                timeout_ms: u32,
+                syncobj_handle: u32,
+            ) -> Result<(), DirectError> {
+                self.inner
+                    .wait_command_with_syncobj(fd, hwctx, seq, timeout_ms, syncobj_handle)
             }
             fn sync_buffer(
                 &self,

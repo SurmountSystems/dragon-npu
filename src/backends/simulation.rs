@@ -1,4 +1,4 @@
-//! Simulation backend for DragonNPU.
+//! Simulation backend for Earth Dragon NPU.
 //!
 //! This backend is always available and is used for development and testing.
 //! Configurable simulation parameters (SimulationConfig) and quantization-aware

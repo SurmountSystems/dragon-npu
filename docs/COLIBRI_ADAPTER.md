@@ -35,6 +35,24 @@ Bump only when removing/renaming fields or changing honesty semantics of
 `ran_on_npu` / product Pass rules. Additive optional fields may keep version 1
 if documented here.
 
+### Optional `npu_generation` (idea, schema stays 1)
+
+`TimedOpResult::to_json_value()` does not emit `npu_generation` in this
+delta. A later producer may add the field without a schema bump.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `npu_generation` | string, optional | Absent means the producer has not classified the host. When present, the revision table is `npu4` for PCI `1022:17f0` rev `0x10`, `npu5` for rev `0x11`, `npu6` for rev `0x20`, and `npu3` for AIE4 classic device `0x17f1`. Colibrì may refuse a `npu3` value so an AIE4 host does not take the AIE2 cmdlist path. This field does not set `ran_on_npu`. `ran_on_npu` stays the verified-compute bool in the timed-op object. |
+
+This host's revision `0x20` is `npu6` when a producer fills the field.
+The series applied to drm-misc-next on 2026-10-21 does not put Strix
+`1022:17f0` on `dev_npu3_classic_info`. Quote home:
+`docs/upstream/AIE4_NPU3_PCI_IDS.md`. The colibrì tree under
+`/home/hunter/Projects/surmount/colibri` is not edited from this note.
+
+invent_pass stays 0. Pass stays No. `ran_on_npu` stays false. Unlock
+none. First `C_UNLOCK=` is `2c9c12e8` CONSUMED.
+
 ---
 
 ## Timed op object (matmul / bo_roundtrip)

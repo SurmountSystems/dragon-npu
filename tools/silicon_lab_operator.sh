@@ -156,11 +156,15 @@ cmd_apply() {
   note ""
   local allow_post
   allow_post="$(read_exec_cmd_allow)"
-  note "POST: exec_cmd_allow=$allow_post  (expect N or 0)"
+  note "POST: exec_cmd_allow=$allow_post  (expect N or 0; missing=stock driver no L3 param)"
   note "      bash scripts/diagnose_amdxdna.sh"
   case "$allow_post" in
     0|N|n)
       note "POST_OK: L3 closed"
+      ;;
+    missing)
+      # Stock in-tree amdxdna has no exec_cmd_allow sysfs param — not sticky open.
+      note "POST_OK: exec_cmd_allow param absent (stock driver; no L3 gate to restore)"
       ;;
     *)
       note "CRITICAL: exec_cmd_allow still open ($allow_post) — restore manually:" >&2
@@ -203,6 +207,9 @@ cmd_capture_golden() {
     0|N|n)
       note "L3 already closed (good)."
       ;;
+    missing)
+      note "POST_OK: exec_cmd_allow param absent (stock driver; no L3 gate to restore)"
+      ;;
     *)
       note "CRITICAL: exec_cmd_allow=$allow_post still open — restore NOW:" >&2
       note "  sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'" >&2
@@ -244,6 +251,11 @@ cmd_capture_instr() {
   case "$allow_post" in
     0|N|n)
       note "L3 already closed (good)."
+      ;;
+    missing)
+      # Stock in-tree amdxdna (no L2+L3 hardened param) — not sticky open.
+      # Matches capture_mladf_instr_vendor.sh: unreadable ALLOW → keep base rc.
+      note "POST_OK: exec_cmd_allow param absent (stock driver; no L3 gate to restore)"
       ;;
     *)
       note "CRITICAL: exec_cmd_allow=$allow_post still open — restore NOW:" >&2

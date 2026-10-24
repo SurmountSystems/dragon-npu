@@ -1,0 +1,4 @@
+./whole_array.exe -x /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/final.xclbin -i /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/insts.bin -k MLIR_AIE -M 128 -K 128 -N 128 --b_col_maj 0 --c_col_maj 0
+not executed. The command has not been run.
+PCI 1022:17f0 revision 0x20.
+decide_ran_on_npu has not been run and has not passed.

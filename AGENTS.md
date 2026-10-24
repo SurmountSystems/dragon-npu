@@ -1,4 +1,1178 @@
+## Development status (2026-10-12)
+
+The Rust minimum for this crate is 1.99. `cargo update` and `cargo audit` were run on the stable 1.99 toolchain. The audit loaded 1307 security advisories from the RustSec database, scanned Cargo.lock (159 crate dependencies), and exited 0. No advisory warning remained. The earlier anymap2 advisory (RUSTSEC-2026-0319) closed because tract-onnx is now 0.23.8 and that line no longer pulls in liquid or anymap2. That was an upgrade. It was not an audit ignore.
+
+Product Pass is still no. invent_pass stays 0. ran_on_npu stays false. The first unlock line remains `2c9c12e8` consumed. Do not mint a new unlock. Do not reopen a consumed one.
+
+An IRON catalog child PASS is an external runner. It is not `decide_ran_on_npu`. That function, in `src/backends/amd_xdna2/numerical.rs`, is a pure check. It returns true only when the host golden and the device buffer are both non-empty, the host golden is not all zeros, the caller recorded a real gated submit-and-wait, an instruction blob was present, the path was a real ioctl, and the float values match within the relative and absolute tolerances. A length mismatch, a NaN, or an infinity fails the match. The function does not open a device and does not submit work. `XDNA2_LAB_ALLOW_ZERO_GOLDEN` does not override the all-zero golden refusal.
+
+`testdata/xdna2_cmd/external_known_good/` holds research peels (300, 660, 2592, and 4512 bytes). Those peels are not a load-accepted lab matmul. The 1688-byte file `testdata/xdna2_cmd/silicon_lab/lab_instr.bin` is the unpatched lab body.
+
+The hardware outcome still open is one matmul this crate submits, the device finishes, and the output matches `decide_ran_on_npu`.
+
 ## Standing rules (silicon / HITL) — permanent
+
+Latest Turn (classic 1688 origin cited; no residual-matched buffer offline; invent_pass=0):
+- **Named delta:** The classic 1688-byte body in this tree is the unpatched DynamicDispatch dump, not a residual-matched capture. `STAGED_MLADF_CLASSIC_INSTR_BYTES` is 1688 (`src/backends/amd_xdna2/txn.rs` line 30). `MATERIAL_EXEC_LAB_CLASSIC_BYTES` aliases it (`src/backends/amd_xdna2/silicon_contract.rs` line 14525). `LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16` is `3c5ffca750922d3b` (line 16485). This turn measured `testdata/xdna2_cmd/silicon_lab/lab_instr.bin` at 1688 bytes, sha256 `3c5ffca750922d3b6b1dec66b792273e46504cc1d3de6b5b96e12ac5c8197368`. `classify_material_residual_match` keeps `residual_matched_claim` false (line 13907). IRON and mlir-aie cannot emit a residual-matched buffer offline (`docs/XDNA2_XRT_CONTRACT_MLADF.md` lines 56 and 99-101; classifier lines 13935-13948). Research peels at 300, 660, 2592, and 4512 bytes stay rejected, as does `lab_instr.bin`. No new buffer. No new test. `decide_ran_on_npu` was not edited. invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; ran_on_npu=false; unlock **none**; first unlock line `2c9c12e8` CONSUMED. Do not mint. Do not reopen CONSUMED.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. The single file only the Operator holds is a residual-matched classic 1688-byte ctrltext to place under `testdata/xdna2_cmd/external_known_good/`.
+- **Who acts next:** the Operator, for that one file. Do not ask the Operator to re-run `just npu-iron`. Do not retag the public peels as load-accepted. Agent does not mint.
+- **Q4:** stays open. Watch for a linux tag, or a drm-next tag after `drm-next-2026-10-21`, that contains `drm-misc-next-2026-10-23`.
+- **Gate:** `/tmp/grok-goal-5f7882d2f7dc/implementer/gate.log`. nproc printed 16. `CARGO_BUILD_JOBS=8`. `nice -n 19`. `PATH="/usr/bin:$PATH"`. Four exits 0, 0, 0, 0. Clippy default and clippy `--features amd-xdna2` (lib, bins, tests, examples, benches, `-D warnings`) each exited 0. `cargo test --lib` 168 passed, 0 failed, 0 ignored. `cargo test --features amd-xdna2 --lib` 737 passed, 0 failed, 1 ignored.
+
+Latest Turn (ops pointer yes; Q3 pages read; invent_pass=0):
+- **Named delta:** Yes. `dev_npu6_info.ops` is `&aie2_ops` on linux
+  master `npu6_regs.c` (fetched 2026-10-23). Source is linux master,
+  not the drm-misc-next tag. The V5 series does not edit
+  `npu6_regs.c`. V5 patch 19 adds `.runtime_resume = aie2_hw_resume`
+  and `.runtime_suspend = aie2_hw_suspend` on `aie2_ops`, so those
+  hooks are on the ops table this host uses (`1022:17f0` rev `0x20`).
+  Q3: V5 15 says "No functional change for AIE2." The
+  `populate_range` body was read and matches across the move. V5 02
+  sets `hwctx->doorbell_offset` to `AMDXDNA_INVALID_DOORBELL_OFFSET`
+  and sets `amdxdna_fops.mmap` to `drm_gem_mmap`. Q4 stays open:
+  pull 607373 requests tag `drm-misc-next-2026-10-23`, and that is
+  not a released mainline tag. invent_pass=0 not_c_ready=1
+  not_ran_on_npu=1; Pass=**No**; unlock **none** (`2c9c12e8`
+  CONSUMED). Do not mint. Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. An ops
+  pointer is not Pass. The person who holds a residual-matched classic
+  1688 still places it under
+  `testdata/xdna2_cmd/external_known_good/`.
+- **Who acts next:** that person, for that one file. Do not ask the
+  operator to re-run `just npu-iron`. Agent does not mint. The delta
+  is named only and is not started.
+- **Gate:** no new test. `decide_ran_on_npu` was not edited.
+- **Reports:** `/home/hunter/.agents/reports/dragon-npu-aie4-ops-page.md`;
+  plan `.agents/plans/plan-amd-aie4-kmq-pm-series.md`; `RESIDUAL.md`
+  top.
+
+Prior Turn (Wave 2 Q2 Q3 Q4; invent_pass=0):
+- **Named delta:** Wave 2 records the patch 19 `aie2_ops` runtime hooks
+  (`.runtime_resume = aie2_hw_resume`, `.runtime_suspend = aie2_hw_suspend`
+  in `aie2_pci.c`; `amdxdna_pm_runtime_suspend` and
+  `amdxdna_pm_runtime_resume` in `amdxdna_pm.c`). Patch 5 keeps
+  `{ 0x17f0, 0x20, &dev_npu6_info }`. The ops pointer page is missing.
+  V5 08 `npu4_regs.c` does not set `dev_npu6_info.ops`. Do not guess
+  `&aie2_ops`. Q3 cover and V5 08 lines are cited. The V5 15 body and
+  the V5 02 doorbell hunk stay open. Q4 stays open: pull 607373
+  requests tag `drm-misc-next-2026-10-23` for a window. That is not a
+  released mainline tag. No new test. `decide_ran_on_npu` was not
+  edited. invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**;
+  unlock **none** (`2c9c12e8` CONSUMED). Do not mint. Do not reopen
+  CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. A
+  requested drm-misc-next tag is not Pass. The operator still places
+  a residual-matched classic 1688 under
+  `testdata/xdna2_cmd/external_known_good/`.
+- **Who acts next:** smaller offline read is the missing
+  `dev_npu6_info` ops page. Q4 watch signal is a linux tag, or a
+  drm-next tag after `drm-next-2026-10-21`, that contains
+  `drm-misc-next-2026-10-23`. Do **not** ask the operator to re-run
+  `just npu-iron`. Agent does **not** mint. Horizon list stays
+  unrun: HMM wait, `populate_range`, doorbell mmap, runtime PM hooks,
+  `aie2_pm.c` field move, probe, and the recovery procedure
+  (diagnose, bridge reset of `0000:00:08.2`, rescue module).
+- **Gate:** log
+  `call-4f6b0998-5910-4941-afc8-b57ababb657d-21.log`. nproc printed
+  16. `JOBS=8`. `nice` and `PATH` were not printed in that log. Four
+  exits 0, 0, 0, 0. `cargo test --lib` 168 passed, 0 failed, 0
+  ignored. `cargo test --features amd-xdna2 --lib` 737 passed, 0
+  failed, 1 ignored.
+- **Reports:** `/home/hunter/.agents/reports/dragon-npu-aie4-kmq-pm.md`
+  section Wave 2; plan `.agents/plans/plan-amd-aie4-kmq-pm-series.md`;
+  `RESIDUAL.md` top.
+
+Prior Turn (D-AIE4 offline gate green; invent_pass=0):
+- **Named delta:** Offline gate for D-AIE4-1 through D-AIE4-5 is green
+  on the tree that includes the three clippy fixes in
+  `src/backends/mod.rs`. `classify_amd_npu_pci_id` no longer carries
+  `#[must_use]` (the Result is already must-use). The AIE4 device
+  arm is `0x17f1..=0x17f3` at revisions `0x10 | 0x13`.
+  `parse_sysfs_hex_u32` uses `strip_prefix("0x").unwrap_or(trimmed)`.
+  Classification is unchanged: `1022:17f0` rev `0x10` is npu4, rev
+  `0x11` is npu5, rev `0x20` is npu6. AIE4 ids fail closed.
+  invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock
+  **none** (`2c9c12e8` CONSUMED). Do not mint. Do not reopen
+  CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. The
+  series does not cover Strix. A green offline gate is not Pass.
+- **Who acts next:** Q4 stays open: which mainline release carries
+  the 2026-10-21 drm-misc-next. Do not ask the operator to re-run
+  `just npu-iron`. Agent does not mint.
+- **Gate:** `cargo test --lib` EXIT 0 (168 passed, 0 failed, 0
+  ignored). `cargo test --features amd-xdna2 --lib` EXIT 0 (737
+  passed, 0 failed, 1 ignored). Four clippy commands EXIT 0.
+- **Reports:** `/home/hunter/.agents/reports/dragon-npu-aie4-kmq-pm.md`;
+  plan `.agents/plans/plan-amd-aie4-kmq-pm-series.md`; `RESIDUAL.md` top.
+
+Prior Turn (D-AIE4-5 colibri adapter note; invent_pass=0):
+- **Named delta:** **D-AIE4-5 CLOSED.** `docs/COLIBRI_ADAPTER.md`
+  documents optional `npu_generation`. Schema stays 1. The timed-op
+  JSON emitter does not print the field in this delta. A later
+  producer may set `npu6` for this host (`1022:17f0` rev `0x20`) and
+  `npu3` for AIE4 classic `0x17f1`. Colibrì may refuse `npu3`. The
+  field does not set `ran_on_npu`. The colibrì tree was not edited.
+  invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock
+  **none** (`2c9c12e8` CONSUMED). Do not mint. Do not reopen
+  CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. The
+  adapter note is not Pass.
+- **Who acts next:** one offline cargo test and clippy gate for the
+  five deltas. Q4 (which mainline release carries the 2026-10-21
+  drm-misc-next) stays open. Do **not** ask the operator to re-run
+  `just npu-iron`. Agent does **not** mint.
+- **Reports:** `docs/COLIBRI_ADAPTER.md`; plan
+  `.agents/plans/plan-amd-aie4-kmq-pm-series.md`; `RESIDUAL.md` top.
+
+Prior Turn (D-AIE4-4 recovery note; invent_pass=0):
+- **Named delta:** **D-AIE4-4 CLOSED.** `docs/XDNA2_RECOVERY_ENGINEERING.md`
+  now has "AIE4 power management and 17f0 recovery" under the
+  driver-fork roadmap. The 17f0 procedure stays diagnose, bridge reset
+  of `0000:00:08.2`, and the rescue module. V5 19 runtime PM, including
+  the AIE2 hooks to `aie2_hw_suspend` and `aie2_hw_resume`, is power
+  management. The AIE4 job-timeout is a pattern for the open-timeout /
+  killable-wait row. invent_pass=0 not_c_ready=1 not_ran_on_npu=1;
+  Pass=**No**; unlock **none** (`2c9c12e8` CONSUMED). Do not mint. Do
+  not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. A
+  recovery paragraph is not Pass.
+- **Who acts next:** D-AIE4-5 colibri adapter note in
+  `docs/COLIBRI_ADAPTER.md` only. Do **not** ask the operator to
+  re-run `just npu-iron`. Agent does **not** mint. Do not edit the
+  colibri tree.
+- **Reports:** `docs/XDNA2_RECOVERY_ENGINEERING.md`; plan
+  `.agents/plans/plan-amd-aie4-kmq-pm-series.md`; `RESIDUAL.md` top.
+
+Prior Turn (D-AIE4-3 shared-code re-check list; invent_pass=0):
+- **Named delta:** **D-AIE4-3 CLOSED.** Offline read. No device open
+  and no submit. V5 14 HMM wait is uninterruptible and unlimited
+  (`dma_resv_wait_timeout` with `false` and `MAX_SCHEDULE_TIMEOUT`).
+  V5 15 states no functional change for AIE2 on the `populate_range`
+  move. The function body after the signature was truncated on the
+  page read. V5 02 forces an invalid doorbell offset inside
+  `aie4_hwctx_create` and points common `.mmap` at `drm_gem_mmap`.
+  This crate sends `umq_doorbell` on CREATE_HWCTX (default 0) and does
+  not mmap a doorbell BAR. V5 19 hooks `aie2_hw_suspend` and
+  `aie2_hw_resume` as AIE2 runtime PM. V5 08 `aie2_pm.c` is a 10-line
+  field move onto `struct aie_device`. The V5 cover letter that was
+  read has no `drm_mm_init` sentence. Lab alignment stays
+  `mmap_dev_heap_drm_aligned` at `0x4000000`. invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock **none**
+  (`2c9c12e8` CONSUMED). Do not mint. Do not reopen CONSUMED. No
+  sticky ALLOW. Q2: AIE2 runtime PM is in this series. AIE2 KMQ
+  job-timeout was not in the patches opened. Q3 is the re-check list.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. A
+  re-check list is not Pass.
+- **Who acts next:** D-AIE4-4 recovery-doc paragraph. Do **not** ask
+  the operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** plan `.agents/plans/plan-amd-aie4-kmq-pm-series.md`;
+  `RESIDUAL.md` top.
+
+Prior Turn (D-AIE4-1 Strix answer + D-AIE4-2 classification; invent_pass=0):
+- **Named delta:** The series does not cover Strix. Unchanged
+  `{ 0x17f0, 0x20, &dev_npu6_info }` in
+  `drivers/accel/amdxdna/amdxdna_pci_drv.c`. Added
+  `{ PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x17f1) }` maps to
+  `&dev_npu3_classic_info` in `npu3_regs.c`. This host rev `0x20` stays
+  npu6. Rev `0x10` stays npu4. Cover letter: tested on AIE4/NPU3, and
+  "Confirmed no regression on existing AIE2 devices (NPU1/NPU4)."
+  **D-AIE4-2 CLOSED.** Test
+  `backends::tests::classify_amd_npu_pci_id_aie2_rows_and_aie4_fail_closed`
+  EXIT:0 (1 passed, 737 filtered). AIE4 ids fail closed with "AIE4:
+  not supported by this crate's AIE2 cmdlist path". invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock **none**
+  (`2c9c12e8` CONSUMED). Do not mint. Do not reopen CONSUMED. No
+  sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. An id
+  table and a classifier are not Pass.
+- **Who acts next:** D-AIE4-3 shared-code regression list. Do **not**
+  ask the operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** plan `.agents/plans/plan-amd-aie4-kmq-pm-series.md`;
+  `docs/upstream/AIE4_NPU3_PCI_IDS.md`; `RESIDUAL.md` top.
+
+Prior Turn (D-AIE4-1 coverage table; invent_pass=0):
+- **Named delta:** **D-AIE4-1 CLOSED.** Read V5 patch 5
+  ([07943](https://lkml.iu.edu/2610.2/07943.html), accessed 2026-10-23).
+  PCI match list: AMD `0x1502`, `0x17f0`, added `0x17f1`, `0x17f2`,
+  `0x17f3`. Removed unreleased `0x1B0B` and `0x1B0C`. Info rows:
+  `0x17f0` rev `0x10` npu4, rev `0x11` npu5, rev `0x20` npu6. NPU3
+  classic is `0x17f1` revs `0x10` and `0x13` (`dev_npu3_classic_info`,
+  `aie4_classic_ops`). This host `1022:17f0` rev `0x20` is npu6, not
+  NPU3. `0x1502` has no info-struct row in that hunk. Retail SKUs are
+  not in the patch. Note: `docs/upstream/AIE4_NPU3_PCI_IDS.md`.
+  invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock
+  **none** (`2c9c12e8` CONSUMED). Id table ≠ Pass ≠ unlock. Do not
+  mint. Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. An
+  upstream merge is not Pass.
+- **Who acts next:** D-AIE4-2 pure probe classification. Do **not**
+  ask the operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** plan `.agents/plans/plan-amd-aie4-kmq-pm-series.md`;
+  `docs/upstream/AIE4_NPU3_PCI_IDS.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful wave 2 implement loop CLOSED; invent_pass=0):
+- **Named delta:** Implement loop `5dca83c3` CLOSED (effort 3; review
+  rounds 2; re-review 0 open). Wrap stays restored (default `just npu-iron`
+  is run+verify; export is `just npu-iron-export` / `--iron-export`).
+  invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock
+  **none** (`2c9c12e8` CONSUMED). Catalog / wrap / export collect ≠ Pass
+  ≠ unlock. Do not mint. Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. Named
+  wrap ≠ Pass. Do not idle only on a human 1688 file.
+- **Who acts next:** Human residual-matched classic 1688 when held.
+  Agent only on a **new named offline delta**. Do **not** ask the
+  operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** `.agents/reports/impl-useful-wave2-identity.md`;
+  `/tmp/grok-1000/grok-impl-summary-5dca83c3.md`;
+  `/tmp/grok-1000/grok-review-5dca83c3.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful wave 2 review-fix: default wrap restored; invent_pass=0):
+- **Named delta:** Default `just npu-iron` is the run+verify wrap again
+  (no `--aot-dir`). Export is opt-in (`just npu-iron-export` /
+  `--iron-export`). Kind-match `iron_npu2_vector_add` only at 300 B.
+  One allow-list. invent_pass=0 not_c_ready=1 not_ran_on_npu=1;
+  Pass=**No**; unlock **none** (`2c9c12e8` CONSUMED). Catalog ≠ Pass ≠
+  unlock. Do not mint. Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. Named
+  wrap ≠ Pass. Do not idle only on a human 1688 file.
+- **Who acts next:** Human residual-matched classic 1688 when held.
+  Agent only on a **new named offline delta**. Do **not** ask the
+  operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** `.agents/reports/impl-useful-wave2-identity.md`;
+  `/tmp/grok-1000/grok-impl-summary-5dca83c3.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful wave 2 + second identity JOINED; invent_pass=0):
+- **Named delta:** Catalog wave 2 landed (`gelu` `silu` `eltwise_mul`
+  `swiglu` `scale_shift`) plus this-run `--aot-dir` for vector add.
+  Second identity `iron_npu2_vector_add` is not classic 1688.
+  Public 300-byte peel may kind-match that IRON job. Never 1688
+  load-accepted. Agent ran wave-2 recipes + this-run vector add
+  (`ran_on_npu=false`). invent_pass=0 not_c_ready=1 not_ran_on_npu=1;
+  Pass=**No**; unlock **none** (`2c9c12e8` CONSUMED). Catalog ≠ Pass ≠
+  unlock. Do not mint. Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** product Pass still needs live `decide_ran_on_npu`. Named
+  wrap ≠ Pass. Do not idle only on a human 1688 file.
+- **Who acts next:** Human residual-matched classic 1688 when held.
+  Agent only on a **new named offline delta**. Do **not** ask the
+  operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** `.agents/reports/impl-useful-wave2-identity.md`;
+  `/tmp/grok-1000/grok-impl-summary-5dca83c3.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful-npu-commands review-fix; invent_pass=0):
+- **Named delta:** Catalog review-fix. `--iron` skips dummy compile.
+  This-run npy only (basename mention). `shape [256]` is not OFM.
+  Host fixture from crate root. Shell suffixes removed. invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock **none**
+  (`2c9c12e8` CONSUMED). Catalog ≠ Pass ≠ unlock. Do not mint. Do not
+  reopen CONSUMED. No sticky ALLOW.
+- **Wall:** residual-matched / load-accepted classic 1688 still missing
+  for product Pass. Named commands ≠ Pass.
+- **Who acts next:** Human residual-matched classic 1688 when held.
+  Agent only on a **new named offline delta**. Do **not** ask the
+  operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** `/tmp/grok-1000/grok-review-32f40c3e.md`;
+  `/tmp/grok-1000/grok-impl-summary-32f40c3e.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful-npu-commands JOINED; invent_pass=0):
+- **Named delta:** Plan **useful-npu-commands** catalog **landed**.
+  `just npu-relu` / `npu-eltwise` / `npu-softmax` / `npu-iron` and
+  `dragon-npu run --iron NAME` (vector_add, eltwise, relu, softmax).
+  Unknown name fails closed. Parse child numbers when present; `PASS!`
+  alone is empty vec + `child_said_pass`. `--host-graph` is host
+  `evaluate_host_graph` (`[-1, 2]` → `[0.5, 3.5]`). Agent verified
+  relu/eltwise/softmax: `child_said_pass=true`, `ran_on_npu=false`,
+  `invent_pass=0`. invent_pass=0 not_c_ready=1 not_ran_on_npu=1;
+  Pass=**No**; unlock **none** (`2c9c12e8` CONSUMED). Catalog ≠ Pass ≠
+  unlock. Do not mint. Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** residual-matched / load-accepted classic 1688 still missing
+  for product Pass. Named commands ≠ Pass. Next Pass move is still
+  human residual-matched classic 1688.
+- **Who acts next:** Human residual-matched classic 1688 when held.
+  Agent only on a **new named offline delta**. Do **not** ask the
+  operator to re-run `just npu-iron`. Agent does **not** mint.
+- **Reports:** `.agents/reports/impl-useful-commands-catalog.md`; plan
+  `.agents/plans/plan-useful-npu-commands.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful-npu-commands pin; invent_pass=0):
+- **Named delta (docs/residual only):** Plan **useful-npu-commands**
+  APPROVED. Named IRON catalog + host-graph CLI. Not a Pass plan. Do
+  **not** ask the operator to re-run `just npu-iron`. invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock **none**
+  (`2c9c12e8` CONSUMED). Catalog ≠ Pass ≠ unlock. Do not mint. Do not
+  reopen CONSUMED. No sticky ALLOW.
+- **Wall:** residual-matched / load-accepted classic 1688 still missing
+  for product Pass. Named commands ≠ Pass.
+- **Who acts next:** Agent catalog / parse / `--host-graph` / verify.
+  Human residual-matched classic 1688 when held. Agent does **not** mint.
+- **Reports:** `.agents/plans/plan-useful-npu-commands.md`; `RESIDUAL.md`
+  top.
+
+Prior Turn (useful-npu-accel S0–S5 JOINED; invent_pass=0):
+- **Named delta (docs/residual only):** Dual-track **useful-npu-accel**
+  **S0–S5 JOINED.** Useful-soon shipped: opt-in external-runner + host
+  linear demo. IRON child PASS is **not** product `ran_on_npu`. Residual
+  still `wait_cmd_einval`; S3 ranked out-fence lookup first;
+  `live_justified=0`; diagnostic ≠ unlock. Same-shot proven under
+  **`C_UNLOCK=2c9c12e8` CONSUMED**; next product live only under **new**
+  unlock + **new** named reason. S5: NPU ran this week via IRON
+  eltwise/relu/softmax; eepy still CPU; not product Pass. invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1; Pass=**No**; unlock **none**
+  (`2c9c12e8` CONSUMED). Freeze empty same-shot reconfirm. Do not mint.
+  Do not reopen CONSUMED. No sticky ALLOW.
+- **Wall:** residual-matched / load-accepted material still missing for
+  product Pass. Useful-soon wrap ≠ Pass.
+- **Who acts next:** Human residual-matched / load-accepted classic 1688
+  when held. Agent only on a **new named offline delta**. Operator may run
+  `dragon-npu --external-runner` without a product unlock. Agent does
+  **not** mint.
+- **Reports:** `.agents/reports/impl-useful-accel-s4-join.md`; plan
+  `.agents/plans/plan-useful-npu-accel.md`; `RESIDUAL.md` top.
+
+Prior Turn (useful-npu-accel S0 pin; invent_pass=0):
+- **Named delta (docs/residual only):** Plan **useful-npu-accel** APPROVED.
+  Dual track: (1) useful-soon opt-in external-runner wrap of stacks that
+  already run (IRON first; never launder `ran_on_npu`); (2) pure-direct
+  residual still `wait_cmd_einval`; same-shot proven under
+  **`C_UNLOCK=2c9c12e8` CONSUMED**; next product live only under **new**
+  unlock + **new** named reason. invent_pass=0 not_c_ready=1
+  not_ran_on_npu=1; Pass=**No**; unlock **none** (`2c9c12e8` CONSUMED).
+  IRON PASS and eepy CPU smoke are **not** product `ran_on_npu`. Freeze
+  empty same-shot reconfirm. Do not mint. Do not reopen CONSUMED. No sticky
+  ALLOW. This plan is **not** a mint.
+- **Operator add-on:** S5 is **agent-try**, not parked human-only.
+- **Wall:** residual-matched / load-accepted material still missing for
+  product Pass. Useful-soon wrap ≠ Pass.
+- **Who acts next:** Agent S1 ∥ S2 ∥ S3 then S4 join; S5 agent-try. Human
+  residual-matched / load-accepted classic 1688 when held. Agent does **not**
+  mint.
+- **Reports:** `.agents/reports/impl-useful-accel-s0-pin.md`; plan
+  `.agents/plans/plan-useful-npu-accel.md`; `RESIDUAL.md` top.
+
+Prior Turn (O1 post-fail ERT / Cmd BO dump; invent_pass=0):
+- **Named offline delta:** Plan option1 **P5** pure post-fail ERT observability
+  landed. Soft always invent_pass=0. Product: WAIT Err →
+  `ert_post_fail=present|unread`; pre-EXEC cmd_bo_* → `expected_absent`.
+  Residual still `wait_cmd_einval`; Pass=**No**; unlock **none**
+  (`2c9c12e8` CONSUMED). Freeze empty same-shot reconfirm; do not reopen
+  CONSUMED. No mint.
+- **Wall:** residual-matched / load-accepted material still missing. Post-fail
+  ERT dump ≠ Pass ≠ residual match.
+- **Who acts next:** human material / private stack, or agent only on **new
+  named offline delta**.
+- **Reports:** `.agents/reports/impl-o1-post-fail-ert.md`; `RESIDUAL.md` top.
+
+Prior Turn (option1-after-same-shot P0–P2 join; invent_pass=0):
+- **Named delta:** Plan **option1-after-same-shot** offline **P0–P2 JOINED**.
+  P1-A material **no**; P1-B wait theory **no** → **live_justified=no**.
+  **No mint. No P3/P4.** Residual still `wait_cmd_einval`; Pass=**No**;
+  invent_pass=0; unlock **none** (`2c9c12e8` CONSUMED). Freeze empty same-shot
+  reconfirm; do not reopen CONSUMED.
+- **Wall:** residual-matched / load-accepted material still missing; wait-path
+  = observability only.
+- **Who acts next:** human material / private stack, or agent only on **new
+  named offline delta**.
+- **Reports:** `.agents/reports/impl-o1-p2-join.md`; `RESIDUAL.md` top.
+
+Prior Turn (option1-after-same-shot P0 honesty pin; invent_pass=0):
+- **Named delta:** Plan APPROVED; same-shot proven under `2c9c12e8` CONSUMED;
+  next was P1-A ∥ P1-B → P2 (now closed above with live_justified=no).
+- **Reports:** `.agents/reports/impl-o1-p0-honesty-pin.md`.
+
+Prior Turn (S4–S5 closeout — live-shot-effective Arm A; invent_pass=0):
+- **Named delta:** One product Arm A stock live under **`C_UNLOCK=2c9c12e8`
+  CONSUMED**. last_apply `/tmp/dragon_npu_last_apply_live_eff_2c9c12e8.json`;
+  status=`wait_cmd_einval`; `ran_on_npu=false`; `real_ioctl=true`; total_s≈0.165;
+  **same_shot=1** paddrs_valid=1 source=in_process_bo_map; config_cu absent.
+  invent_pass=0; Pass=**No**. Named reason closed by shot.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Same-shot
+  measured ≠ Pass. Do not reopen `2c9c12e8` or prior CONSUMED. No sticky ALLOW.
+  No empty same-shot reconfirm.
+- **Primary wall:** residual-matched / load-accepted material for ERT Completed
+  + OFM allclose. Next live only under **new** unlock + **new** named reason.
+- **Reports:** `.agents/reports/impl-live-shot-effective-s4-s5.md`;
+  `.agents/reports/live-shot-2c9c12e8.md`; `RESIDUAL.md` top.
+
+Prior Turn (S4 mint — live-shot-effective Arm A; invent_pass=0):
+- **Named delta:** Prep S0–S3 **GREEN**. Host-minted **`C_UNLOCK=2c9c12e8`**
+  (now CONSUMED by closeout above). Named reason: “One product matmul with
+  same-run address patching; measure Pass only by device complete + output
+  match.” Arm A skip CONFIG_CU; SAME_SHOT=1.
+- **Reports:** plan `.agents/plans/plan-live-shot-effective.md`;
+  prep `.agents/reports/impl-live-shot-effective-s0-s3.md`.
+
+Prior Turn (live-shot-effective S0–S3 prep — plan APPROVED; invent_pass=0):
+- **Named delta:** Plan **live-shot-effective** APPROVED. S0–S3 prep: residual
+  pin; kit + `lab_exec_once` export/forward `XDNA2_LAB_SAME_SHOT_RELA` (Arm A
+  default); louder `same_shot_gate` / `same_shot=` last_apply tokens; offline
+  preflight. Named live reason used for S4 mint above. invent_pass=0; Pass=**No**;
+  unlock was none at prep close; first was **`4008e6fd` CONSUMED**.
+- **Honesty:** prep ≠ Pass ≠ unlock. Soft checklist ≠ unlock. No invent Pass.
+- **Reports:** `.agents/reports/impl-live-shot-effective-s0-s3.md`.
+
+Prior Turn (W10 join closeout — same-shot wire + soft; invent_pass=0):
+- **Named delta:** Campaign **W10 JOINED**. W10-B: same-shot offline wire
+  **ready=yes** (`XDNA2_LAB_SAME_SHOT_RELA` + plan APIs; no disk UVAs in
+  product rela). W10-soft: L1b readiness lines on soft classify;
+  **`l1b_live_justified=0`**. **Live L1b not run** (no mint). invent_pass=0;
+  Pass=**No**; unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**.
+  Public AOT frozen; stale UVAs **forbidden** for product live.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Offline
+  same-shot wire ≠ residual match ≠ load-accepted. Soft checklist ≠ unlock.
+  No invent Pass.
+- **Primary wall:** justified live L1b under same-shot + **new** unlock +
+  named reason, and/or Bridge A post-patch / load-accepted material.
+- **Who acts next:** Idle empty reconfirm. Next = justified L1b live under
+  **new** unlock **or** Bridge A material — plan
+  `.agents/plans/plan-silicon-try-everything.md`.
+- **Reports:** `.agents/reports/wave10-join.md`;
+  `.agents/reports/wave10-b-same-shot.md`;
+  `.agents/reports/wave10-soft-classify.md`; `RESIDUAL.md` top.
+
+Prior Turn (W10 S0 — plan pin + same-shot L1b path; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W9 closed** (L1b-prep
+  offline; intercept done; live not justified; no mint). Campaign **W10
+  APPROVED:** same-shot L1b product path (**W10-B**) + optional soft-wire
+  (**W10-soft**); **W10-join**. Plan mirrored to
+  `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0; Pass=**No**;
+  unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not mint**
+  from this pin alone. Public AOT frozen; stale UVAs **forbidden** for product
+  live; no unlock from plan alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Plan
+  approve ≠ Pass. Mirror ≠ unlock. Offline paddrs ≠ same-shot ≠ L1b live. No
+  live from this pin alone. No invent Pass.
+- **Primary wall:** same-shot live-mapped rela (Bridge B), and/or true
+  post-patch / load-accepted material. **Live L1b only if** same-shot path
+  offline-green + **new** unlock + named reason.
+- **Reports:** `.agents/reports/impl-w10-s0-pin-mirror.md`; plan
+  `.agents/plans/plan-silicon-try-everything.md`; `RESIDUAL.md` top.
+
+Prior Turn (W9 join closeout — L1b-prep + intercept; invent_pass=0):
+- **Named delta:** Campaign **W9 JOINED**. W9-B: paddrs on disk → offline
+  `paddr_evidence_ready=1` / `l1b_offline_ready=1`; **`l1b_live_justified=0`**
+  (host UVAs age out; must not drive product live patch). W9-A: no residual-
+  matched post-patch classic 1688; siblings = unpatched other M/K/N only.
+  **Live L1b not run** (no mint). invent_pass=0; Pass=**No**; unlock **none**;
+  first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Public AOT frozen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Offline
+  paddr evidence ≠ live L1b. Stale UVAs ≠ same-shot map. Sibling shapes ≠
+  residual match. No invent Pass.
+- **Primary wall:** true post-patch / load-accepted material + same-shot paddrs
+  if L1b ever justified under **new** unlock + named reason.
+- **Reports:** `.agents/reports/wave9-join.md`;
+  `.agents/reports/wave9-b-l1b-prep.md`;
+  `.agents/reports/wave9-a-bridge-a.md`; `RESIDUAL.md` top.
+
+Prior Turn (W9 S0 — plan pin + W9 tracks; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W8 closed** (unpatched oracle
+  + INSTR_BO_LIMIT; paddr wire landed; L1b not ready; no live). Campaign **W9
+  APPROVED:** **W9-B** L1b-prep + T3 readiness; **W9-A** intercept/sibling;
+  **W9-join**. Plan mirrored to
+  `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0; Pass=**No**;
+  unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not mint**
+  from this pin alone. Public AOT frozen; no unlock from plan alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Plan
+  approve ≠ Pass. Mirror ≠ unlock. Offline paddr wire ≠ L1b. No live from this
+  pin alone. No invent Pass.
+- **Primary wall:** true post-patch / load-accepted material, and/or live
+  device paddrs. **Live L1b only if** W9-B finds live paddrs + **new** unlock
+  + named reason.
+- **Reports:** `.agents/reports/impl-w9-s0-pin-mirror.md`; plan
+  `.agents/plans/plan-silicon-try-everything.md`; `RESIDUAL.md` top.
+
+Prior Turn (W8 join closeout — Material + Paddr; invent_pass=0):
+- **Named delta:** Campaign **W8 JOINED**. Material: re-capture still oracle
+  unpatched **`3c5ffca750922d3b`**; INSTR_BO_LIMIT proven; multi 32208 refuse;
+  A5 L3 sudo password wall; residual_matched=0; load_accepted=0. Paddr: O3+M3
+  pure TDD landed; `l1b_offline_ready=0`. **Live not justified** (no mint).
+  invent_pass=0; Pass=**No**; unlock **none**; first `C_UNLOCK=` =
+  **`4008e6fd` CONSUMED**. Public AOT frozen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Unpatched
+  CLASS A ≠ residual match. Offline paddr wire ≠ L1b. No live from this pin.
+  No invent Pass.
+- **Primary wall:** true post-patch / load-accepted completing-stack material.
+  **L1b only after** live paddrs + **new** unlock + named reason.
+- **Reports:** `.agents/reports/wave8-join.md`;
+  `.agents/reports/wave8-material-track.md`;
+  `.agents/reports/wave8-paddr-track.md`; `RESIDUAL.md` top.
+
+Prior Turn (W8 S0 — plan pin + mirror; Track Material + Track Paddr; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W7 closed** (unpatched classic
+  re-land; true post-patch missing; no live). Campaign **W8 APPROVED:** parallel
+  Track Material (M1/M4/A5) + Track Paddr (O3/M3). Plan mirrored to
+  `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0; Pass=**No**;
+  unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not mint**
+  from this pin alone. No empty reconfirm; public AOT frozen; no unlock from
+  plan alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Plan
+  approve ≠ Pass. Mirror ≠ unlock. Unpatched CLASS A ≠ residual match. No live
+  from this pin alone.
+- **Primary wall:** true post-patch classic 1688 and/or live-mapped rela paddrs
+  (M3). Next: W8 Material + Paddr tracks in parallel.
+- **Reports:** `.agents/reports/impl-w8-s0-pin-mirror.md`; plan
+  `.agents/plans/plan-silicon-try-everything.md`; `RESIDUAL.md` top.
+
+Prior Turn (W7 join closeout — unpatched classic re-land; invent_pass=0):
+- **Named delta:** Campaign **W7 joined** (W7-0…W7-6). Capture-instr re-landed
+  classic **1688** primary unpatched sha16 **`3c5ffca750922d3b`** (oracle match).
+  Collect refuse; residual_matched=0; load_accepted=0. W7-3/W7-4 offline green.
+  **W7-5 live not justified** (no mint). invent_pass=0; Pass=**No**; unlock
+  **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Public AOT frozen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Unpatched
+  CLASS A ≠ C-ready ≠ residual match. No live from this pin. No invent Pass.
+- **Primary wall:** true post-patch / load-accepted completing-stack material.
+  Agent tried capture without parking on bag-drop; human only for sudo L3 /
+  true load-accepted ERT+OFM path.
+- **Reports:** `.agents/reports/wave7-join.md`;
+  `.agents/reports/wave7-capture-instr-attempt.md`; `RESIDUAL.md` top.
+
+Prior Turn (W7 S0 — agent-max residual close pin + plan mirror; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W6 closed** (distance +
+  hunt; residual_matched_claim=0; L1 not from W6 alone). Campaign **W7
+  agent-max residual close APPROVED.** Agent owns capture-instr / L3 sandwich
+  / ingest / unlock / live until proven human-only wall. **Do not** park on
+  operator bag-drop by default. Public AOT re-run frozen. Plan mirrored to
+  `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0; Pass=**No**;
+  unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not
+  mint** from this pin alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Plan
+  approve ≠ Pass. Mirror ≠ unlock. W6 ≠ residual match. No live from this pin.
+- **Primary wall:** completing-stack classic 1688 / residual-shaped peel.
+  Next: **W7-1** agent capture-instr (classic prefer) → score → live only with
+  **new** unlock + named reason.
+- **Reports:** `.agents/reports/impl-w7-s0-pin-mirror.md`; plan
+  `.agents/plans/plan-silicon-try-everything.md`; `RESIDUAL.md` top.
+
+Prior Turn (W6 S0 — residual identity pin + plan mirror; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W5 closed** (Path B IRON
+  ×4 public npu2 AOT **PASS!** on FW **1.1.2.64**; residual_matched_claim=0).
+  Campaign **W6 residual identity APPROVED.** Residual identity primary;
+  freeze public AOT re-run. Plan mirrored to
+  `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0; Pass=**No**;
+  unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not
+  mint** from this pin alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. IRON
+  PASS ≠ product decide_ran_on_npu ≠ residual match. Plan approve ≠ Pass.
+  Mirror ≠ unlock. No live dragon-npu apply.
+- **Primary wall:** residual-matched / product load-accepted material for lab
+  classic 1688. Next: **W6-1** distance + **W6-2** non-public material hunt
+  (parallel). Not re-run public AOT.
+- **Reports:** `.agents/reports/impl-w6-s0-pin-mirror.md`; plan
+  `.agents/plans/plan-silicon-try-everything.md`; `RESIDUAL.md` top.
+
+Prior Turn (W5 join amend — vector + matmul Path B all PASS; invent_pass=0):
+- **Named delta:** Path B IRON on FW **1.1.2.64** completed **all four** public
+  mlir-aie npu2 AOT peels: vector **300** `aaeb5b68cc298a45`, single_core
+  **660** `de8671245bb72436`, whole_array **2592** `7ee4b267ce31cd70`, cascade
+  **4512** `18cb653c05a9d4c8` — all **PASS!**; all `research_duplicate_sha16`;
+  `completed_on_this_fw=yes`; load_accepted_claim=0; residual_matched_claim=0
+  for lab classic 1688. invent_pass=0; Pass=**No**; unlock **none**; first
+  `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not mint**.
+- **Honesty:** IRON PASS ≠ product decide_ran_on_npu ≠ residual match ≠
+  load-accepted re-tag. No live dragon-npu apply.
+- **Primary wall:** residual-matched / product load-accepted material still
+  open. Next residual-useful path: non-public DD/XRT post-patch ctrltext or
+  intercept peels matching residual identity — **not** re-run public AOT.
+- **Reports:** `.agents/reports/wave5-join.md`;
+  `.agents/reports/wave5-join-matmul-amend.md`;
+  `.agents/reports/wave5-path-b-matmul-attempt.md`; `RESIDUAL.md` top.
+
+Prior Turn (W5 agent host-scan + Path B IRON PASS; invent_pass=0):
+- **Named delta:** Operator deferred bag-drop to agent. Host scan + Path B/C
+  attempt. Path B IRON `vector_scalar_add` **PASS!** on NPU (need system
+  `pyxrt` on `PYTHONPATH`). Ctrltext still 300 B sha16 `aaeb5b68cc298a45`
+  (helpers refuse product load_accepted re-tag). invent_pass=0; Pass=**No**;
+  load_accepted_claim=0; residual_matched_claim=0; unlock **none**; first
+  `C_UNLOCK=` = **`4008e6fd` CONSUMED**. Do **not mint**. Superseded for Path B
+  completeness by Latest Turn matmul amend (all four peels).
+- **Honesty:** IRON PASS ≠ product decide_ran_on_npu ≠ residual match to lab
+  classic 1688. No invent load-accepted. No live dragon-npu apply.
+- **Primary wall:** residual-matched / product load-accepted material still
+  open (scalar-add peel ≠ lab classic identity).
+- **Reports:** `.agents/reports/wave5-host-scan-agent.md`;
+  `.agents/reports/path-b-vector-scalar-add-npu2-pass-20260811.log`;
+  `RESIDUAL.md` top.
+
+Prior Turn (W5-5/6/7 path docs + status helper; invent_pass=0):
+- **Named offline delta (docs/tools only):** Load-accepted Paths **B**
+  (mlir-aie/IRON completed NPU run), **C** (`xrt-smi` health ≠ Pass), **A**
+  (FastFlowLM/Lemonade **absent**, operator install only). Page:
+  `docs/LOAD_ACCEPTED_CAPTURE.md`. Extended `docs/CAPTURE_MATERIAL_MLIR_AIE.md`
+  §3b; refuse re-tag public AOT 300/660/2592/4512. Helper:
+  `bash tools/load_accepted_path_status.sh`. invent_pass=0; Pass=**No**;
+  unlock **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**.
+- **Honesty:** AOT ≠ load-accepted; validate ≠ Pass; FLM absent; no network
+  install; no live apply; no invent bins.
+- **Primary wall:** Operator completed-on-FW capture into
+  `testdata/xdna2_cmd/external_known_good/`. Research peels do not count.
+- **Unlock:** **none active.** Do **not mint**. Do not reopen `4008e6fd`.
+- **Reports:** `.agents/reports/impl-w5-path-docs.md`; `RESIDUAL.md` top.
+
+Prior Turn (W5 plan approved — S0 pin + plan mirror; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W5 load-accepted capture
+  automation APPROVED.** W4 offline complete; W5 capture automation next. Plan
+  mirrored to `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0;
+  Pass=**No**; active unlock=**none**; first `C_UNLOCK=` = **`4008e6fd`
+  CONSUMED**. Do **not mint** from this pin alone.
+- **Primary wall:** Operator load-accepted capture into
+  `testdata/xdna2_cmd/external_known_good/` (or path + `--ingest`). Public
+  mlir-aie peels research-only; multi-txn refused.
+- **Agent next (offline only):** host scan / extract / PROVENANCE template /
+  Path B/C/A checklists. No re-live CONSUMED; no empty reconfirm; no invent Pass
+  / residual match; no sticky ALLOW.
+- **Unlock:** **none active.** Do **not mint**. Do not reopen `4008e6fd` or
+  prior CONSUMED list.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`;
+  not_ran_on_npu=1; not_c_ready=1. Plan approve ≠ Pass. Mirror ≠ unlock.
+- **Reports:** `.agents/reports/impl-w5-s0-pin-mirror.md`; plan
+  `.agents/plans/plan-silicon-try-everything.md`; `RESIDUAL.md` top.
+
+Prior Turn (W4 join — offline complete; invent_pass=0):
+- **Named offline delta:** Campaign **W4a/b/c offline complete.** Host
+  inventory, scorecards, journal scrape, syncobj pack+wire, bag discovery
+  (residual_matched_claim=0 all rows; multi-txn 32208 refused). Join:
+  `.agents/reports/wave4-join.md`. invent_pass=0; Pass=**No**; active unlock=
+  **none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**.
+- **L8:** **Not run.** Offline pack+wire green; **live L8 not justified** from
+  wire alone. Do **not mint** unlock this pin. If later justified (new reason +
+  new unlock): skip-CU + `XDNA2_LAB_WAIT_VIA_SYNCOBJ=1` (design only).
+- **Operator one ask still valid:** load-accepted capture into
+  `testdata/xdna2_cmd/external_known_good/` (or path + `--ingest`). Public
+  mlir-aie peels research-only; multi-txn refused.
+- **Who acts next (primary):** **Operator material.** Agent W4 offline done.
+- **Unlock:** **none active.** Do **not mint**. Do not reopen `4008e6fd` or
+  prior CONSUMED list.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Offline
+  tools ≠ Pass. Syncobj wire ≠ Pass. Freeze re-live CONSUMED / spent flexml /
+  invent Pass / sticky ALLOW / empty reconfirm.
+- **Reports:** `.agents/reports/wave4-join.md`, `wave4-*.md`,
+  `impl-s0-w4-pin-mirror.md`; `RESIDUAL.md` top.
+
+Prior Turn (W4 campaign pin + plan mirror S0; invent_pass=0):
+- **Named delta (docs/residual only):** Campaign **W4 agent-max residual
+  resolve APPROVED**. Plan mirrored to
+  `.agents/plans/plan-silicon-try-everything.md`. invent_pass=0; Pass=**No**;
+  active unlock=**none**; first `C_UNLOCK=` = **`4008e6fd` CONSUMED**.
+- **Agent offline next (W4a, no unlock):** host inventory, scorecards, journal
+  tools, syncobj pack/unit tests. No re-live CONSUMED; no empty reconfirm; no
+  invent Pass / residual match; no sticky ALLOW.
+- **Operator one ask:** load-accepted capture into
+  `testdata/xdna2_cmd/external_known_good/` (or path + `--ingest`). Public
+  mlir-aie peels (300 / 660 / 2592 / cascade 4512) are **research-only** and
+  **do not count** as load-accepted.
+- **Unlock:** **none active.** Do **not mint** this pin. Do not reopen
+  `4008e6fd` or prior CONSUMED list.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Plan
+  approve ≠ Pass. Mirror ≠ unlock.
+- **Reports after wave:** `.agents/reports/wave4-*.md`; S0 closeout
+  `.agents/reports/impl-s0-w4-pin-mirror.md`; `RESIDUAL.md` top.
+
+Prior Turn (W3 S7 cascade closeout; invent_pass=0):
+- **Named offline delta:** cascade public mlir-aie npu2 AOT **landed** under
+  `testdata/xdna2_cmd/external_known_good/` (ctrltext **4512 B** sha16
+  `18cb653c05a9d4c8` + insts/elf/pdi/xclbin siblings). RESEARCH ONLY;
+  size-class **`other`** (not small-public ≤1024, not lab classic 1688);
+  residual_matched_claim=0; **not** Pass. Offline classify via
+  `classify_instruction_blob` / classic walk: **ClassicTxnV01** START_NPU/txn
+  (v0.1, gen4, 8×6, NumOps **116**, size 4512); aiebu ELF =
+  `Aie2ElfCtrltext` with inner classic. Unit soft-skip:
+  `optional_cascade_public_aot_classifies_if_present`. **L7 live (skip-CU +
+  cascade as instruction) not justified** — no unlock mint; experiment would
+  only re-prove `wait_cmd_einval` with residual-mismatched body.
+- **Unlock:** **none active.** First `C_UNLOCK=` = **`4008e6fd` CONSUMED**
+  (do not reopen). Prior: `48da6e60`, `1f761bf4`, `efd44f35`, `8352882b`,
+  `2ae69036`, `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119` CONSUMED.
+  **Do not mint** from cascade alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`.
+  Cascade land ≠ residual match ≠ Pass. Classic walk ≠ load-accepted.
+- **Who acts next:** **highest** = working-stack residual-matched /
+  load-accepted peel. Cascade = optional research material only. Live queue:
+  L1 blocked; L4 not open; L5/L5b closed; **L7 no**; L8 needs syncobj wire
+  under new unlock only if more offline justifies. Freeze CONSUMED re-live /
+  spent flexml / invent Pass.
+- **Reports:** `.agents/reports/wave3-s7-cascade-closeout.md`,
+  `.agents/reports/wave3-cascade-aot-attempt.md`,
+  `.agents/reports/wave3-join.md`, `RESIDUAL.md` top.
+
+Prior Turn (W3 offline join O12; invent_pass=0):
+- **Named offline delta:** W3 join closed. Pure syncobj wait decision helpers
+  landed offline (`should_wait_via_syncobj` / `select_wait_completion_path` /
+  `pack_syncobj_timeline_wait_args`) — **not live-wired**; ≠ Pass ≠ unlock.
+  Material hunt: cascade AOT not built (superseded: landed S7); FastFlowLM/
+  Lemonade absent; public AOT research only (still highest Pass gap). L5b soft
+  classify: `wait_cmd_einval` + Dev DBG_BUF ok; not Pass. **4** non-flexml
+  unspent PDI listed; **L4 not** open from scan alone. invent_pass=0; Pass=**No**.
+- **Unlock:** **none active.** First `C_UNLOCK=` = **`4008e6fd` CONSUMED**
+  (do not reopen). Prior: `48da6e60`, `1f761bf4`, `efd44f35`, `8352882b`,
+  `2ae69036`, `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119` CONSUMED.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`.
+  Syncobj pure ≠ Pass. Unspent list ≠ L4. Material still highest gap.
+- **Live queue:** L1 blocked; L4 not open from unspent alone; L5/L5b closed;
+  L8 needs live syncobj wire first under **new** unlock after more offline if
+  justified. Freeze re-live CONSUMED / spent flexml / invent Pass.
+- **Reports:** `.agents/reports/wave3-join.md`,
+  `.agents/reports/wave3-syncobj-wait-offline.md`,
+  `.agents/reports/wave3-material-hunt.md`,
+  `.agents/reports/wave3-l5b-classify.md`,
+  `.agents/reports/wave3-unspent-pdi.md`, `RESIDUAL.md` top.
+
+Prior Turn (W2 L5b live research debug-BO **Dev** `4008e6fd` CONSUMED; invent_pass=0):
+- **Live evidence:** stock skip-CONFIG_CU + `XDNA2_LAB_RESEARCH_DEBUG_BO=1`
+  under `4008e6fd`; last_apply `/tmp/dragon_npu_last_apply_config_cu_821691.json`;
+  status=`wait_cmd_einval`; DBG_BUF Assign **ok** bo=2 size=4096 **Dev**
+  `attempt_ok=1` `debug_bo_ty=dev`; then WAIT EINVAL (hwctx=1 seq=1
+  timeout_ms=5000); `real_ioctl=true`; `ran_on_npu=false`; total_s≈0.20;
+  invent_pass=0. No new journal `Get bo failed` in shot window.
+- **Unlock:** **`C_UNLOCK=4008e6fd` CONSUMED** (do not reopen). Prior:
+  `48da6e60`, `1f761bf4`, `efd44f35`, `8352882b`, `2ae69036`, `97f38307`,
+  `11bc9016`, `3a70fabf`, `b17b0119` CONSUMED.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`.
+  Dev Assign ok ≠ Pass. wait_cmd_einval ≠ Pass. Unlock ≠ Pass.
+- **Next:** residual-matched / load-accepted material first. Freeze re-live
+  Shmem under CONSUMED `48da6e60`, reopen `4008e6fd`, spent flexml, invent Pass.
+- **Reports:** `.agents/reports/live-shot-4008e6fd.md`,
+  `.agents/reports/impl-l5b-debug-bo-dev-closeout.md`, `RESIDUAL.md` top.
+
+Prior Turn (W2 L5 live research debug-BO Shmem `48da6e60` CONSUMED; invent_pass=0):
+- **Live evidence:** stock skip-CONFIG_CU + `XDNA2_LAB_RESEARCH_DEBUG_BO=1`
+  under `48da6e60`; last_apply `/tmp/dragon_npu_last_apply_config_cu_343412.json`;
+  status=`debug_bo_failed`; Assign DBG_BUF **EINVAL** bo=2 size=4096 Shmem;
+  journal `aie2_hwctx_cfg_debug_bo: Get bo 2 failed`; fail-closed **before**
+  EXEC; `real_ioctl=true`; `ran_on_npu=false`; total_s≈0.17; invent_pass=0.
+  Superseded for type: offline Dev fix + L5b live verify above.
+- **Unlock:** **`C_UNLOCK=48da6e60` CONSUMED** (do not reopen).
+- **Reports:** `.agents/reports/live-shot-48da6e60.md`,
+  `.agents/reports/impl-l5-debug-bo-live-closeout.md`,
+  `.agents/reports/wave2-debug-bo-type-fix.md`.
+
+Prior Turn (campaign try-everything W0+W1 offline status pin; invent_pass=0):
+- **Named offline delta (docs/residual only):** W0 fan-out + W1 O2/O5/material
+  + debug-BO research gate/trait offline closed. invent_pass=0; Pass=**No**;
+  unlock **none** (`1f761bf4` CONSUMED). Live queue was L1–L4 blocked; L5 then
+  in flight (closed above as `48da6e60`). Highest remaining: working-stack
+  residual-matched / load-accepted material.
+- **Unlock:** **`C_UNLOCK=1f761bf4` CONSUMED** (do not reopen).
+  Prior: `efd44f35`, `8352882b`, `2ae69036`, `97f38307`, `11bc9016`,
+  `3a70fabf`, `b17b0119` CONSUMED.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. O2 /
+  aiebu / public AOT / debug-BO research wire ≠ Pass.
+- **Reports:** `.agents/reports/campaign-try-everything-w1-status.md`,
+  `.agents/reports/wave0-join.md`, `.agents/reports/wave1-join.md`,
+  `RESIDUAL.md` top.
+
+Prior Turn (offline WAIT EINVAL dig + material inventory `49feb5d2`; invent_pass=0):
+- **Named offline delta:** pure `WaitCmdEinvalAxes` /
+  `parse_wait_cmd_einval_axes` / `format_wait_cmd_einval_axes_note` +
+  `MaterialResidualMatchKind` / `classify_material_residual_match` /
+  `format_material_residual_match_note` /
+  `format_material_residual_match_checklist` in `silicon_contract.rs` (re-exports
+  on amd-xdna2). Fixture TDD: skip-CU last_apply shape (hwctx=1 seq=0
+  timeout_ms=5000 request=0xc0106449 Invalid argument; config_cu absent; lab
+  classic 1688 + aiebu+rela). Soft always invent_pass=0 not_c_ready=1
+  not_ran_on_npu=1 axes_alone_not_pass=1 hypothesis_not_proven_root=1.
+  Material: public-npu2-small = RESEARCH ONLY; load-accepted criteria require
+  live ERT Completed + OFM allclose via `decide_ran_on_npu` (never offline claim).
+- **Unlock:** **`C_UNLOCK=1f761bf4` CONSUMED** (do not reopen; **no mint** this
+  slice). Prior: `efd44f35`, `8352882b`, `2ae69036`, `97f38307`, `11bc9016`,
+  `3a70fabf`, `b17b0119` CONSUMED.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Axes ≠
+  Pass. Inventory ≠ Pass. Public AOT ≠ residual identity. Skip-CU live ≠ Pass.
+- **Next:** load-accepted / residual-matched material; next live only under
+  **new** unlock + new named reason. Freeze skip-CU reconfirm under CONSUMED,
+  spent flexml re-live, invent Pass, sticky ALLOW.
+- **Reports:** `.agents/reports/impl-offline-wait-einval-material-49feb5d2.md`,
+  `.agents/reports/live-shot-1f761bf4.md`, `RESIDUAL.md` top.
+
+Prior Turn (live closeout — skip-CONFIG_CU isolation `1f761bf4` CONSUMED; invent_pass=0):
+- **Live evidence:** stock **skip-CONFIG_CU** under `1f761bf4`; last_apply
+  `/tmp/dragon_npu_last_apply_config_cu_4080903.json`; status=`wait_cmd_einval`;
+  **`config_cu_present=0`** (no PDI overlay); `real_ioctl=true`;
+  `ran_on_npu=false`; total_s≈**0.17** (vs ~62s CONFIG_CU attach shots);
+  journal **no** IO_PAGE_FAULT / **no** `aie2_set_cmd_timeout` in shot window.
+  Isolation: EXEC residual **persists without overlay**; overlay not sole root.
+  invent_pass=0.
+- **Unlock:** **`C_UNLOCK=1f761bf4` CONSUMED** (do not reopen). Prior:
+  `efd44f35`, `8352882b`, `2ae69036`, `97f38307`, `11bc9016`, `3a70fabf`,
+  `b17b0119` CONSUMED. Do **not** re-live skip-CU under same unlock.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Skip-CU
+  live ≠ Pass. Attach ≠ Pass. No sticky ALLOW. No re-live spent flexml.
+- **Next then:** load-accepted material + offline WAIT dig (landed above as
+  `49feb5d2` tools). Freeze empty reconfirm of skip-CU.
+- **Reports:** `.agents/reports/live-shot-1f761bf4.md`,
+  `.agents/reports/impl-t-skip-cu-1f761bf4-closeout.md`, `RESIDUAL.md` top.
+
+Prior Turn (Phase 3 mint — skip-CONFIG_CU isolation; unlock was active `1f761bf4`; now CONSUMED by closeout above; invent_pass=0):
+- **Historical mint only:** host-minted **`C_UNLOCK=1f761bf4`** then one-shot
+  live; **superseded** by Latest Turn closeout (**CONSUMED**). Named offline
+  reason was skip-CONFIG_CU isolation after orphan map audit + three spent
+  flexml CONFIG_CU attach shots. Join:
+  `.agents/reports/impl-next-p2-join-pick-skip-cu.md`.
+- **Do not treat this block as active unlock.** Current first `C_UNLOCK=` is
+  CONSUMED in `RESIDUAL.md` top.
+- **Honesty:** still **no** Pass; invent_pass=0; unlock ≠ Pass ≠ `ran_on_npu`.
+
+Prior Turn (offline join pick — skip-CONFIG_CU isolation pending; invent_pass=0):
+- **Named offline delta (docs/residual only):** Offline A multi-shot fault vs
+  BO map: **all orphan**; no fixable userspace map/bind bug; map audit ≠ Pass ≠
+  unlock (bands ~`0x4fff…` llm / ~`0x8fff…` unified-4x4; `2ae69036` none).
+  Offline B: B1 overlay-vs-instr **hypothesis only**; skip-CU prep ready; C6
+  debug-BO offline only. **Named next experiment:** **`skip-CONFIG_CU
+  isolation`** (one stock shot under **new** host-minted unlock; **not**
+  minted this pin — Phase 3 mints).
+- **Unlock:** **none active.** First `C_UNLOCK=` = **`efd44f35` CONSUMED**
+  (do not reopen). Prior: `8352882b`, `2ae69036`, `97f38307`, `11bc9016`,
+  `3a70fabf`, `b17b0119` CONSUMED. All three flexml STX research PDIs Spent.
+  **Do not mint** from this pin alone.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Map
+  audit ≠ Pass. skip-CU prep ≠ Pass. Attach ≠ Pass. No re-live spent
+  `7d172bf2` / `ba0cd738` / `0eeeb70c`. No live map-fix (no fixable bug).
+- **Next:** Phase 3 mint + `config-cu-run-skip` under new unlock + reason in
+  join report; optional offline only until then.
+- **Reports:** `.agents/reports/impl-next-p2-join-pick-skip-cu.md`,
+  `.agents/reports/impl-next-fault-vs-bo-map.md`,
+  `.agents/reports/impl-next-load-path-offline.md`, `RESIDUAL.md` top.
+
+Prior Turn (live closeout — flexml unified-4x4 `efd44f35` CONSUMED; invent_pass=0):
+- **Live evidence:** stock CONFIG_CU flexml **unified-4x4** under `efd44f35`;
+  last_apply `/tmp/dragon_npu_last_apply_config_cu_2618482.json`;
+  status=`wait_cmd_einval`; `config_cu=1` pdi_bytes=**13792**; sha16
+  `7d172bf223a9b06b`; `real_ioctl=true`; `ran_on_npu=false`; total_s≈62.12;
+  journal **IO_PAGE_FAULT** ~`0x8fff8000…` + `aie2_set_cmd_timeout`
+  (DPU `0xffffffff`, TXN OP **`0xd`**). Differs from Shot L llm ~`0x4fff8000…`
+  and spent unified-2x4x4 (no IO_PAGE_FAULT). invent_pass=0.
+- **Unlock:** **`C_UNLOCK=efd44f35` CONSUMED** (do not reopen). Prior:
+  `8352882b`, `2ae69036`, `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119`
+  CONSUMED. All three flexml STX research PDIs now Spent.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Attach ≠
+  Pass. Unlock ≠ Pass. No second live under same unlock. No re-live spent
+  `7d172bf2` / `ba0cd738` / `0eeeb70c`.
+- **Next:** optional offline IO_PAGE_FAULT band vs BO map; new material before
+  next live; no mint without named offline reason.
+- **Reports:** `.agents/reports/live-shot-efd44f35.md`,
+  `.agents/reports/impl-feedback-live-unified-4x4.md`, `RESIDUAL.md` top.
+
+Prior Turn (live closeout — flexml llm-2x4x4 `8352882b` CONSUMED; invent_pass=0):
+- **Live evidence:** stock CONFIG_CU flexml **llm-2x4x4** under `8352882b`;
+  last_apply `/tmp/dragon_npu_last_apply_config_cu_2328515.json`;
+  status=`wait_cmd_einval`; `config_cu=1` pdi_bytes=**21664**; sha16
+  `ba0cd738fd870011`; `real_ioctl=true`; `ran_on_npu=false`; total_s≈61.57;
+  journal **IO_PAGE_FAULT** ~`0x4fff8000…` + `aie2_error_backtrack` +
+  `aie2_set_cmd_timeout` (DPU/TXN `0xffffffff`). Differs from spent unified
+  `2ae69036` (no IO_PAGE_FAULT) and CVML (`0x2fff8000…`). invent_pass=0.
+- **Unlock:** **`C_UNLOCK=8352882b` CONSUMED** (do not reopen). Prior:
+  `2ae69036`, `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119` CONSUMED.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Attach ≠
+  Pass. Unlock ≠ Pass. No second live under same unlock. No re-live spent
+  `ba0cd738` / `0eeeb70c`.
+- **Reports:** `.agents/reports/live-shot-8352882b.md`,
+  `.agents/reports/impl-feedback-live-llm-2x4x4.md`, `RESIDUAL.md` top.
+
+Latest Turn (residual honesty pin feedback — dual material RESEARCH ONLY; offline only):
+- **Named delta (docs/residual only):** Dual public mlir-aie npu2 AOT under
+  `testdata/xdna2_cmd/external_known_good/` is **RESEARCH ONLY** (size-class
+  **`public-npu2-small`**): vector **300 B** sha16 `aaeb5b68cc298a45` +
+  single_core matmul **660 B** sha16 `de8671245bb72436`. **Not** residual
+  identity; **not** unlock justification alone; **not** Pass. Tags:
+  `public-npu2-small` vs spent **`flexml-2x4x4-class`** vs lab
+  **`mladf-classic-1688`**. **One-line residual:** dual public material present;
+  still residual-mismatched to spent flexml and to lab classic 1688. Route B
+  axes (size class, opcode/header, section, rela, structural distance) citable
+  in unlock reason **text** without claiming match; invent_pass=0. Residual
+  class still post-attach **`wait_cmd_einval`** (`2ae69036`); unlock **none**;
+  Pass=No.
+- **Ranked next:** (1) optional offline classify on dual research material;
+  (2) prefer minimal load; unspent llm-2x4x4 / unified-4x4; (3) next live only
+  under **new** unlock + named reason (**not** dual bins alone); (4) frozen
+  empty reconfirm / reopen CONSUMED / Pass-from-attach / Pass-from-capture /
+  re-live spent flexml / agent live without unlock / MMU without journal.
+- **Agent-legal only:** classify present bytes; unlock justification text only;
+  no unlock mint; no live apply from this pin.
+- **Unlock:** **none active.** `C_UNLOCK=2ae69036` CONSUMED (+ priors). **Do
+  not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+- **Reports:** `.agents/reports/impl-feedback-offline-residual-pin.md`,
+  `RESIDUAL.md` top.
+
+Latest Turn (residual honesty pin — Route A+B join closeout; offline only):
+- **Named delta (docs/residual only):** **dual** public mlir-aie npu2 AOT under
+  `testdata/xdna2_cmd/external_known_good/`: vector **300 B** sha16
+  `aaeb5b68cc298a45` (primary `working_stack_ctrltext.bin` +
+  `mlir_aie_vector_scalar_add_npu2.*`) **and** single_core matmul **660 B**
+  sha16 `de8671245bb72436` (`mlir_aie_single_core_matmul_npu2.*`, dims 64³
+  i16→i32). Soft vs lab classic **1688 B** = **mismatch expected**. **Do not
+  claim matmul is flexml-matched.** Route B pure structure tools landed
+  (structural distance, size class, opcode/header soft, capture-dir fingerprint,
+  optional rela); invent_pass=0. Residual class still post-attach
+  **`wait_cmd_einval`** (flexml `2ae69036`); unlock **none**; Pass=No.
+  **Superseded for RESEARCH ONLY + size-class tags** by Latest Turn residual
+  pin feedback above.
+- **Ranked next:** (1) optional offline classify on dual material; (2) prefer
+  minimal load; unspent llm-2x4x4 `ba0cd738…` / unified-4x4 `7d172bf2…`;
+  (3) next live only under **new** unlock + named reason (not from A/B alone);
+  (4) frozen empty reconfirm / reopen CONSUMED / Pass-from-attach /
+  Pass-from-capture / re-live spent flexml.
+- **Agent-legal only:** classify present bytes; unlock justification text only;
+  no unlock mint; no live apply from this pin. Operator may reboot when
+  convenient; no agent live device work this slice.
+- **Unlock:** **none active.** All listed `C_UNLOCK` CONSUMED (`2ae69036` +
+  priors). **Do not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+- **Reports:** `.agents/reports/impl-route-a-b-join-closeout.md`,
+  `.agents/reports/impl-route-a-matmul-material.md`,
+  `.agents/reports/impl-route-b-structure-tools.md`, `RESIDUAL.md` top.
+
+Latest Turn (residual honesty pin — mlir-aie capture material landed; offline only):
+- **Named delta (docs/residual only):** real binaries under
+  `testdata/xdna2_cmd/external_known_good/` from public mlir-aie
+  `vector_scalar_add` npu2 AOT (was bins=0). Ctrltext **300 B** sha16
+  `aaeb5b68cc298a45` (`working_stack_ctrltext.bin` + sibling
+  `mlir_aie_vector_scalar_add_npu2.*`); PROVENANCE updated; ingest OK.
+  Soft compare vs lab classic **1688 B** = **mismatch expected** (not
+  matmul-matched residual identity). Material **≠** Pass **≠** product
+  known-good **≠** C-ready. Residual class still post-attach
+  **`wait_cmd_einval`** (flexml `2ae69036`); invent_pass=0; unlock **none**.
+  **Superseded for dual-material + structure tools** by Latest Turn Route A+B
+  above.
+- **Ranked next:** (1) matmul-matched / load-accepted material optional;
+  (2) prefer minimal load; unspent llm-2x4x4 `ba0cd738…` / unified-4x4
+  `7d172bf2…`; (3) next live only under **new** unlock (not from capture
+  landing alone); (4) frozen empty reconfirm / reopen CONSUMED /
+  Pass-from-attach / Pass-from-capture.
+- **Agent-legal only:** classify present bytes; unlock justification text only;
+  no unlock mint; no live apply from this pin.
+- **Unlock:** **none active.** All listed `C_UNLOCK` CONSUMED (`2ae69036` +
+  priors). **Do not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+- **Reports:** `.agents/reports/residual-pin-mlir-aie-material-landed.md`,
+  `.agents/reports/impl-mlir-aie-material-playbook.md`, `RESIDUAL.md` top.
+
+Latest Turn (residual refine pin — operator next-moves; offline only):
+- **Named delta (docs/residual only):** operator refined residual framing after
+  flexml `2ae69036`. CONFIG_CU attach succeeded (unified-2x4x4 27200 B,
+  sha16 `0eeeb70c…`); residual class = post-attach **`wait_cmd_einval`** + journal
+  cmd timeout / backtrack — **≠** pure APP_LOAD; **≠** CVML orphan IO_PAGE_FAULT.
+  Better information, **not** Pass. Pure re-live of spent fingerprint **banned**.
+  Offline P0–P2 still done; **superseded for capture-empty claim** by Latest Turn
+  above (mlir-aie bins landed); unlock **none active**.
+- **Ranked next:** (1) human material → `testdata/xdna2_cmd/external_known_good/`;
+  (2) prefer minimal load; unspent llm-2x4x4 `ba0cd738…` / unified-4x4 `7d172bf2…`;
+  (3) next live only under **new** unlock (reason: unspent topology and/or new
+  material + `2ae69036` residual class + optional debug BO); (4) keep frozen empty
+  reconfirm / empty soft-compare / reopen CONSUMED / MMU without journal /
+  Pass-from-attach.
+- **Agent-legal only:** ingest/classify new human bytes; unlock justification +
+  Step 2 checklist prep; residual splitters only if new last_apply failure mode;
+  refuse status re-spin / re-fingerprint spent default.
+- **Unlock:** **none active.** All listed `C_UNLOCK` CONSUMED (`2ae69036` +
+  priors). **Do not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+- **Reports:** `.agents/reports/residual-pin-refined-next-moves.md`,
+  `.agents/plans/plan-pass-unblock-sequence.md`, `RESIDUAL.md` top.
+
+Latest Turn (residual honesty pin after P2 C6 + recipe — offline only):
+- **Named offline delta:** P2 C6 + Step 2 recipe checklist **landed** (see
+  `.agents/reports/impl-p2-c6-recipe.md`). C6: `pack_config_hwctx_dbg_buf_aie2`
+  / `validate_config_hwctx_dbg_buf_aie2` / `HwctxDbgBufOp` (AIE2 value-mode BO
+  handle); soft `debug_bo_uapi_prep_aie2` / `format_c6_debug_bo_prep_note`
+  always invent_pass=0 not_c_ready=1 not_ran_on_npu=1
+  debug_bo_prep_alone_not_pass=1 research_only=1. Env name
+  `XDNA2_LAB_RESEARCH_DEBUG_BO` intent-only (**not** live-wired). Recipe:
+  `docs/HITL_C_APP_LOAD_RECIPE.md` § Step 2 prep checklist (minimal load +
+  optional debug BO + last_apply + journal; CONSUMED list). Kit overview points
+  at checklist. Soft always invent_pass=0 not_c_ready=1 not_ran_on_npu=1.
+  Offline debug-BO prep / recipe **≠** C-ready.
+- **Unlock:** **none active.** All listed `C_UNLOCK` CONSUMED
+  (`2ae69036` + priors). **Do not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+  Capture under `testdata/xdna2_cmd/external_known_good/` still may be bins=0.
+- **Next:** human material Step 1; live only under **new** unlock + named reason
+  (Step 2 checklist). Agent: no empty reconfirm mill; sequence offline P0–P2 done.
+- **Reports:** `.agents/reports/impl-p2-c6-recipe.md`,
+  `.agents/reports/impl-p1-c4-c5.md`,
+  `.agents/reports/impl-p0-c1-c3.md`,
+  `.agents/plans/plan-pass-unblock-sequence.md`.
+
+Latest Turn (residual honesty pin after P1 C4–C5 — offline only):
+- **Named offline delta:** P1 C4+C5 **landed** (see
+  `.agents/reports/impl-p1-c4-c5.md`). C4:
+  `iron_artifact_path_is_allowed` / `classify_iron_artifact_ingest` +
+  `format_c4_iron_ingest_note` (empty blocked; present classifies; product_known_good=0).
+  C5: `fingerprint_pdi_geometry_bytes` / `compare_pdi_geometry_to_spent_flexml` +
+  format note (`spent_rematch_not_unlock_alone=1`). Soft always invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1. Offline IRON ingest / PDI geometry **≠** C-ready.
+- **Unlock:** **none active.** All listed `C_UNLOCK` CONSUMED
+  (`2ae69036` + priors). **Do not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+  Capture under `testdata/xdna2_cmd/external_known_good/` still may be bins=0.
+- **Next:** agent **P2 C6** offline (debug-BO prep + recipe); or human material
+  Step 1; live only under **new** unlock + named reason. No empty reconfirm mill.
+- **Reports:** `.agents/reports/impl-p1-c4-c5.md`,
+  `.agents/reports/impl-p0-c1-c3.md`,
+  `.agents/plans/plan-pass-unblock-sequence.md`.
+
+Latest Turn (residual honesty pin after P0 C1–C3 — offline only):
+- **Named offline delta:** P0 C1+C2+C3 **landed** (see
+  `.agents/reports/impl-p0-c1-c3.md`). C1:
+  `validate_aiebu_elf_ctrltext_structure` + `format_c1_validator_note`. C2:
+  `StructuralLabFingerprint` / `structural_fingerprint_from_lab_detail` +
+  format note. C3: `ResidualClassifierSplit` / `classify_residual_split` +
+  format note (`wait_cmd_einval` ≠ `wait_timeout`). Soft always invent_pass=0
+  not_c_ready=1 not_ran_on_npu=1. Offline validate/FP/split **≠** C-ready.
+- **Unlock:** **none active.** All listed `C_UNLOCK` CONSUMED
+  (`2ae69036` + priors). **Do not mint** from this pin alone. Do not reopen.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+  Capture under `testdata/xdna2_cmd/external_known_good/` still may be bins=0.
+- **Next:** agent **P1 C4+C5** offline; or human material Step 1; live only under
+  **new** unlock + named reason. No empty reconfirm mill.
+- **Reports:** `.agents/reports/impl-p0-c1-c3.md`,
+  `.agents/reports/impl-residual-pin-p0.md`,
+  `.agents/plans/plan-pass-unblock-sequence.md`.
+
+Prior Turn (residual Pass-unblock Phase 1 S4–S5 polish — offline only):
+- **Named offline delta:** fingerprint pack prints spent/unspent PDI ledger
+  (matches RESIDUAL); **skips re-dump** of spent default
+  `unified-2x4x4` / sha16 `0eeeb70c…` unless `--force` or
+  `XDNA2_FP_FORCE_REDUMP=1`; spent DIFF alone ≠ new unlock reason.
+  S5 read-only `*mladf*` / `*gemm*.xclbin` inventory →
+  `.agents/reports/pdi-xclbin-inventory.md` (empty OK).
+- **Unlock:** **none active.** `C_UNLOCK=2ae69036` CONSUMED (+ prior list).
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+- **Next:** agent Layer A via `pass_unblock_once.sh --agent-offline`; human
+  capture bytes when held; unspent flexml (llm / 4x4) needs **new** unlock.
+- **Reports:** `.agents/reports/impl-residual-pass-build-s4-s5.md`,
+  `.agents/reports/pass-unblock-fingerprint-once.md`,
+  `.agents/reports/pdi-xclbin-inventory.md`.
+
+Prior Turn (pass-unblock once — Layer A entrypoint; no privilege script):
+- **Named offline delta:** `tools/pass_unblock_once.sh` one entry
+  (`--status` / `--agent-offline` / `--ingest` / `--ingest-pdi` / `--live`
+  refuse without active unlock). Kit alias `pass-unblock`. PROVENANCE leads
+  with this command. Residual honesty: Pass=No; unlock none; flexml spent;
+  bag empty; stock no-sudo; privilege script **skipped** (no wall).
+- **Unlock:** **none active.** `C_UNLOCK=2ae69036` CONSUMED (+ prior list).
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. No re-live.
+- **Next:** agent Layer A via entrypoint; human only for capture bytes they hold.
+- **Reports:** `.agents/reports/impl-pass-unblock-once.md`,
+  `.agents/reports/pass-unblock-fingerprint-once.md`,
+  `.agents/reports/live-shot-2ae69036.md`.
+
+Prior Turn (U4 closeout — live stock flexml `2ae69036` CONSUMED, wait_cmd_einval):
+- **Live evidence:** flexml STX unified-2x4x4 stock CONFIG_CU under `2ae69036`;
+  last_apply `/tmp/dragon_npu_last_apply_config_cu_675133.json`;
+  status=`wait_cmd_einval` (WAIT EINVAL os error 22); `ran_on_npu=false`;
+  `real_ioctl=true`; `config_cu=1` pdi_bytes=**27200**; pdi sha16=`0eeeb70c84df056e`
+  (DIFF vs CVML `a1e65d04add3422c` / 283840); journal `aie2_error_backtrack`
+  + `aie2_set_cmd_timeout` (DPU/TXN `0xffffffff`); **no** IO_PAGE_FAULT in shot
+  window (differs from CVML `97f38307` / `11bc9016`). C4/P6 not Pass; invent_pass=0.
+- **Unlock:** **`C_UNLOCK=2ae69036` CONSUMED** (do not reopen). Prior:
+  `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119` **CONSUMED**.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Flexml
+  attach ≠ Pass. Unlock ≠ Pass. No second live under same unlock.
+- **Next:** agent only if named offline delta (capture bytes, true matmul-
+  matched PDI/ctrltext, driver/MMU). Else pin blocker and stop. **No** empty
+  reconfirm mill.
+- **Reports:** `.agents/reports/live-shot-2ae69036.md`,
+  `.agents/reports/impl-u4-flexml-live-closeout.md`,
+  `.agents/reports/pass-unblock-fingerprint-once.md`,
+  `.agents/reports/live-shot-97f38307.md`.
+- **Parse rule:** first `C_UNLOCK=` in `RESIDUAL.md` is active only when that
+  line has no CONSUMED. Read the **first** `C_UNLOCK=` line in `RESIDUAL.md`
+  only (do not trust mid-file historical stamps). As of this pin the first line
+  is **`C_UNLOCK=1f761bf4` CONSUMED** — no active one-shot.
+
+Prior Turn (T4 closeout — live stock `97f38307` CONSUMED, wait_cmd_einval):
+- **Live evidence:** research-blob stock CONFIG_CU under `97f38307`; last_apply
+  `/tmp/dragon_npu_last_apply_config_cu_3377745.json`; status=`wait_cmd_einval`;
+  `config_cu=1` pdi_bytes=283840; sha16=`a1e65d04add3422c`; journal IO_PAGE_FAULT
+  ~`0x2fff80007f00` + aie2_set_cmd_timeout. invent_pass=0.
+- **Unlock:** **`C_UNLOCK=97f38307` CONSUMED**. Superseded by U4 above.
+- **Reports:** `.agents/reports/live-shot-97f38307.md`,
+  `.agents/reports/impl-t4-live-97f38307-closeout.md`.
+
+Prior Turn (T3c — research PDI identity + skip CONFIG_CU A/B; unlock then active):
+- **Named offline delta:** pure `ResearchPdiIdentity` /
+  `fingerprint_pdi_blob_bytes` / `research_pdi_identity_from_*` /
+  `format_research_pdi_preflight_note` / `parse_pdi_fingerprint_from_detail` in
+  `silicon_contract.rs`. Soft always
+  `research_pdi_not_product_known_good=1 invent_pass=0 not_ran_on_npu=1`.
+  Tooling: `prep-skip-pdi` / `run-stock-skip-pdi` /
+  `XDNA2_LAB_SKIP_CONFIG_CU=1` / unset `XDNA2_LAB_PDI_BLOB`; dump emits
+  `pdi_fp len=… sha16=…`. Default CVML/AIE2P dump ≠ product matmul known-good.
+- **Unlock (then):** **`C_UNLOCK=97f38307` active** (one-shot T4; now CONSUMED
+  by Latest Turn above). Prior: `11bc9016`, `3a70fabf`, `b17b0119` **CONSUMED**.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`.
+  PDI identity ≠ Pass. Unlock ≠ Pass.
+- **Next then:** T4 live (landed above).
+- **Reports:** `.agents/reports/impl-t3c-pdi-identity.md`,
+  `.agents/reports/impl-t3b-io-page-fault-bo-map.md`,
+  `.agents/reports/impl-t3-wait-cmd-einval-classify.md`,
+  `.agents/reports/live-shot-11bc9016.md`.
+
+Prior Turn (T3b — IO_PAGE_FAULT vs BO map audit; unlock still CONSUMED):
+- **Named offline delta:** pure `parse_bo_diag_from_detail` /
+  `parse_journal_io_page_fault_addrs` / `classify_fault_addr` /
+  `list_rela_patch_targets_overwrite` / `audit_io_page_fault_vs_lab_map` in
+  `silicon_contract.rs`. Live-shaped lock: fault **`0x2fff80007f40` → orphan**
+  vs DevHeap `0x4000000` / instr `0x4068000` / host UVAs. Soft always
+  `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 audit_alone_not_pass=1`.
+- **Unlock (then):** **`C_UNLOCK=11bc9016` CONSUMED** (do not reopen). Prior:
+  `3a70fabf`, `b17b0119` CONSUMED. Superseded for active unlock by T3c
+  `97f38307`.
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`.
+  Map audit ≠ Pass. Not invent APP_LOAD from this pin alone.
+- **Next then:** T3c (landed above) or T4 under new unlock.
+- **Reports:** `.agents/reports/impl-t3b-io-page-fault-bo-map.md`,
+  `.agents/reports/impl-t3-wait-cmd-einval-classify.md`,
+  `.agents/reports/live-shot-11bc9016.md`.
+
+Prior Turn (T3 — honest WAIT EINVAL classify; unlock still CONSUMED):
+- **Named offline delta:** `classify_submit_wait_error` no longer labels WAIT
+  EINVAL as `wait_timeout` because the message embeds `timeout_ms=`. Status
+  **`wait_cmd_einval`**. True timeouts still `wait_timeout`. Field-only
+  `timeout_ms=` → not timeout (`submit_wait_failed`).
+- **Unlock:** **`C_UNLOCK=11bc9016` CONSUMED** (do not reopen).
+- **Honesty:** still **no** Pass; invent_pass=0; **no** `ran_on_npu`.
+  Classifier honesty ≠ Pass.
+- **Next then:** T3b (landed above) or T4 after offline reason.
+- **Reports:** `.agents/reports/impl-t3-wait-cmd-einval-classify.md`,
+  `.agents/reports/live-shot-11bc9016.md`,
+  `.agents/reports/impl-t2-live-11bc9016-closeout.md`.
+
+Prior Turn (T2 closeout — live stock `11bc9016` CONSUMED, wait_timeout label):
+- **Unlock:** **`C_UNLOCK=11bc9016` CONSUMED** (2026-08-10 stock CONFIG_CU;
+  last_apply pin; product status=`wait_timeout`; WAIT_CMD then EINVAL; journal
+  IO_PAGE_FAULT + aie2_set_cmd_timeout). Do **not** reopen.
+- **Residual class (then):** wait_timeout label / FW timeout / IO_PAGE_FAULT —
+  **not** invent locked APP_LOAD from this pin alone. `config_cu=1` measured;
+  still **no** Pass; invent_pass=0; **no** `ran_on_npu`. Superseded for class
+  honesty by T3 `wait_cmd_einval`.
+- **Reports:** `.agents/reports/live-shot-11bc9016.md`,
+  `.agents/reports/impl-t2-live-11bc9016-closeout.md`.
+
+Latest Turn (plan complete product silicon S0–S2b — unlock mint + offline prep):
+- **Unlock then active:** **`C_UNLOCK=11bc9016`** (now CONSUMED — see Latest Turn
+  above). Named offline reason was progressive last_apply + timeout honesty +
+  ≥120s recipe after prior `3a70fabf` timeout shot.
+- **Prior unlocks CONSUMED:** `3a70fabf` (2026-08-09 stock timeout); `b17b0119`
+  (2026-07-18). Do **not** reopen.
+- **Historical operator framing (superseded for stock by T0–T2 agent path):**
+  prep via `config-cu`; live via `config-cu-run` under active unlock only.
+- **Agent:** offline only unless plan unlocks a live stock shot; **no** sticky
+  ALLOW. **No** Pass / **no** `ran_on_npu` from prep alone. Report:
+  `.agents/reports/impl-complete-product-silicon-s0-s2b.md`.
+
+Latest Turn (max-prep for one privileged CONFIG_CU sandwich — no L3 from agent):
+- **Operator:** `bash tools/operator_app_load_kit.sh config-cu` (or
+  `tools/hitl_config_cu_once.sh prep`) → a-prep + pin last_apply off locked
+  baseline + preflight + fish/bash sandwich with real paths filled.
+- **Apply path:** `lab_exec_once` **explicitly forwards** `XDNA2_LAB_PDI_BLOB` /
+  `CU_FUNC` / `LAST_APPLY` / BO_DIAG / residual envs into cargo child; hitl_c
+  loud PDI preflight + auto-pin last_apply when PDI set; `XDNA2_HITL_REQUIRE_PDI=1`
+  fail-closed optional.
+- **Post:** `tools/collect_post_c2_evidence.sh` journal + p5 pack.
+- **Research only:** `DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF` / `REMOVE_DBG_BUF`
+  constants (public uAPI; not live-wired). Unlock state **superseded** by Latest
+  Turn above (`C_UNLOCK=11bc9016` active). **No** Pass / **no** `ran_on_npu`.
+- Gates: bash -n new scripts; `cargo test --features amd-xdna2 --lib config_cu` 7 ok.
 
 ### Writing + identifiers (always — every file agents touch)
 
@@ -2052,11 +3226,11 @@ Honest: after driver reload, re-probe CREATE_HWCTX (qos fix may already have wor
 
 Previous: XDNA2_HWCTX_EXT_FLAGS + 118 tests (env override surface). CREATE_HWCTX was still EINVAL before qos_p fix.
 
-Previous: 
+Previous:
 
-Previous: 
+Previous:
 
-Previous: 
+Previous:
 
 Latest Turn (continued — post-BO diagnostics for hwctx creation):
 - After creating the UMQ and log BOs inside create_hwctx, we now immediately call get_bo_info on them (before attempting CREATE_HWCTX).
@@ -2066,7 +3240,7 @@ Latest Turn (continued — post-BO diagnostics for hwctx creation):
 
 This directly accelerates debugging the last mile to a working hwctx (prerequisite for any real command submission / model loading).
 
-Previous: 
+Previous:
 
 Latest Turn (continued — ownership + richer hwctx tracking):
 - Introduced HwCtxRecord to track hwctx + its umq_bo + log_buf_bo.
@@ -2078,7 +3252,7 @@ Latest Turn (continued — ownership + richer hwctx tracking):
 
 Excellent mechanical progress toward a usable real execution layer.
 
-Previous: 
+Previous:
 
 Latest Turn (continued — tunable hwctx creation for real hardware bring-up):
 - Added create_direct_hwctx_with_sizes (and the backend equivalent) so the caller can pass custom UMQ and log buffer sizes. This is the key ergonomics win for iterating on the direct path on physical XDNA2 silicon.
@@ -2088,7 +3262,7 @@ Latest Turn (continued — tunable hwctx creation for real hardware bring-up):
 
 Momentum on making real hardware contexts actually work remains excellent.
 
-Previous: 
+Previous:
 
 Latest Turn (continued — observability + lifecycle hygiene):
 - Wired created_direct_hwctx_count through the full stack (device → executor → backend) using the tracking field added earlier.
@@ -2097,7 +3271,7 @@ Latest Turn (continued — observability + lifecycle hygiene):
 
 Small but useful step toward production-quality direct execution.
 
-Previous: 
+Previous:
 
 Latest Turn (continued — refined hwctx + new AIE version query + error diagnostics):
 - Improved CREATE_HWCTX error messages to include the actual umq_bo and log_buf_bo handles used (very useful when it fails on hardware).
@@ -2110,7 +3284,7 @@ Latest Turn (continued — refined hwctx + new AIE version query + error diagnos
 
 The direct layer is steadily becoming more complete and observable.
 
-Previous: 
+Previous:
 
 Latest Turn (continued autonomous — hwctx lifecycle + tracking + demo):
 - Added destroy_direct_hwctx exposure on device and backend (symmetric API).
@@ -2121,7 +3295,7 @@ Latest Turn (continued autonomous — hwctx lifecycle + tracking + demo):
 
 The direct submission infrastructure is becoming genuinely usable for bring-up experiments.
 
-Previous: 
+Previous:
 
 Latest Turn (continued — destroy + full hwctx lifecycle on hardware):
 - Exposed destroy_direct_hwctx symmetrically on RealXdna2Device and AmdXdna2Backend.
@@ -2130,7 +3304,7 @@ Latest Turn (continued — destroy + full hwctx lifecycle on hardware):
 
 Momentum on the direct execution infrastructure remains strong.
 
-Previous: 
+Previous:
 
 Latest Turn (continued autonomous progress — real hwctx creation now functional):
 - Made create_hwctx actually usable on real hardware by adding internal helpers that create the required UMQ BO and log buffer BO using the now-real create_buffer path (64KB UMQ, 256KB log by default).
@@ -2141,7 +3315,7 @@ Latest Turn (continued autonomous progress — real hwctx creation now functiona
 
 This is a major step toward being able to submit real work.
 
-Previous: 
+Previous:
 
 Latest Turn (major autonomous push on real lightweight direct submission infrastructure):
 - Completed real BO management: `create_buffer` and `sync_buffer` now perform actual DRM ioctls (CREATE_BO / SYNC_BO) in RealDirectSubmission.
@@ -2154,7 +3328,7 @@ Latest Turn (major autonomous push on real lightweight direct submission infrast
 
 This is the largest single step forward on the pure direct execution path so far while staying 100% true to the lightweight, no-heavy-runtime vision.
 
-Previous: 
+Previous:
 
 Latest Turn (safe autonomous work after "I don't know how to answer any of those questions"):
 - User explicitly does not want to field the big submission architecture questions right now. Strict policy: only safe mechanical/lightweight-direct work, no architecture asks.
@@ -2166,7 +3340,7 @@ Latest Turn (safe autonomous work after "I don't know how to answer any of those
 
 Continuing on safe items only (more queries, better scaffolding of the remaining DirectSubmission methods with real ioctl attempts + honest errors, more tests, more cleanup, etc.).
 
-Previous: 
+Previous:
 
 Latest Turn (final mechanical bring-up on lightweight direct XDNA2 queries — real hardware success):
 - Fixed the core blocker: DRM_IOCTL_AMDXDNA_GET_INFO magic corrected from placeholder 0xc020_6447 (wrong size) to the proper computed 0xc010_6447 (sizeof(struct)=16, dir=3, 'd', 0x40+7). Added the missing command id constants (GET_INFO=7 etc.) matching amdxdna_drm_ioctl_id enum from the kernel header.

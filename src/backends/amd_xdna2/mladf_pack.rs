@@ -773,7 +773,7 @@ pub fn unpack_ofm_bf16_to_f32(bytes: &[u8]) -> Result<Vec<f32>, DirectError> {
         )));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
         out.push(bf16_bits_to_f32(bits));
     }
@@ -896,13 +896,13 @@ pub fn load_wts_packed_from_env(expected_len: Option<u64>) -> Result<Option<Vec<
         ));
     }
     let bytes = read_lab_file_capped(path, "XDNA2_LAB_WTS_PACKED")?;
-    if let Some(want) = expected_len {
-        if bytes.len() as u64 != want {
-            return Err(DirectError::InvalidArgument(format!(
-                "XDNA2_LAB_WTS_PACKED len {} != plan/expected {want} (path={path})",
-                bytes.len()
-            )));
-        }
+    if let Some(want) = expected_len
+        && bytes.len() as u64 != want
+    {
+        return Err(DirectError::InvalidArgument(format!(
+            "XDNA2_LAB_WTS_PACKED len {} != plan/expected {want} (path={path})",
+            bytes.len()
+        )));
     }
     Ok(Some(bytes))
 }
@@ -1227,7 +1227,10 @@ mod tests {
           "coalesed_buffers":[{"name":"ifm","control_packet_patch_locations":[{"size":6}]}]}}}"#;
         assert!(parse_mladf_ctrl_patch_locations(bad).is_err());
         assert!(parse_mladf_ctrl_patch_locations("not-json").is_err());
-        assert!(parse_mladf_ctrl_patch_locations("{}").unwrap().is_empty());
+        assert_eq!(
+            parse_mladf_ctrl_patch_locations("{}").unwrap(),
+            [] as [CtrlMetaPatchEntry; 0]
+        );
         // Present but not an array → refuse (no silent drop)
         let not_arr = r#"{"external_buffers":{"b":{"name":"coalesed_inputs",
           "control_packet_patch_locations":{"offset":1}}}}"#;
@@ -1244,10 +1247,9 @@ mod tests {
         // Empty array is fine (no locations)
         let empty_arr = r#"{"external_buffers":{"b":{"name":"coalesed_inputs",
           "control_packet_patch_locations":[]}}}"#;
-        assert!(
-            parse_mladf_ctrl_patch_locations(empty_arr)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            parse_mladf_ctrl_patch_locations(empty_arr).unwrap(),
+            [] as [CtrlMetaPatchEntry; 0]
         );
     }
 
@@ -1359,7 +1361,8 @@ mod tests {
 
     #[test]
     fn validate_wts_packed_len_nonzero_staged() {
-        let mut v = vec![0_u8; STAGED_MLADF_WTS_BYTES as usize];
+        let mut v =
+            vec![0_u8; usize::try_from(STAGED_MLADF_WTS_BYTES).expect("value fits in usize")];
         assert!(
             validate_wts_packed_len_nonzero(&v, STAGED_MLADF_WTS_BYTES)
                 .unwrap_err()

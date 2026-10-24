@@ -1,8 +1,8 @@
 # XDNA2 instruction / txn BO research (Phase 3.5 prep)
 
-**Status:** Offline research consolidated — envelope known; **classic v0.1 XAie txn layout implemented in pure Rust**; GEMM-correct silicon txn still HITL.  
-**Date:** 2026-07-16  
-**Safety:** No EXEC_CMD by default. No silicon GEMM Pass. No proprietary bytes committed.  
+**Status:** Offline research consolidated — envelope known; **classic v0.1 XAie txn layout implemented in pure Rust**; GEMM-correct silicon txn still HITL.
+**Date:** 2026-07-16
+**Safety:** No EXEC_CMD by default. No silicon GEMM Pass. No proprietary bytes committed.
 **Cross-links:** [`XDNA2_CMD_PAYLOAD.md`](./XDNA2_CMD_PAYLOAD.md) · [`XDNA2_DIRECT_CAPABILITIES.md`](./XDNA2_DIRECT_CAPABILITIES.md) · [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) · [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md)
 
 ---
@@ -157,10 +157,15 @@ host `aiebu-asm-lib/aie2/copy_DDR_to_Mem_Tile.bin` (lab file; not in git):
 | Op | Size rule (v0.1) |
 |----|------------------|
 | WRITE | 24 (size field = 24) |
-| MASKWRITE / MASKPOLL / MASKPOLL_BUSY | 32 (size field = 32) |
+| MASKWRITE / MASKPOLL / MASKPOLL_BUSY | size field LE u32 at +24; **28** (mlir-aie public AOT compact) or **32** (lab DD/aiebu padded) |
 | BLOCKWRITE / BLOCKSET | `size` u32 at +12 (total incl. 16 B hdr) |
 | NOOP / PREEMPT | 4 |
 | CUSTOM (≥128) | `size` u32 at +4 (total) |
+
+MASK* dual size: measured on public peels under
+`testdata/xdna2_cmd/external_known_good/` (compact 28) and lab classic /
+DynamicDispatch matmul dumps (padded 32). Walk advances by the size field.
+Not residual match to lab 1688; not Pass.
 
 Module: `src/backends/amd_xdna2/txn.rs`
 
@@ -199,7 +204,7 @@ export XDNA2_INSTRUCTION_REQUIRE_TXN=1   # optional strict
 | `xrt_bridge` | `xrt_bridge.rs` | Research stub — never capture, never EXEC |
 | Staging dir | `testdata/xdna2_cmd/` | Gitignored binaries; README only in git |
 
-Operator inventory: `bash scripts/inventory_txn_sources.sh`  
+Operator inventory: `bash scripts/inventory_txn_sources.sh`
 Operator capture procedure: `scripts/capture_instruction_blob_checklist.md`
 
 ---
@@ -225,22 +230,22 @@ Product flag `TimedOpResult.ran_on_npu` stays **false** until **all** of:
 - `false` if allclose fails (length mismatch / non-finite / tol)
 - `true` only if all of the above pass
 
-Structured reasons: `decide_ran_on_npu_reason` → `RanOnNpuBlockReason`.  
+Structured reasons: `decide_ran_on_npu_reason` → `RanOnNpuBlockReason`.
 L1/L3 gates are **outside** this pure helper — set `submit_wait_ok` only after real gated EXEC+WAIT.
 
-**Envelope-only or inst-blob submit without verify must never set Pass.**  
+**Envelope-only or inst-blob submit without verify must never set Pass.**
 See `docs/XDNA2_DIRECT_CAPABILITIES.md` Phase 3.5 section.
 
 ---
 
 ## 7. Next lab steps (single-shot only when blob exists)
 
-1. Run `bash scripts/inventory_txn_sources.sh` (read-only).  
-2. Follow Pathway A: obtain Apache/MIT-cleared ELF or partner `local_shim_test_data` for **npu4 / 17f0**.  
-3. Materialize ctrltext → file under **gitignored** `testdata/xdna2_cmd/` (or `/tmp`).  
-4. Set `XDNA2_INSTRUCTION_BLOB` without opening L1; confirm load path + START_NPU packing unit tests.  
-5. Only then: [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) single-shot under triple gate + finite timeout.  
-6. After wait: bind/read OFM BO → `verify_f32_allclose` → `decide_ran_on_npu` → optional product flip.  
+1. Run `bash scripts/inventory_txn_sources.sh` (read-only).
+2. Follow Pathway A: obtain Apache/MIT-cleared ELF or partner `local_shim_test_data` for **npu4 / 17f0**.
+3. Materialize ctrltext → file under **gitignored** `testdata/xdna2_cmd/` (or `/tmp`).
+4. Set `XDNA2_INSTRUCTION_BLOB` without opening L1; confirm load path + START_NPU packing unit tests.
+5. Only then: [`XDNA2_EXEC_CMD_LAB.md`](./XDNA2_EXEC_CMD_LAB.md) single-shot under triple gate + finite timeout.
+6. After wait: bind/read OFM BO → `verify_f32_allclose` → `decide_ran_on_npu` → optional product flip.
 7. Restore `exec_cmd_allow=0`; unset `XDNA2_ALLOW_EXEC_CMD`.
 
 **Do not** loop empty/scaffold payloads. **Do not** claim GEMM Pass from `ok_submit_wait_*` alone.
@@ -249,10 +254,10 @@ See `docs/XDNA2_DIRECT_CAPABILITIES.md` Phase 3.5 section.
 
 ## 8. Bottom line
 
-1. Cmd BO = **pointer envelope**; Instruction BO = **opaque txn bytes**.  
-2. Host has full XRT 2.21 + plugin, but **no ready known-good instruction binary** and **no stock dump path**.  
-3. Best safe next work: offline ELF/xclbin materialize + feed `XDNA2_INSTRUCTION_BLOB`.  
-4. Pure numerical policy + lab OFM wire unit-tested; product `ran_on_npu` still hard-false by default until `XDNA2_LAB_OFM=1` + known-good blob + OFM match.  
+1. Cmd BO = **pointer envelope**; Instruction BO = **opaque txn bytes**.
+2. Host has full XRT 2.21 + plugin, but **no ready known-good instruction binary** and **no stock dump path**.
+3. Best safe next work: offline ELF/xclbin materialize + feed `XDNA2_INSTRUCTION_BLOB`.
+4. Pure numerical policy + lab OFM wire unit-tested; product `ran_on_npu` still hard-false by default until `XDNA2_LAB_OFM=1` + known-good blob + OFM match.
 5. Never commit proprietary reverse dumps into default CI fixtures.
 
 *Research + pure helpers only; no EXEC issued by this document.*

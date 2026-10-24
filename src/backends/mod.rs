@@ -1,4 +1,4 @@
-//! NPU backend implementations for DragonNPU.
+//! NPU backend implementations for Earth Dragon NPU.
 //!
 //! - **Simulation** — always available (default).
 //! - **AMD XDNA2** (`amd-xdna2`) — primary hardware path (lightweight direct
@@ -7,13 +7,18 @@
 //!   **honest stubs** only until XDNA2 MVP is green. Not auto-selected by
 //!   `DragonNpu::new`. See `docs/SECONDARY_BACKENDS.md`.
 //! - **XRT bridge** (`xrt-bridge`) — research-only, never default, never hot path.
+//! - **External runner** — opt-in IRON/eepy wrap (`execution=external_runner`,
+//!   `ran_on_npu=false`). Never default. See `external_runner` and
+//!   `docs/SECONDARY_BACKENDS.md`.
 //!
 //! # Example
 //!
 //! ```rust
-//! use dragon_npu::backends::simulation::SimulationBackend;
+//! use earth_dragon_npu::backends::simulation::SimulationBackend;
 //! ```
 
+pub mod external_runner;
+pub mod iron_kernel;
 pub mod simulation;
 
 #[cfg(feature = "amd-xdna2")]
@@ -90,6 +95,9 @@ pub trait Backend: std::fmt::Debug {
 // Re-export the simulation backend's main types for convenience.
 // Use the public crate path for NpuStatus to avoid private import errors.
 pub use crate::NpuStatus as SimulationNpuStatus;
+pub use external_runner::{
+    EXECUTION_EXTERNAL_RUNNER, ExternalRunnerBackend, ExternalRunnerConfig, ExternalRunnerReport,
+};
 pub use simulation::SimulationBackend;
 
 impl Backend for SimulationBackend {
@@ -172,6 +180,8 @@ pub fn probe_accel_devices() -> Vec<AccelDevice> {
 
             // Extract XDNA2 variant hint (modalias substring or 17f0 PCI family)
             let xdna2_variant = parse_xdna2_variant(&modalias, &device);
+            // Revision table from ids already read above. No /dev/accel open.
+            let cmdlist_class = cmdlist_class_from_sysfs(&vendor, &device, &revision);
 
             devices.push(AccelDevice {
                 name,
@@ -182,6 +192,7 @@ pub fn probe_accel_devices() -> Vec<AccelDevice> {
                 npu_name,
                 modalias,
                 xdna2_variant,
+                cmdlist_class,
             });
         }
     }
@@ -217,6 +228,117 @@ pub(crate) fn parse_xdna2_variant(modalias: &str, pci_device: &str) -> Option<St
         Some("XDNA2".to_string())
     } else {
         None
+    }
+}
+
+/// AIE2 device-info row this crate's cmdlist path may name.
+///
+/// Classification only. Not a submit, and not NPU3 / AIE4.
+/// Variant names keep the upstream `dev_npu*_info` stems.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aie2DevInfo {
+    /// `1022:17f0` revision `0x10` → `dev_npu4_info`.
+    DevNpu4,
+    /// `1022:17f0` revision `0x11` → `dev_npu5_info`.
+    DevNpu5,
+    /// `1022:17f0` revision `0x20` → `dev_npu6_info` (this host, Strix).
+    DevNpu6,
+}
+
+impl std::fmt::Display for Aie2DevInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DevNpu4 => "dev_npu4_info",
+            Self::DevNpu5 => "dev_npu5_info",
+            Self::DevNpu6 => "dev_npu6_info",
+        })
+    }
+}
+
+/// Why an AMD NPU PCI id is not on this crate's AIE2 cmdlist path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AmdNpuPciClassError {
+    /// NPU3 classic, PF, or VF (`aie4_classic_ops`). Fail closed.
+    #[error("AIE4: not supported by this crate's AIE2 cmdlist path")]
+    Aie4NotSupported,
+    /// Device id or revision is not a row this crate classifies.
+    ///
+    /// Includes `1022:1502` (match list only; patch 5 showed no info struct)
+    /// and unknown revisions of a known device. No generation is invented.
+    #[error("unknown AMD NPU PCI id 0x{vendor:04x}:0x{device:04x} revision 0x{revision:02x}")]
+    Unknown {
+        /// PCI vendor id.
+        vendor: u16,
+        /// PCI device id.
+        device: u16,
+        /// PCI revision.
+        revision: u8,
+    },
+}
+
+/// Classify an AMD NPU PCI id for this crate's AIE2 cmdlist path.
+///
+/// Pure: no device open, no ioctl, no `/dev/accel`, no `EXEC_CMD`.
+/// `1022:17f0` revisions `0x10`, `0x11`, and `0x20` are AIE2
+/// (`dev_npu4_info`, `dev_npu5_info`, `dev_npu6_info`). Revision `0x20`
+/// is npu6, not npu4, and not AIE4. `0x1502` is left unsupported.
+///
+/// # Errors
+///
+/// * [`AmdNpuPciClassError::Aie4NotSupported`] for `1022:17f1`, `1022:17f2`,
+///   and `1022:17f3` at revisions `0x10` and `0x13`.
+/// * [`AmdNpuPciClassError::Unknown`] for every other vendor, device, or revision.
+pub const fn classify_amd_npu_pci_id(
+    vendor: u16,
+    device: u16,
+    revision: u8,
+) -> Result<Aie2DevInfo, AmdNpuPciClassError> {
+    match (vendor, device, revision) {
+        (0x1022, 0x17f0, 0x10) => Ok(Aie2DevInfo::DevNpu4),
+        (0x1022, 0x17f0, 0x11) => Ok(Aie2DevInfo::DevNpu5),
+        (0x1022, 0x17f0, 0x20) => Ok(Aie2DevInfo::DevNpu6),
+        (0x1022, 0x17f1..=0x17f3, 0x10 | 0x13) => Err(AmdNpuPciClassError::Aie4NotSupported),
+        _ => Err(AmdNpuPciClassError::Unknown {
+            vendor,
+            device,
+            revision,
+        }),
+    }
+}
+
+fn parse_sysfs_hex_u16(text: &str) -> Option<u16> {
+    parse_sysfs_hex_u32(text).and_then(|value| u16::try_from(value).ok())
+}
+
+fn parse_sysfs_hex_u8(text: &str) -> Option<u8> {
+    parse_sysfs_hex_u32(text).and_then(|value| u8::try_from(value).ok())
+}
+
+fn parse_sysfs_hex_u32(text: &str) -> Option<u32> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if hex.is_empty() {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// Note stored on a sysfs probe row. Empty when the id text did not parse.
+fn cmdlist_class_from_sysfs(vendor: &str, device: &str, revision: &str) -> String {
+    let (Some(vendor_id), Some(device_id), Some(revision_id)) = (
+        parse_sysfs_hex_u16(vendor),
+        parse_sysfs_hex_u16(device),
+        parse_sysfs_hex_u8(revision),
+    ) else {
+        return String::new();
+    };
+    match classify_amd_npu_pci_id(vendor_id, device_id, revision_id) {
+        Ok(info) => format!("AIE2 {info}"),
+        Err(err) => err.to_string(),
     }
 }
 
@@ -286,6 +408,10 @@ pub struct AccelDevice {
     pub modalias: String,
     /// Extracted XDNA2 variant (NPU4/NPU5/NPU6) if detectable from modalias
     pub xdna2_variant: Option<String>,
+    /// Pure PCI cmdlist note from vendor/device/revision already read.
+    /// Empty when those strings did not parse. AIE4 rows store the fail-closed
+    /// error. This field is not a device open and not a submit.
+    pub cmdlist_class: String,
 }
 
 #[cfg(test)]
@@ -297,7 +423,7 @@ mod tests {
         let devs = probe_accel_devices();
         for d in &devs {
             assert!(d.name.starts_with("accel"));
-            assert!(!d.driver.is_empty());
+            assert_ne!(d.driver, "");
             if !d.pci_vendor.is_empty() {
                 assert!(d.pci_vendor.starts_with("0x"));
             }
@@ -388,6 +514,93 @@ mod tests {
             parse_xdna2_variant("some other modalias", "0x17f0"),
             Some("XDNA2".to_string())
         );
+    }
+
+    /// V5 patch 5 PCI rows. Revision selects the info struct.
+    /// `0x17f0` rev `0x20` is npu6, not npu4. AIE4 rows fail closed.
+    /// `0x1502` stays unclassified (no info struct in that patch).
+    #[test]
+    fn classify_amd_npu_pci_id_aie2_rows_and_aie4_fail_closed() {
+        const AIE4: &str = "AIE4: not supported by this crate's AIE2 cmdlist path";
+
+        assert_eq!(
+            classify_amd_npu_pci_id(0x1022, 0x17f0, 0x10),
+            Ok(Aie2DevInfo::DevNpu4)
+        );
+        assert_eq!(
+            classify_amd_npu_pci_id(0x1022, 0x17f0, 0x11),
+            Ok(Aie2DevInfo::DevNpu5)
+        );
+        assert_eq!(
+            classify_amd_npu_pci_id(0x1022, 0x17f0, 0x20),
+            Ok(Aie2DevInfo::DevNpu6)
+        );
+        assert_ne!(
+            classify_amd_npu_pci_id(0x1022, 0x17f0, 0x20),
+            Ok(Aie2DevInfo::DevNpu4),
+            "rev 0x20 is dev_npu6_info, not npu4"
+        );
+
+        for (device, revision) in [
+            (0x17f1_u16, 0x10_u8),
+            (0x17f1, 0x13),
+            (0x17f2, 0x10),
+            (0x17f2, 0x13),
+            (0x17f3, 0x10),
+            (0x17f3, 0x13),
+        ] {
+            let Err(err) = classify_amd_npu_pci_id(0x1022, device, revision) else {
+                panic!("AIE4 id {device:#06x} rev {revision:#04x} must fail closed");
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains(AIE4),
+                "device {device:#06x} rev {revision:#04x}: {message}"
+            );
+        }
+
+        for (device, revision) in [
+            (0x17f0_u16, 0x00_u8),
+            (0x17f0, 0x12),
+            (0x17f0, 0x21),
+            (0x17f1, 0x11),
+            (0x17f1, 0x20),
+            (0x17f2, 0x00),
+            (0x17f3, 0x11),
+        ] {
+            let Err(err) = classify_amd_npu_pci_id(0x1022, device, revision) else {
+                panic!("unknown rev {device:#06x}/{revision:#04x} must fail closed");
+            };
+            let message = err.to_string();
+            assert!(
+                !message.contains(AIE4),
+                "unknown rev must not use the AIE4 sentence: {message}"
+            );
+            assert!(
+                message.contains("unknown"),
+                "unknown rev needs a clear error: {message}"
+            );
+        }
+
+        let Err(first_gen) = classify_amd_npu_pci_id(0x1022, 0x1502, 0x00) else {
+            panic!("0x1502 has no info struct and must stay unsupported");
+        };
+        let first_gen_message = first_gen.to_string();
+        assert!(
+            !first_gen_message.contains(AIE4),
+            "0x1502 is not an AIE4 row: {first_gen_message}"
+        );
+        assert!(
+            !first_gen_message.to_ascii_lowercase().contains("npu4")
+                && !first_gen_message.to_ascii_lowercase().contains("npu6")
+                && !first_gen_message.contains("AIE2"),
+            "0x1502 must not invent a generation: {first_gen_message}"
+        );
+
+        let Err(other_vendor) = classify_amd_npu_pci_id(0x1002, 0x17f0, 0x20) else {
+            panic!("non-AMD vendor must fail closed");
+        };
+        assert!(!other_vendor.to_string().contains(AIE4));
     }
 
     // === TDD for the extracted real-device open helper (xdna2-real-exec-01) ===

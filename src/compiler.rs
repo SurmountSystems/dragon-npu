@@ -1,4 +1,4 @@
-/// Compiler module for DragonNPU.
+/// Compiler module for Earth Dragon NPU.
 ///
 /// Handles real model parsing (ONNX via tract-onnx + protobuf, plus .onnx.json and structured .txt
 /// fallbacks), optimization passes (FuseOperations with pattern-based conv+bn/relu/etc fusion,
@@ -32,7 +32,7 @@ pub enum OptimizationPass {
     MemoryPlanning,
 }
 
-/// The DragonNPU model compiler.
+/// The Earth Dragon NPU model compiler.
 ///
 /// Performs the full compilation pipeline: parse → optimize → quantize.
 /// See `dragon_npu_compiler.py` for the reference implementation and optimization levels.
@@ -101,9 +101,11 @@ impl Initializer {
                     return vec![];
                 }
                 self.raw_data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| {
-                        let bits = u16::from_le_bytes([b[0], b[1]]);
+                        let bits = u16::from_le_bytes(*b);
                         if self.data_type == 16 {
                             bf16_bits_to_f32(bits)
                         } else {
@@ -2534,7 +2536,7 @@ mod tests {
 
             let model = ModelProto {
                 ir_version: 7,
-                producer_name: "dragon-npu-test".to_string(),
+                producer_name: "earth-dragon-npu-test".to_string(),
                 graph: Some(GraphProto {
                     node: vec![NodeProto {
                         op_type: "conv".to_string(),

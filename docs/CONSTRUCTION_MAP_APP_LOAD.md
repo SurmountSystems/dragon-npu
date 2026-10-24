@@ -1,6 +1,6 @@
 # Construction map — how loadable bytes are built (APP_LOAD residual)
 
-**Date:** 2026-07-20  
+**Date:** 2026-07-20
 **Status:** Offline research notes only. **Not** a Pass. **Not** a live unlock.
 **Not** a new lettered track. Named question: *how does a working public stack
 build what firmware loads, and what does our lab build instead?*
@@ -32,6 +32,7 @@ firmware accepts — then diff that against what we submit.
 | **PDI** | Opaque app/partition blob inside the xclbin; public stack registers it on the hardware context. |
 | **CU** | Compute unit (one programmed slot the xclbin defines). |
 | **CONFIG_CU** | Ioctl after create-context: “this CU uses that PDI buffer.” Lab: optional via `XDNA2_LAB_PDI_BLOB` (default off). |
+| **DBG_BUF** | Optional hwctx debug buffer (`ASSIGN_DBG_BUF` / `REMOVE_DBG_BUF` in public uAPI; XRT `config_ctx_debug_bo`). **AIE2 pack (C6):** `pack_config_hwctx_dbg_buf_aie2` / `validate_config_hwctx_dbg_buf_aie2` (`param_val` = BO handle value). Soft prep: `format_c6_debug_bo_prep_note`. **Research-gated wire:** `DirectSubmission::config_hwctx_dbg_buf` refuse unless `XDNA2_LAB_RESEARCH_DEBUG_BO` set. **Lab timed path:** when that env is set, `try_lab_attach_research_debug_bo_from_env` CREATE 4096 B **Dev** (`AMDXDNA_BO_DEV`; not Shmem — driver type filter; live `48da6e60` Shmem failed) + Assign after hwctx (REMOVE on guard drop); soft: `format_research_debug_bo_config_detail` / `lab_debug_bo_attach=1` / `debug_bo_ty=dev`. Env unset → no DBG_BUF. Assign alone ≠ Pass. |
 | **ctrltext** | Per-job tile program (what we peel from `lab_instr.elf`). |
 | **START_NPU** | The run-this-job command (instruction buffer + I/O buffers). |
 | **Privilege (product)** | Admin installs driver/udev **once**; product users open `/dev/accel` **without** sudo. Lab L3 flip is research-only — see [`XDNA2_NEVER_AGAIN.md`](./XDNA2_NEVER_AGAIN.md) § Product vs lab privileges. |
@@ -176,6 +177,87 @@ silicon corpus is **`silicon_lab/lab_instr.elf`**.
 
 ---
 
+## Wave W0 depth — three construction paths + BO pins (2026-08-11)
+
+**Research only. invent_pass=0. Not Pass. Not residual match. Not unlock alone.**
+Named offline facts only (measured or open-source map). Soft compare ≠ Pass.
+
+### Three distinct construction paths (easy to conflate)
+
+| Path | Who builds | Order (summary) | Present in bag / lab? |
+|------|------------|-----------------|------------------------|
+| **A. XRT/DD production (KMQ)** | Shim + driver on live NPU | xclbin → CREATE_HWCTX → **CONFIG_CU** (PDI BO per CU) → per job aiebu peel/patch → **START_NPU** (instr Dev BO + IFM/WTS/OFM kernel args, `prop_count=0`) → EXEC/WAIT | Not captured as post-patch residual identity on this host |
+| **B. Lab pure-direct** | dragon-npu silicon_lab | CREATE_HWCTX (no xclbin) → optional CONFIG_CU → DD classic 1688 + aiebu ELF rela×12 → START_NPU content=1688 layout xrt3 → EXEC | Live residual: historical `0x3000003`; post-CONFIG_CU flexml class `wait_cmd_einval` |
+| **C. mlir-aie / IRON AOT (research generator)** | Public example AOT **offline** | Peano cores + CDO → **xclbin + PDI + insts.bin** emit **without** host EXEC → host `aiebu-asm -t aie2txn` → peel `.ctrltext` | Under `testdata/xdna2_cmd/external_known_good/` (vector 300 / single_core 660 / whole_array 2592 + siblings). **RESEARCH ONLY** |
+
+Path C is **not** a completing XRT/DD load on this firmware. It is a public
+generator of **roles** (ctrltext vs PDI vs core ELF) for offline classify.
+**Do not** treat Path C bins as residual identity or Pass.
+
+### Artifact roles (IRON bag; measured offline)
+
+| Artifact | Role in load map | Lab analogue | Notes |
+|----------|------------------|--------------|-------|
+| `*.ctrltext.bin` / peeled `.ctrltext` | START_NPU **instruction_buffer** body | silicon_lab 1688 ctrltext | Primary soft-compare body |
+| `*.insts.bin` | Raw txn before/after aiebu normalize | DD `lab_instr.bin` | May **≠** peel sha (aiebu normalizes a header field; vector 300 is identical; 660/2592 peels differ) |
+| `*.insts.elf` | aiebu ELF (`.ctrltext` + `.rela.dyn` + `.dynsym`) | `lab_instr.elf` | Rela counts: lab **12**, vector **1**, single_core **5**, whole_array **20** |
+| `*.pdi` | CONFIG_CU opaque app image candidate | `XDNA2_LAB_PDI_BLOB` | Sizes 2528 / 5536 / 66864 **≠** spent flexml 27200/21664/13792 |
+| `*.xclbin` | Container (section map research only) | none in pure-direct | Markers/offsets offline; no private body decode |
+| `*_core.elf` | Peano **compute** kernel | none on START_NPU path | **Not** ctrltext; do not EXEC as instr BO |
+
+### START_NPU + BO pin order (XRT-ish vs lab)
+
+Open-source map (`docs/XDNA2_XRT_CONTRACT_MLADF.md` + shim `exec_buf.h` /
+`elf_io` + lab path):
+
+```text
+# Production / shim elf_io shape (after CONFIG_CU when xclbin path used)
+CREATE_BO(Dev) instr  → fill peeled+patched ctrltext
+CREATE_BO(Shmem) IFM / WTS / OFM  (+ optional CTRL)
+START_NPU:
+  instruction_buffer      = instr BO xdna_addr
+  instruction_buffer_size = content length (not whole page unless size_mode=bo)
+  instruction_prop_count  = 0
+  kernel args (xrt3): n_bos=3, pad, IFM, WTS, OFM, pads  → 15 u32
+EXEC_CMD pins arg_bo_handles; WAIT_CMD → ERT Completed + OFM check (Pass only then)
+
+# Lab pure-direct (silicon_lab)
+same START_NPU shape when LAB_OFM + pack mode
+CTRL may be 4th BO (count4) or meta patch-only
+rela patch: overwrite default (sym 1=IFM, 2=WTS, 3=OFM)
+```
+
+**Closed offline as sole root of historical APP_LOAD:** raw bin, content vs bo
+size mode, xrt3 vs count4, rela overwrite vs add, QoS/tiles, DevHeap 64 MiB.
+**Open:** matched material + topology (B1 hypothesis: flexml PDI vs lab classic
+ctrltext mismatch) and residual class honesty after attach/skip.
+
+### Isolation measured (live, already CONSUMED — do not re-run)
+
+| Shot | What | Result (honest) |
+|------|------|-----------------|
+| flexml CONFIG_CU attach (`2ae69036` / `8352882b` / `efd44f35`) | Path B + research PDI | Attach OK → post-submit **`wait_cmd_einval`**; some IO_PAGE_FAULT bands. **≠ Pass** |
+| skip-CONFIG_CU (`1f761bf4`) | Path B **without** PDI overlay | **`wait_cmd_einval` persists**; `config_cu_present=0`; total ~0.17s. Overlay is **not** sole residual root. **≠ Pass** |
+
+Unlock stamps above are **CONSUMED**. invent_pass=0. No re-live under same unlock.
+
+### Size-class / structural axes vs residual oracles (cite only)
+
+| Stream | len | `CtrltextSizeClass` | Header (aiebu report) | rela | vs lab 1688 |
+|--------|----:|---------------------|----------------------|-----:|-------------|
+| lab classic | 1688 | `mladf_classic_1688` | ops **40**, gen4, **8×6** | 12 | self oracle |
+| vector_scalar_add | 300 | `small_public_npu2` | classic aiebu wrap (rela×1) | 1 | size_class_match=0 |
+| single_core matmul | 660 | `small_public_npu2` | ops **17**, gen4, **1×6** | 5 | size_class_match=0; header_cols_diff vs 8 |
+| whole_array matmul | 2592 | `other` (>1024, ≠1688) | ops **68**, gen4, **8×6** | 20 | size_class_match=0; ops_diff=28 |
+
+Route B tools: `research_external_vs_lab_structural_distance`,
+`compare_rela_structure_lab_vs_external_elf`,
+`fingerprint_capture_material_dir_research`,
+`classify_material_residual_match` (always `residual_matched_claim=0` offline).
+**Distance ≠ match ≠ Pass.** Report: `.agents/reports/wave0-structural-diff.md`.
+
+---
+
 ## What this is **not** (honesty)
 
 - Not proof that missing CONFIG_CU alone causes `0x3000003` on START_NPU.
@@ -194,38 +276,209 @@ silicon corpus is **`silicon_lab/lab_instr.elf`**.
 | Track | Command | What it does |
 |-------|---------|--------------|
 | A prep | `bash tools/dump_xclbin_pdi.sh --print-env` | Dump opaque PDI; print `XDNA2_LAB_PDI_BLOB=` |
+| **A max-prep** | `bash tools/operator_app_load_kit.sh config-cu` | a-prep + pin last_apply + preflight + filled sandwich |
+| Post evidence | `bash tools/collect_post_c2_evidence.sh [json]` | Journal + p5 pack after restore (no L3) |
 | A+B kit | `bash tools/operator_app_load_kit.sh` | Overview + status both tracks |
 | B status | `bash tools/operator_external_capture.sh --status` | Capture dir ready? |
 | B install | `… --install /path/ctrltext.bin` | Safe copy into `external_known_good/` |
 | B compare | `… --compare` | Soft classify with external path |
 
-Live apply under active one-shot **`C_UNLOCK=3a70fabf`** (CONFIG_CU + PDI path);
-never reopen consumed `b17b0119`. Attach CONFIG_CU ≠ Pass.
+Live apply only under an **active** one-shot in `RESIDUAL.md` (CONFIG_CU + PDI
+path; ≥120s outer). **Current unlock: none.** All prior one-shots CONSUMED
+(`2ae69036` flexml, `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119`). Attach
+CONFIG_CU ≠ Pass. invent_pass=0.
+
+### Spent vs unspent research PDI ledger (not product known-good)
+
+| tag | pdi_bytes | sha16 (16) | Live status |
+|-----|-----------|------------|-------------|
+| flexml STX `unified-2x4x4` | 27200 | `0eeeb70c84df056e` | **Spent** under `2ae69036` (`wait_cmd_einval`; not Pass) |
+| flexml STX `llm-2x4x4` | 21664 | `ba0cd738fd870011` | **Not spent** (unspent candidate; needs **new** unlock) |
+| flexml STX `unified-4x4` | 13792 | `7d172bf223a9b06b` | **Not spent** (weaker topology A/B; needs **new** unlock) |
+| CVML AIE2P 4x4 Overlay | 283840 | `a1e65d04add3422c` | **Spent** prior unlocks (orphan IO_PAGE_FAULT class) |
+
+Research dump path: `tools/dump_xclbin_pdi.sh` / `pass_unblock_fingerprint_once.sh`.
+**Never** treat these as product known-good. Re-live spent FPs alone is not progress.
+
+## Public-stack ctrltext extract playbook (path B)
+
+**Research only. invent_pass=0. Match ≠ Pass. Capture ≠ C-ready ≠ `ran_on_npu`.**
+
+**Hard rule:** residual tools need **concrete binaries** under
+`testdata/xdna2_cmd/external_known_good/` (or
+`bash tools/pass_unblock_once.sh --ingest PATH [NAME]` — **PATH required**).
+A **source clone alone is not capture material.**
+
+Exact operator steps when you have a public stack that **completes** on this NPU:
+
+1. **Run a working public stack** that finishes EXEC (ERT Completed + useful OFM).
+   Prefer the same mladf key family as lab when possible (`…_1_1152_256_128`).
+   Stacks: XRT / DynamicDispatch / Ryzen AI EP (outside this repo).
+2. **Capture post-patch ctrltext** (instruction BO image after peel/patch that
+   goes into START_NPU), or aiebu ELF with the peel step documented.
+3. **Ingest into the capture directory** (primary entrypoint):
+
+   ```bash
+   cd ~/Projects/ai/dragon-npu
+   bash tools/pass_unblock_once.sh --ingest /path/to/ctrltext.bin working_stack_ctrltext.bin
+   # same install surface:
+   # bash tools/operator_external_capture.sh --install /path/to/ctrltext.bin working_stack_ctrltext.bin
+   # kit: bash tools/operator_app_load_kit.sh b-install …
+   ```
+
+4. **Fill the capture table** in
+   `testdata/xdna2_cmd/external_known_good/PROVENANCE.md` (source stack, key,
+   peel/patch notes). Keep research-only honesty; no invent Pass tokens.
+5. **Soft compare** (no L3 / no ALLOW / no invent Pass):
+
+   ```bash
+   bash tools/operator_external_capture.sh --compare
+   # or kit: bash tools/operator_app_load_kit.sh b-compare
+   ```
+
+**Refuse list (not bag-eligible):** local oracles under lab / GT, including
+`gt_capture/instr_post_patch.bin`, `instr_vendor_post_patch.bin`,
+`ctrl_post_patch.bin`, `instr_raw_txn.bin`, `instr_vendor_txn_bin.bin`, and VE2
+`validate.xclbin` / `NOT_AIE2` stubs. Agent **must not invent** capture bytes.
+
+### MLIR-AIE / IRON material (concrete generator path)
+
+When you do **not** already have a completing XRT/DD stack: build a **small**
+public example (passthrough / vector_scalar_add / single_core matmul /
+getting_started), collect `*.xclbin` / `insts_*.bin` / aiebu elf / `.ctrltext`,
+ingest + PROVENANCE. Full step list:
+
+**[`docs/CAPTURE_MATERIAL_MLIR_AIE.md`](./CAPTURE_MATERIAL_MLIR_AIE.md)**
+
+That doc also covers Peano, aiebu, AMD IRON, and FastFlowLM/Lemonade **fallback
+intercept**. Clone-exists ≠ capture bins.
+
+## Residual-ready note (B1) — lab instruction key vs flexml overlay topology
+
+**Status for residual pin (Phase 2 owns `RESIDUAL.md`):** this is a **named
+hypothesis**, not a proven root cause, and **not** a Pass claim.
+
+| Fact (measured) | Interpretation (hypothesis only) |
+|-----------------|----------------------------------|
+| All three flexml STX CONFIG_CU research PDIs were live-attached under stock and then failed post-attach (`wait_cmd_einval`; some with journal `IO_PAGE_FAULT` / cmd timeout). Spent sha16: unified-2x4x4 `0eeeb70c…`, llm-2x4x4 `ba0cd738…`, unified-4x4 `7d172bf2…`. | Overlay attach alone did not unlock compute. |
+| Instruction path on those shots stayed the **lab classic pack key** `mladfmatmulbias_prmptflat_mladf_2x4x4_flat_a16fw4acc16f_1_1152_256_128` (silicon_lab aiebu ELF / 1688 B ctrltext). Live reports: `.agents/reports/live-shot-8352882b.md`, `live-shot-efd44f35.md`, `live-shot-2ae69036.md`. | **Hypothesis:** flexml overlay topology (partition / tile map / PDI) may be **mismatched** to the lab classic START_NPU ctrltext / map, so firmware accept-or-run fails even when CONFIG_CU attach returns success. |
+| Public mlir-aie npu2 AOT under `testdata/xdna2_cmd/external_known_good/` is **research only** (size class `public-npu2-small`; residual-mismatched to spent flexml and lab classic 1688). | Capture presence ≠ product known-good ≠ Pass. |
+
+**What this is not:** proven root cause; unlock justification alone; permission
+to re-live spent flexml; invent_pass. Citable in a future unlock **reason text**
+only with invent_pass=0 and a **new** named offline reason (e.g. skip-CONFIG_CU
+isolation or new material). See report
+`.agents/reports/impl-next-load-path-offline.md`.
+
+## Skip-CONFIG_CU offline prep checklist (A/B isolation)
+
+**Purpose:** isolate whether residual is **CONFIG_CU / PDI attach** vs
+**START_NPU / map / lab ctrltext**. Offline prep anytime; **live arm only** under
+a **new** active `C_UNLOCK` in `RESIDUAL.md`. invent_pass=0 always.
+**skip-CU prep ≠ Pass ≠ `ran_on_npu`.**
+
+### Exact env (skip arm)
+
+```bash
+# Required for skip arm (lab never issues CONFIG_CU):
+unset XDNA2_LAB_PDI_BLOB          # or leave empty — both mean no CONFIG_CU
+export XDNA2_LAB_SKIP_CONFIG_CU=1 # loud flag for logs / sandwich / last_apply pin name
+
+# Keep usual lab honesty (never sticky product Pass gates):
+unset XDNA2_ALLOW_EXEC_CMD
+# Optional BO diag on live: export XDNA2_LAB_BO_DIAG=1
+# Optional research: lab timed path CREATE+Assign 4096 B Dev debug BO
+# (AMDXDNA_BO_DEV; not Shmem — spent under 48da6e60; invent_pass=0; not Pass):
+# XDNA2_LAB_RESEARCH_DEBUG_BO=1
+```
+
+### Kit / script commands (prefer kit)
+
+| Offline (no unlock) | Live (active unlock only) |
+|---------------------|---------------------------|
+| `bash tools/operator_app_load_kit.sh config-cu-skip` | `bash tools/operator_app_load_kit.sh config-cu-run-skip` |
+| same: `bash tools/hitl_config_cu_once.sh prep-skip-pdi` | same: `bash tools/hitl_config_cu_once.sh run-stock-skip-pdi` |
+| Compare prep with CONFIG_CU: `… config-cu` / `prep` | Compare live with CONFIG_CU: `… config-cu-run` / `run-stock` |
+
+After any live shot: `bash tools/operator_app_load_kit.sh post-evidence [JSON]`
+then `bash tools/p5_post_c2_interpret.sh` (or c3+c4+p6). Outer live budget
+`--timeout-s=120` (or ≥120).
+
+### Spent-sha process refuse (still applies if someone points PDI at spent)
+
+Do **not** re-live these research fingerprints alone (attach already measured;
+re-live without a **new** unlock + named delta is banned):
+
+| Tag | Bytes | sha16 | Unlock (CONSUMED) |
+|-----|------:|-------|-------------------|
+| flexml unified-2x4x4 | 27200 | `0eeeb70c84df056e` | `2ae69036` |
+| flexml llm-2x4x4 | 21664 | `ba0cd738fd870011` | `8352882b` |
+| flexml unified-4x4 | 13792 | `7d172bf223a9b06b` | `efd44f35` |
+| CVML/AIE2P research dump | 283840 | `a1e65d04add3422c` | `97f38307` / priors |
+
+Skip arm must **not** export those paths as `XDNA2_LAB_PDI_BLOB`. If a spent
+path is set, you left the skip experiment (CONFIG_CU arm) and must still obey
+spent re-live rules. Ledger tooling:
+`bash tools/pass_unblock_fingerprint_once.sh --offline` (skip spent re-dump
+unless `--force`).
+
+### Expected residual classes (honest; not Pass)
+
+| Class / signal | May appear on skip arm? | Notes |
+|----------------|-------------------------|--------|
+| `config_cu=0` / absent in last_apply | **Yes (expected)** | No PDI → no CONFIG_CU |
+| `wait_cmd_einval` | Possible | Same post-submit class as flexml attach shots |
+| `wait_timeout` | Possible | True WAIT timeout (classifier-honest) |
+| `app_load_pdi_fail_after_aiebu` / FW `0x3000003` | Possible | Historical without matched load image |
+| Journal `IO_PAGE_FAULT` / `aie2_set_cmd_timeout` | Possible | Orphan vs BO map is offline audit only |
+| `config_cu=1` + attach | **No** on pure skip | If present, PDI was set — not skip arm |
+| Product Pass / `ran_on_npu=true` | **No** until OFM allclose + ERT Completed + decide | invent_pass=0 |
+
+### A/B live sequence (docs only until new unlock)
+
+| Step | Action | Notes |
+|------|--------|-------|
+| 1 | Offline prep **with** CONFIG_CU | `kit config-cu` / `hitl_config_cu_once prep` |
+| 2 | Offline prep **without** CONFIG_CU | `kit config-cu-skip` → `SKIP=1`, PDI unset |
+| 3 | Live arm A (CONFIG_CU) | Only under **new** active unlock; prefer **new** material, not spent flexml alone |
+| 4 | Live arm B (skip-PDI) | Only under **new** unlock (or operator-documented two-arm plan); `config-cu-run-skip` |
+| 5 | Compare last_apply + journal | `config_cu=` present vs absent; status / page-fault / timeout class |
+| 6 | Never claim Pass from either arm alone | invent_pass=0; attach ≠ Pass; skip prep ≠ Pass |
+
+**Hard rules:** active unlock required for live; never auto-mint unlock; do not
+reopen CONSUMED stamps (`efd44f35`, `8352882b`, `2ae69036`, `97f38307`,
+`11bc9016`, `3a70fabf`, `b17b0119`); tool headers:
+`tools/hitl_config_cu_once.sh`, `tools/operator_app_load_kit.sh`.
 
 ## Highest-value next offline questions (named, not track letters)
 
-1. **PDI / CONFIG_CU live effect**  
-   With `XDNA2_LAB_PDI_BLOB` set from host overlay dump, does one supervised
-   live apply change journal status vs locked `0x3000003`? Use active one-shot
-   `C_UNLOCK=3a70fabf`; unlock ≠ Pass; wrong overlay may still `0x3000003`.
-   Then capture mladf-related PDI or path B if still failing.
+1. **Load-accepted / residual-matched material (offline first)**
+   Public IRON bins are present (`public-npu2-small` + whole_array `other`) but
+   **residual-mismatched** to lab classic 1688 and spent flexml PDI class.
+   Prefer material that shares lab classic topology **or** a public stack that
+   **completes** EXEC on this firmware (true path-B capture). Soft classify /
+   Route B distance OK; **≠** Pass **≠** unlock alone.
 
-2. **Known-good instruction BO capture (path B)**  
-   From a higher-level run that succeeds (Ryzen AI / ORT / DD execute), capture
-   the **post-patch ctrltext** (or instr BO) and soft-compare via
-   `tools/operator_external_capture.sh`. Prefer public tooling over reopening
-   L3 under consumed unlock.
+2. **Known-good instruction BO capture (path B, no unlock)**
+   Follow **Public-stack ctrltext extract playbook** above → ingest → PROVENANCE
+   → soft compare. Prefer completing XRT/DD over reopening L3 under consumed
+   unlock. Generator playbook:
+   **[`CAPTURE_MATERIAL_MLIR_AIE.md`](./CAPTURE_MATERIAL_MLIR_AIE.md)**.
+   **Source tree ≠ capture material.** Public bins remain research only.
 
-3. **Triton-XDNA / mlir-aie artifacts**  
-   Secondary: what does a successful open matmul hand to XRT (`aie.xclbin` /
-   equivalent)? Map sections to PDI vs ctrltext roles. Only after (1)/(2) if
-   still blocked.
+3. **Next live only under new unlock + named reason**
+   Prior: skip-CONFIG_CU isolation **already run** under `1f761bf4` CONSUMED
+   (residual persisted without overlay). Do **not** empty-reconfirm skip-CU.
+   Future live needs **new** host-minted unlock + offline reason (new material
+   and/or named delta). invent_pass=0.
 
-4. **Do not**  
-   - Empty gate-only stamp rolls  
-   - Reopen execute-allow under `C_UNLOCK=b17b0119`  
-   - Re-run closed env matrix (content / xrt3 / rela add) without new bytes  
-   - Invent `ran_on_npu`
+4. **Do not**
+   - Empty gate-only stamp rolls / empty reconfirm mill
+   - Reopen execute-allow under any CONSUMED unlock
+   - Re-live spent flexml / CVML sha16 alone
+   - Re-run closed env matrix (content / xrt3 / rela add) without new bytes
+   - Invent `ran_on_npu` / invent residual_matched / invent capture bytes
+   - Claim Pass from attach, capture presence, or structural distance alone
 
 ---
 
@@ -277,6 +530,8 @@ Offline helpers in `src/backends/amd_xdna2/silicon_contract.rs` (re-exported fro
 | External bag confinement + load (`fec9c58b`) | `external_known_good_path_is_allowed` / `_load_path_is_allowed` / `load_external_ctrltext_for_compare` / `load_external_ctrltext_from_env`. Roots: clamped `temp_dir` ∪ `testdata/xdna2_cmd/external_known_good/`. Ext: `.bin` / `.ctrltext`. Refuse local post-patch oracle basenames. Size-capped via `read_lab_file_capped`. |
 | PROVENANCE field validation (`f06d5b38`) | `validate_external_known_good_provenance_text` / `external_known_good_lab_bag_provenance_allows_load` / `external_known_good_provenance_research_ready`. Lab bag load requires research-ready PROVENANCE: research-only honesty (prose or exact `not_c_ready=1`; **not** substring that matches `not_c_ready=0`) + source/stack (whole-token `xrt`) + refuse invent/honesty-inverse tokens (ascii-lower exact, incl. `product_known_good=1` / `not_c_ready=0`). Bag PROVENANCE only under bag root (no grandparent). Empty / missing markers fail-closed. Research-ready **≠** product known-good. |
 | Soft classify (optional) | `XDNA2_LAB_PRINT_C2_CMDBUF_RESEARCH=1` → `construction_path_research=` + `ctrltext_fingerprint_export=` + `lab_export_fingerprint_feed=` + `external_ctrltext_compare=` + `external_ctrltext_compare_dry_run=` (auto-feed via feed) + `app_load_bag_feed_dry_run_scorecard=` (composition; bag absent after feed → `blocked_on_external_bytes=1`) + `app_load_extract_bag_scorecard_pipeline=` (extract→bag→scorecard; markers without bytes still blocked) + `cu_pdi_necessity_research=` + `app_load_residual_axis_matrix=` + `xclbin_extract_research_dry_run=` + `cu_pdi_section_identity_research=` + `cu_pdi_section_offset_map_research=` + `cu_pdi_section_body_bounds_research=` + `app_load_partition_id_field_map=` + `external_known_good_provenance_check=` + `external_known_good_bag_drop_check=` + `app_load_e2e_fixture_research=` + `app_load_offline_progress_scorecard=` + `external_known_good_operator_extract_checklist=` in `examples/classify_last_apply.rs`. Optional `XDNA2_LAB_EXTERNAL_CTRLTEXT=` (confined) feeds compare/dry-run when set; unset → `blocked_on_external_bytes=1`. Optional `XDNA2_LAB_XCLBIN_SECTION_TEXT=` research section-name paste for pipeline extract input. Lab export auto-feeds from staged ELF when present. |
+| `WaitCmdEinvalAxes` + `parse_wait_cmd_einval_axes` / `format_wait_cmd_einval_axes_note` (`49feb5d2`) | Offline dig of WAIT_CMD EINVAL axes on lab classic START_NPU (skip-CONFIG_CU shape). Soft always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 axes_alone_not_pass=1 hypothesis_not_proven_root=1 product_pass_requires_live_decide=1`. Printed on soft classify when status/detail present (`wait_cmd_einval_axes=`). Axes alone ≠ Pass / ≠ proven root. |
+| `MaterialResidualMatchInventory` + `classify_material_residual_match` / `format_material_residual_match_note` / `format_material_residual_match_checklist` (`49feb5d2`) | Residual-matched criteria vs public-npu2-small research-only inventory. Size class band `CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES=1024` covers public peels 300 B + 660 B as research-only. **Hard lock:** `residual_matched_claim` never true offline. Soft always invent_pass=0 trio + `product_pass_requires_live_decide=1`. Soft classify prints inventory + checklist. |
 
 **Offline honesty:** Local pure-direct `gt_capture/instr_post_patch.bin` is **not**
 a working public-stack known-good capture. VE2 `validate.xclbin` is **NOT_AIE2**
@@ -294,7 +549,8 @@ Tests (filter): `cargo test --features amd-xdna2 --lib construction_path`,
 `app_load_partition_id`, `xclbin_`, `journal_failed_cmd`, `fingerprint_`,
 `external_known_good`, `app_load_e2e_fixture`, `bag_drop`,
 `app_load_offline_progress`, `operator_extract_checklist`,
-`external_ctrltext_compare_dry_run`, `lab_export_fingerprint_feed`.
+`external_ctrltext_compare_dry_run`, `lab_export_fingerprint_feed`,
+`wait_cmd_einval_axes`, `material_residual_match`.
 Map + TDD **≠** Pass / **≠** second C unlock.
 
 ---
@@ -400,14 +656,15 @@ Or pure unit: `load_external_ctrltext_for_compare` →
 
 - Capture **≠** Pass. Loading known-good for research **≠** C-ready **≠** second unlock.
 - Soft note always `product_known_good=0` even when research external present.
-- `C_UNLOCK=b17b0119` **CONSUMED** — do not reopen L3 under it.
+- **No active unlock.** All prior one-shots **CONSUMED** (`2ae69036` flexml,
+  `97f38307`, `11bc9016`, `3a70fabf`, `b17b0119`) — do not reopen L3 under them.
 
 ---
 
 ## See also
 
-- Residual SSoT: [`../RESIDUAL.md`](../RESIDUAL.md)  
-- Field contract: [`XDNA2_XRT_CONTRACT_MLADF.md`](./XDNA2_XRT_CONTRACT_MLADF.md)  
-- HITL recipe (CONSUMED): [`HITL_C_APP_LOAD_RECIPE.md`](./HITL_C_APP_LOAD_RECIPE.md)  
-- Stage script: `tools/stage_aiebu_lab_instr.sh`  
-- Agent policy: `AGENTS.md` standing §6–9  
+- Residual SSoT: [`../RESIDUAL.md`](../RESIDUAL.md)
+- Field contract: [`XDNA2_XRT_CONTRACT_MLADF.md`](./XDNA2_XRT_CONTRACT_MLADF.md)
+- HITL recipe (CONSUMED): [`HITL_C_APP_LOAD_RECIPE.md`](./HITL_C_APP_LOAD_RECIPE.md)
+- Stage script: `tools/stage_aiebu_lab_instr.sh`
+- Agent policy: `AGENTS.md` standing §6–9

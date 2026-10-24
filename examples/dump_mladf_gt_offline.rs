@@ -14,12 +14,14 @@
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used)]
 
 #[cfg(feature = "amd-xdna2")]
+use std::fmt::Write;
+#[cfg(feature = "amd-xdna2")]
 use std::fs;
 #[cfg(feature = "amd-xdna2")]
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::amd_xdna2::{
+use earth_dragon_npu::backends::amd_xdna2::{
     LAB_DEFAULT_QOS_FPS, LAB_DEFAULT_QOS_GOPS, LabInstrSizeMode, LabKernelArgLayout,
     STAGED_MLADF_CTRL_BYTES, STAGED_MLADF_IFM_BYTES, STAGED_MLADF_OFM_BYTES,
     STAGED_MLADF_WTS_BYTES, build_ert_start_npu_cmd_bo_with_kernel_args, format_dynsym_report,
@@ -56,12 +58,14 @@ fn main() {
 }
 
 #[cfg(feature = "amd-xdna2")]
+#[allow(clippy::too_many_lines)]
 fn run() -> i32 {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let silicon = root.join("testdata/xdna2_cmd/silicon_lab");
-    let out = std::env::var("XDNA2_GT_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| root.join("testdata/xdna2_cmd/gt_capture"));
+    let out = std::env::var("XDNA2_GT_OUT").map_or_else(
+        |_| root.join("testdata/xdna2_cmd/gt_capture"),
+        PathBuf::from,
+    );
 
     let elf_path = silicon.join("lab_instr.elf");
     let bin_path = silicon.join("lab_instr.bin");
@@ -69,12 +73,15 @@ fn run() -> i32 {
     let meta_path = silicon.join("lab_ctrl_meta.json");
 
     if !elf_path.is_file() {
-        eprintln!("ERROR: missing {elf_path:?}");
+        eprintln!("ERROR: missing {}", elf_path.display());
         eprintln!("  stage: bash tools/stage_aiebu_lab_instr.sh");
         return 2;
     }
     if !ctrl_path.is_file() || !meta_path.is_file() {
-        eprintln!("ERROR: missing lab_ctrl.bin or lab_ctrl_meta.json under {silicon:?}");
+        eprintln!(
+            "ERROR: missing lab_ctrl.bin or lab_ctrl_meta.json under {}",
+            silicon.display()
+        );
         return 2;
     }
 
@@ -86,7 +93,10 @@ fn run() -> i32 {
         }
     };
     if !is_aiebu_elf_ctrltext(&elf) {
-        eprintln!("ERROR: {elf_path:?} is not aiebu ELF with .ctrltext");
+        eprintln!(
+            "ERROR: {} is not aiebu ELF with .ctrltext",
+            elf_path.display()
+        );
         return 2;
     }
 
@@ -104,13 +114,16 @@ fn run() -> i32 {
 
     // Optional: XDNA2_GT_PADDRS_JSON with ifm_paddr/wts_paddr/ofm_paddr/ctrl_paddr as
     // hex strings or numbers — re-patch pure-direct with vendor/live paddrs for fair diff.
-    let (ifm_p, wts_p, ofm_p, ctrl_p, paddr_src) = load_gt_paddrs_or_synthetic().unwrap_or((
-        IFM_PADDR,
-        WTS_PADDR,
-        OFM_PADDR,
-        CTRL_PADDR,
-        "synthetic".to_string(),
-    ));
+    let (ifm_p, wts_p, ofm_p, ctrl_p, paddr_src) =
+        load_gt_paddrs_or_synthetic().unwrap_or_else(|| {
+            (
+                IFM_PADDR,
+                WTS_PADDR,
+                OFM_PADDR,
+                CTRL_PADDR,
+                "synthetic".to_string(),
+            )
+        });
     eprintln!(
         "gt paddrs source={paddr_src} ifm={ifm_p:#x} wts={wts_p:#x} ofm={ofm_p:#x} ctrl={ctrl_p:#x}"
     );
@@ -174,7 +187,7 @@ fn run() -> i32 {
     );
 
     if let Err(e) = fs::create_dir_all(&out) {
-        eprintln!("ERROR: mkdir {out:?}: {e}");
+        eprintln!("ERROR: mkdir {}: {e}", out.display());
         return 2;
     }
 
@@ -273,9 +286,9 @@ fn run() -> i32 {
         "tiles": 32,
         "qos_gops": LAB_DEFAULT_QOS_GOPS,
         "qos_fps": LAB_DEFAULT_QOS_FPS,
-        "mem_size": 262144,
+        "mem_size": 262_144,
         "umq_size": 16384,
-        "log_size": 131072,
+        "log_size": 131_072,
         "key": STAGED_KEY,
     });
     write_json(&out.join("hwctx.json"), &hwctx);
@@ -377,7 +390,7 @@ fn run() -> i32 {
     write_json(&out.join("contract.json"), &contract);
 
     let provenance = format!(
-        r#"# PROVENANCE — offline GT capture (dump_mladf_gt_offline)
+        r"# PROVENANCE — offline GT capture (dump_mladf_gt_offline)
 
 **Not live XRT BO dump. Not ran_on_npu.**
 
@@ -426,7 +439,7 @@ Pure-direct **patch oracle** for staged `lab_instr.elf` + `lab_ctrl.bin` + meta:
 6. Optional Milestone B OFM golden re-lock: `bash tools/hitl_b_gt_capture.sh --with-vendor`
 
 **Honesty:** unpatched CLASS A / mere `diff rc=0` = body match only → **≠ C-ready**, **≠ `ran_on_npu`**.
-"#
+"
     );
     if let Err(e) = fs::write(out.join("PROVENANCE.md"), provenance) {
         eprintln!("ERROR: write PROVENANCE: {e}");
@@ -453,7 +466,7 @@ Pure-direct **patch oracle** for staged `lab_instr.elf` + `lab_ctrl.bin` + meta:
         let p = out.join(name);
         if p.is_file() {
             let b = fs::read(&p).unwrap_or_default();
-            manifest.push_str(&format!("{}  {}\n", sha256_hex(&b), name));
+            let _ = writeln!(manifest, "{}  {}", sha256_hex(&b), name);
         }
     }
     if let Err(e) = fs::write(out.join("MANIFEST.sha256"), &manifest) {
@@ -487,7 +500,7 @@ Pure-direct **patch oracle** for staged `lab_instr.elf` + `lab_ctrl.bin` + meta:
 #[cfg(feature = "amd-xdna2")]
 fn write_json(path: &Path, v: &serde_json::Value) {
     let s = serde_json::to_string_pretty(v).expect("json");
-    fs::write(path, s).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+    fs::write(path, s).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 /// Load paddrs from `XDNA2_GT_PADDRS_JSON` when all of ifm/wts/ofm present.

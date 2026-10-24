@@ -166,6 +166,9 @@ run_hard_cargo_filter "classic_1688" "classic_1688"
 
 run_hard "bash -n hitl_c_pass_apply" bash -n tools/hitl_c_pass_apply.sh
 run_hard "bash -n hitl_c2_once" bash -n tools/hitl_c2_once.sh
+run_hard "bash -n hitl_config_cu_once" bash -n tools/hitl_config_cu_once.sh
+run_hard "bash -n collect_post_c2_evidence" bash -n tools/collect_post_c2_evidence.sh
+run_hard "bash -n operator_app_load_kit" bash -n tools/operator_app_load_kit.sh
 run_hard "bash -n c3_post_c2_classify" bash -n tools/c3_post_c2_classify.sh
 run_hard "bash -n c4_pass_check" bash -n tools/c4_pass_check.sh
 run_hard "bash -n p5_post_c2_interpret" bash -n tools/p5_post_c2_interpret.sh

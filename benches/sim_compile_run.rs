@@ -18,7 +18,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use dragon_npu::DragonNpu;
+use earth_dragon_npu::DragonNpu;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_matmul_relu.json")

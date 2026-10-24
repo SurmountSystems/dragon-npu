@@ -1,10 +1,10 @@
-/// Error types for DragonNPU.
+/// Error types for Earth Dragon NPU.
 ///
 /// All public APIs return `Result<T, DragonNpuError>`.
 /// Never use `Option` to represent errors.
 use thiserror::Error;
 
-/// The primary error type for all DragonNPU operations.
+/// The primary error type for all Earth Dragon NPU operations.
 ///
 /// Variants are descriptive and include context (model names, reasons, etc.)
 /// so that callers can produce good user-facing messages or logs.

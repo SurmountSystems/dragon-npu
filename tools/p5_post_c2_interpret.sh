@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # P5 post-C2 offline interpret — classify + C3 + C4 + P6 one-shot (no L3 / no ALLOW).
 #
-# IMPL 68eeaaf6: after operator sandwich (or anytime on fixture), interpret
-# last_apply offline. Prints dual residual honesty + CONFIG_CU tokens when
-# present. Unlock bookkeeping is **guidance only** — agent never auto-marks
-# C_UNLOCK=3a70fabf CONSUMED without real sandwich evidence.
+# IMPL 68eeaaf6 + post-timeout honesty: after operator sandwich (or anytime on
+# fixture), interpret last_apply offline. Prints dual residual honesty +
+# CONFIG_CU tokens when present. Unlock SSoT (latest consumed one-shot):
+# **C_UNLOCK=97f38307 CONSUMED** (2026-08-10 stock research-blob CONFIG_CU;
+# status=wait_cmd_einval; last_apply pin). Prior: 11bc9016 CONSUMED (2026-08-10);
+# 3a70fabf CONSUMED (2026-08-09 outer kill); b17b0119 CONSUMED historical.
+# Not active. Agent never auto-marks unlocks.
 #
 # What this does (offline only; NO L3 / NO EXEC / never sets ALLOW):
 #   1) Soft classify (tools/classify_last_apply_residual.sh)
@@ -68,7 +71,9 @@ CHILD_PATH_ARGS=()
 if [[ -n "$IN" ]]; then
   if [[ ! -f "$IN" ]]; then
     echo "ERROR: path not a file: $IN" >&2
-    echo "P5_INTERPRET_PATH_REFUSE invent_pass=0 not_c_ready=1 not_ran_on_npu=1" >&2
+    echo "PLAIN: Explicit pin missing — matches outer timeout kill before last_apply" >&2
+    echo "  stamp (incomplete evidence; not APP_LOAD classify; not product Pass)." >&2
+    echo "P5_INTERPRET_PATH_REFUSE invent_pass=0 not_c_ready=1 not_ran_on_npu=1 incomplete_timeout_or_missing_pin=1" >&2
     exit 2
   fi
   export XDNA2_LAB_LAST_APPLY_JSON="$IN"
@@ -78,10 +83,18 @@ fi
 echo "=== p5_post_c2_interpret (offline; ≠ Pass ≠ ran_on_npu ≠ auto-CONSUME unlock) ==="
 echo "ROOT=$ROOT"
 echo "NOTE: XDNA2_ALLOW_EXEC_CMD unset; never open L3; invent_pass=0 not_c_ready=1 not_ran_on_npu=1"
+echo "UNLOCK: C_UNLOCK=97f38307 is CONSUMED (not active; 2026-08-10 stock research-blob wait_cmd_einval). Further live C needs a new host-minted unlock after named offline delta."
 if [[ -n "${XDNA2_LAB_LAST_APPLY_JSON:-}" ]]; then
   echo "XDNA2_LAB_LAST_APPLY_JSON=$XDNA2_LAB_LAST_APPLY_JSON"
+  # Loud baseline fixture note if path is the locked repo last_apply.
+  case "${XDNA2_LAB_LAST_APPLY_JSON}" in
+    */testdata/xdna2_cmd/last_apply.json|"$ROOT/testdata/xdna2_cmd/last_apply.json")
+      echo "LOUD: path is locked baseline fixture (2026-07-18 APP_LOAD) — not a timeout/CONFIG_CU shot pin."
+      ;;
+  esac
 else
   echo "path: default (repo fixture or child discovery)"
+  echo "LOUD: no explicit pin — child may fall back to locked baseline fixture only."
 fi
 echo
 
@@ -128,11 +141,10 @@ echo "always: invent_pass=0 not_c_ready=1 not_ran_on_npu=1 product_pass_requires
 echo
 
 echo "--- unlock bookkeeping (human; agent does not auto-edit) ---"
-echo "Active one-shot: C_UNLOCK=3a70fabf (see RESIDUAL.md top Unlock row)."
-echo "Mark 3a70fabf CONSUMED in RESIDUAL **only if** a real L3 sandwich was run"
-echo "  (new last_apply vs locked baseline — C3_EVIDENCE / new path — not this soft script alone)."
-echo "Do **not** mark CONSUMED from locked-fixture C3_SKIP / C4_SKIP / P6_SKIP reconfirm."
-echo "Prior b17b0119 remains historical CONSUMED (do not reopen)."
+echo "C_UNLOCK=97f38307 is CONSUMED (2026-08-10 stock live: wait_cmd_einval after measured research-blob CONFIG_CU; see RESIDUAL)."
+echo "Not active. Do not reopen under 97f38307. Do not mark CONSUMED again from soft reconfirm."
+echo "Prior: 11bc9016 CONSUMED (2026-08-10); 3a70fabf CONSUMED (2026-08-09 outer timeout); b17b0119 CONSUMED historical."
+echo "Further live C needs a **new** host-minted unlock + named offline reason (capture / matmul PDI / driver-MMU)."
 echo "Agent: never open L3 / never ALLOW=1 / never invent Pass."
 echo
 

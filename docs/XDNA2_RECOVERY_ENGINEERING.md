@@ -101,6 +101,102 @@ Userspace already: feature `xdna2-dangerous-exec-cmd` default OFF + env
 `XDNA2_ALLOW_EXEC_CMD` unset; diagnose script; no auto scaffold submit
 (see `docs/XDNA2_NEVER_AGAIN.md`).
 
+### AIE4 power management and 17f0 recovery
+
+The 17f0 recovery procedure stays the diagnose, bridge reset of
+`0000:00:08.2`, and rescue module path in this file. AIE4 runtime power
+management is the V5 19 suspend and resume path that Lizhi Hou applied to
+drm-misc-next on 2026-10-21. That patch also assigns the existing
+`aie2_hw_suspend` and `aie2_hw_resume` as `.runtime_suspend` and
+`.runtime_resume` on `aie2_ops`. Those hooks are power management. They
+do not clear a wedged `amdxdna_drm_open`.
+
+This host is PCI `1022:17f0` revision `0x20`, which patch 5 leaves on
+`dev_npu6_info`. The AIE4 classic info struct `dev_npu3_classic_info`
+is the new `0x17f1` rows.
+
+The AIE4 job-timeout that stops a hardware context is a pattern for the
+`open` timeout / killable-wait row in the table above: a wait that can
+end, in place of an unbounded D-state inside SVA bind. V5 14 also makes
+the common HMM invalidate wait uninterruptible and unlimited
+(`dma_resv_wait_timeout` with `false` and `MAX_SCHEDULE_TIMEOUT`). That
+wait is a kernel-bump re-check. The list is D-AIE4-3 in
+`.agents/plans/plan-amd-aie4-kmq-pm-series.md`. It is a separate question
+from this recovery engine.
+
+invent_pass stays 0. Pass stays No. `ran_on_npu` stays false. Unlock
+none. First `C_UNLOCK=` is `2c9c12e8` CONSUMED.
+
+### AIE4 kernel submission and what 17f0 does not get (2026-10-24)
+
+The 17f0 procedure in this file does not change. It stays diagnose,
+bridge reset of `0000:00:08.2`, and the rescue module. Do not replace
+that with a runtime-PM resume.
+
+Lizhi Hou applied V5 "accel/amdxdna: Kernel submission and PM for AIE4"
+to drm-misc-next on 2026-10-21
+([14306](https://lkml.iu.edu/2610.2/14306.html), accessed: 2026-10-24).
+The pull
+[607373](https://lists.freedesktop.org/archives/dri-devel/2026-October/607373.html)
+(accessed: 2026-10-24) requests tag `drm-misc-next-2026-10-23` for
+v7.5. That name is a requested tag, not a released mainline tag. No
+mainline version is claimed here.
+
+Kernel-mode submit for NPU3 classic is not the AIE2 ops table. Patch 16
+sets `.cmd_submit = aie4_cmd_submit` on `const struct amdxdna_dev_ops
+aie4_classic_ops` in `drivers/accel/amdxdna/aie4_pci.c`
+([07861](https://lkml.iu.edu/2610.2/07861.html), accessed: 2026-10-24).
+The same file's `aie4_vf_ops` gets the same callback. Patch 5 points
+`dev_npu3_classic_info` at `&aie4_classic_ops` for `1022:17f1` revisions
+`0x10` and `0x13` (`npu3_regs.c`,
+[07943](https://lkml.iu.edu/2610.2/07943.html), accessed: 2026-10-24).
+`0x17f0` revision `0x20` stays `dev_npu6_info` and keeps the AIE2 submit
+path. Patch 5 also prints `.device_type = AMDXDNA_DEV_TYPE_UMQ` on
+`dev_npu3_classic_info`. The cover still calls the feature KMQ. Both
+lines were read. The enum word does not attach `aie4_cmd_submit` to this
+host.
+
+Linux master `npu6_regs.c` still has `.ops = &aie2_ops` on
+`dev_npu6_info`
+([npu6_regs.c](https://raw.githubusercontent.com/torvalds/linux/master/drivers/accel/amdxdna/npu6_regs.c),
+accessed: 2026-10-24). Patch 19 is the only AIE2 power hook in this
+series: `.runtime_suspend = aie2_hw_suspend` and
+`.runtime_resume = aie2_hw_resume` on `aie2_ops`
+([08350](https://lkml.iu.edu/2610.2/08350.html), accessed: 2026-10-24).
+That is not AIE4 job suspend. Patch 18 puts
+`.suspend = pm_ptr(aie4_classic_suspend)` on `aie4_classic_ops` and
+describes draining in-flight jobs, then recreating firmware contexts on
+resume
+([08021](https://lkml.iu.edu/2610.2/08021.html), accessed: 2026-10-24).
+That page does not use the words job-save or firmware-restore. The
+behavior on the page is AIE4-only. It does not change the 17f0 rescue
+steps.
+
+Clock, DPM, and resource queries are listed on the cover as AIE4
+patches. Patch 18's `aie4_restore_sriov()` is PF resume for AIE4 SR-IOV.
+No AIE2 hook for those queries was on the pages opened. They are N/A
+for `1022:17f0`.
+
+D-AIE4-3 stays. Patch 15 (`populate_range` moved into common GEM code,
+"No functional change for AIE2") and patch 02 (doorbell mmap removed,
+common `.mmap` set to `drm_gem_mmap`) are still shared-code re-checks.
+Do not delete that list.
+
+Horizon re-check, list only. Do not run it from this note:
+`power/runtime_status`, `autosuspend_delay_ms`, first-submit latency
+after idle, a submit across suspend/resume, and whether bridge reset of
+`0000:00:08.2` is still needed after resume.
+
+`uname -r` on this machine printed `7.2.11-zen1-1-zen`. The installed
+module's strings include `aie2_ops` and `aie2_cmd_submit`. They did not
+include `aie4_cmd_submit` or `aie4_classic`. That is a string search of
+`amdxdna.ko.zst`, not a claim from the uname line alone. The module
+build tree under that kernel only has `Kconfig` for this driver, not
+the C sources.
+
+invent_pass stays 0. Pass stays No. `ran_on_npu` stays false. Unlock
+none. First `C_UNLOCK=` is `2c9c12e8` CONSUMED. Do not mint.
+
 ## Relation to “fork Linux”
 
 We do **not** need a full distro kernel fork to start. We need:

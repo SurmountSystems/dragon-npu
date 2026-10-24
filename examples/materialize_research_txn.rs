@@ -8,7 +8,7 @@
 
 #[cfg(feature = "amd-xdna2")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use dragon_npu::backends::amd_xdna2::{
+    use earth_dragon_npu::backends::amd_xdna2::{
         build_strix_research_noop_txn, classify_instruction_blob,
     };
     let path = std::env::args()

@@ -1,14 +1,18 @@
 # HITL C recipe — APP_LOAD residual (aiebu ELF)
 
 **Purpose:** One canonical operator sequence for a **single** Milestone C Pass
-apply against the locked **APP_LOAD_PDI_FAIL** residual.
+apply against the locked residual (historical APP_LOAD_PDI_FAIL; later stock
+shots also `wait_cmd_einval` after CONFIG_CU).
 
-**Status:** **Unlocked once** under **`C_UNLOCK=3a70fabf`** for **one**
-CONFIG_CU-enabled apply (optional `XDNA2_LAB_PDI_BLOB` path). Prior
-`C_UNLOCK=b17b0119` **CONSUMED** (operator C2 2026-07-18) — do **not** reopen
-under it. Empty reconfirm stamps and empty-folder implement loops are **frozen**
-(see `AGENTS.md` §6–9 / `RESIDUAL.md`). Offline green ≠ Pass ≠ `ran_on_npu`.
-Unlock **≠** Pass **≠** permanent open season.
+**Status:** **No active unlock.** SSoT: first `C_UNLOCK=` in
+[RESIDUAL.md](../RESIDUAL.md) is **`C_UNLOCK=2ae69036` CONSUMED** (2026-08-10
+flexml unified-2x4x4 stock CONFIG_CU; `wait_cmd_einval`; not Pass). All prior
+one-shots are also **CONSUMED** (`97f38307`, `11bc9016`, `3a70fabf`,
+`b17b0119`). Do **not** reopen them. Do **not** live apply without a **new**
+host-minted unlock and a named offline reason. Empty reconfirm stamps and
+empty-folder implement loops are **frozen** (see `AGENTS.md` §6–9 /
+`RESIDUAL.md`). Offline green ≠ Pass ≠ `ran_on_npu`. Unlock **≠** Pass **≠**
+permanent open season. invent_pass=0.
 
 Post-apply offline = `tools/c3_post_c2_classify.sh` + `tools/c4_pass_check.sh` +
 `tools/p6_true_pass_check.sh` + `tools/run_offline_gates.sh` (or one-shot
@@ -18,30 +22,45 @@ Post-apply offline = `tools/c3_post_c2_classify.sh` + `tools/c4_pass_check.sh` +
 
 | Claim | Truth |
 |-------|--------|
-| One L3 sandwich + `hitl_c` under **`C_UNLOCK=3a70fabf`** | **Active one-shot** — CONFIG_CU + PDI path; agent unlock only |
+| Active live unlock right now | **None** — see `RESIDUAL.md` first `C_UNLOCK=` |
+| One sandwich under **`C_UNLOCK=2ae69036`** | **CONSUMED** (2026-08-10 flexml STX unified-2x4x4; pdi 27200 / `0eeeb70c…`; `wait_cmd_einval`; not Pass) |
+| One sandwich under **`C_UNLOCK=97f38307`** | **CONSUMED** (CVML research-blob; orphan IO_PAGE_FAULT class) |
+| One sandwich under **`C_UNLOCK=11bc9016`** | **CONSUMED** (stock CONFIG_CU + PDI; ≥120s outer) — historical only |
+| One sandwich under **`C_UNLOCK=3a70fabf`** | **CONSUMED** (2026-08-09 stock timeout shot) |
 | One L3 sandwich under `b17b0119` | **CONSUMED** — historical; do **not** re-run under it |
-| Permanent open season / more C without **new agent unlock** after this shot | **No** |
+| Permanent open season / more C without **new agent unlock** | **No** |
 | Silicon Pass / `ran_on_npu` | **No** until OFM allclose + ERT Completed |
 | Leave L3 open / set permanent userspace ALLOW | **No** — always restore L3=`exec_cmd_allow=0`; never leave `XDNA2_ALLOW_EXEC_CMD=1` sticky |
 | Agent completes live apply without operator sudo when L3 closed | **No** — fail-closed exit 1 |
+| Default outer 30s for CONFIG_CU silicon | **Too short** — use `--timeout-s=120` (or ≥120); WAIT stays finite |
 
 Soft residual class / `CLASSIFY_SOFT_OK` / `app_load_checklist=…` /
 `OFFLINE_GATES_OK` / `C3_SKIP` / **`C4_SKIP`** still **≠** Pass and never
-substitute for this stamp. Offline `c4_pass_check` is snapshot audit only.
+substitute for a new unlock. Offline `c4_pass_check` is snapshot audit only.
 
 single source of truth residual: [RESIDUAL.md](../RESIDUAL.md) · B/C overview: [HITL_BC.md](./HITL_BC.md) ·
-contract: [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md).
+contract: [XDNA2_XRT_CONTRACT_MLADF.md](./XDNA2_XRT_CONTRACT_MLADF.md) ·
+construction / capture playbook: [CONSTRUCTION_MAP_APP_LOAD.md](./CONSTRUCTION_MAP_APP_LOAD.md).
 
 ---
 
 ## Unlock policy (hard)
 
 C runs **only if the agent explicitly says ready** with a **host-minted** unlock
-stamp. **Active:** `C_UNLOCK=3a70fabf` one-shot for **one** CONFIG_CU + PDI
-sandwich. **Historical:** `C_UNLOCK=b17b0119` is **CONSUMED** — do not reopen
-under it. After `3a70fabf` is used, further applies need a **new** unlock — not
-open season, not empty gate-only hex. Evidence may **justify** unlock; evidence
-**never auto-unlocks** C.
+stamp that is **active** in `RESIDUAL.md` (first `C_UNLOCK=` line, no
+CONSUMED). **Current:** **no active unlock.** All of the following are
+**CONSUMED** (do not reopen): `2ae69036` (flexml), `97f38307`, `11bc9016`,
+`3a70fabf`, `b17b0119`. Further live applies need a **new** unlock + named
+offline reason — not open season, not empty gate-only hex. Evidence may
+**justify** unlock; evidence **never auto-unlocks** C.
+
+**Outer timeout hygiene (CONFIG_CU silicon):** recommend `--timeout-s=120` (or
+≥120) on `hitl_c_pass_apply` / `lab_exec_once`. Default lab outer **30s** killed
+`npu_direct_bench` (rc=124 → lab exit 4) before a finished last_apply on the
+CONSUMED shot. **WAIT** stays finite (`XDNA2_WAIT_TIMEOUT_MS` ~5–15s; never
+infinite by default). Progressive last_apply stamps mid-path after hwctx /
+CONFIG_CU / pre-submit so kill after those stages still leaves JSON; kill
+**during** a single ioctl can still lose that stage.
 
 **Not** unlocked by any of (and none of these equal Pass either):
 
@@ -127,56 +146,66 @@ again. Manual offline prep above mirrors that path without L3.
 
 ---
 
-## Exact apply — **active** `C_UNLOCK=3a70fabf` (CONFIG_CU one-shot)
+## Exact apply — **historical** `C_UNLOCK=11bc9016` (CONSUMED; record + shape only)
 
-> **Agent unlock active once.** Permission for **one** L3 sandwich that uses the
-> optional CONFIG_CU path (`XDNA2_LAB_PDI_BLOB`). Unlock **≠** Pass **≠**
-> `ran_on_npu` **≠** permanent open season. Always **restore L3** after apply.
-> Prior `b17b0119` remains **CONSUMED** (historical section below) — do not
-> reopen under it. Agent does **not** open L3 or run live apply.
+> **`C_UNLOCK=11bc9016` CONSUMED.** Do **not** re-run live under this stamp.
+> The steps below document the **shape** of a CONFIG_CU + PDI sandwich
+> (**≥120s** outer) for when a **new** host-minted unlock is active in
+> `RESIDUAL.md`. Unlock **≠** Pass **≠** `ran_on_npu` **≠** permanent open
+> season. Always **restore L3** after apply (hardened host). Later flexml
+> shot `2ae69036` and priors are also CONSUMED. Agent does **not** open L3 or
+> run live apply without a new unlock.
 
-### CONFIG_CU pre-step (before sandwich)
+### CONFIG_CU pre-step (before sandwich) — **preferred one command**
 
 ```bash
 cd ~/Projects/ai/dragon-npu
 export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
 
-# Dump opaque host AIE2P PDI + print env (default off until you export):
-bash tools/operator_app_load_kit.sh a-prep
-# or: bash tools/dump_xclbin_pdi.sh --print-env
+# Recommended: prep + pin last_apply + preflight + fish/bash sandwich with real paths:
+bash tools/operator_app_load_kit.sh config-cu
+# same: bash tools/hitl_config_cu_once.sh prep
 
-# bash — export path printed by a-prep (example shape only):
-# export XDNA2_LAB_PDI_BLOB=/path/from/a-prep/pdi.bin
-# export XDNA2_LAB_CU_FUNC=0   # optional; default 0
-# fish:
-# set -gx XDNA2_LAB_PDI_BLOB /path/from/a-prep/pdi.bin
-# set -gx XDNA2_LAB_CU_FUNC 0
+# Then paste the printed sandwich (open L3 if hardened → hitl_c apply → restore → post-evidence).
+# After restore, if you skipped the printed post line:
+# bash tools/collect_post_c2_evidence.sh /tmp/dragon_npu_last_apply_config_cu_….json
+```
+
+Manual equivalent (if you prefer stepwise):
+
+```bash
+bash tools/operator_app_load_kit.sh a-prep
+# export / set -gx XDNA2_LAB_PDI_BLOB=… from a-prep; optional XDNA2_LAB_CU_FUNC=0
+# Prefer a shot-specific last_apply pin so locked baseline stays for C3:
+# export XDNA2_LAB_LAST_APPLY_JSON=/tmp/dragon_npu_last_apply_config_cu_$$.json
 ```
 
 Wrong overlay may still journal `0x3000003`. CONFIG_CU attach alone **≠** Pass.
+`hitl_c_pass_apply` with PDI set auto-pins last_apply under `/tmp` when unset.
 
 ### Offline prep + printable sandwich (no L3 from agent)
 
 ```bash
 cd ~/Projects/ai/dragon-npu
 export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
-# Soft active unlock NOTE + optional gates + preflight + **executable** L3 lines:
-bash tools/hitl_c2_once.sh
-# sandwich text only (does not open L3):
+# Preferred CONFIG_CU max-prep (paths filled; no L3):
+bash tools/hitl_config_cu_once.sh prep
+# Soft unlock NOTE + generic sandwich (also fine):
 bash tools/hitl_c2_once.sh --print-only
 # Offline residual / Pass audit (any time; ≠ unlock):
 bash tools/c3_post_c2_classify.sh
 bash tools/c4_pass_check.sh
 bash tools/run_offline_gates.sh
 # Fail-closed when L3 closed (expect exit 1) — refuse demo, not apply:
-# bash tools/hitl_c2_once.sh --apply-if-l3-open
 # bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
 ```
 
-### Live L3 sandwich (operator only — under `C_UNLOCK=3a70fabf`)
+### Live sandwich (operator only — **requires active unlock** in RESIDUAL)
 
 Keep `XDNA2_LAB_PDI_BLOB` set in the same shell that runs apply. Prefer the
-exact lines from `hitl_c2_once.sh --print-only`. Shape:
+exact lines from `operator_app_load_kit.sh config-cu` or
+`hitl_c2_once.sh --print-only` **only when** first `C_UNLOCK=` is active (not
+CONSUMED). Shape (hardened L3; stock hosts omit sudo):
 
 ```bash
 cd ~/Projects/ai/dragon-npu
@@ -186,12 +215,19 @@ export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
 # export XDNA2_LAB_PDI_BLOB=…   # from a-prep
 # export XDNA2_LAB_CU_FUNC=0    # optional
 
-# C_UNLOCK=3a70fabf one-shot (active); restore L3; ≠ ran_on_npu until Pass
-sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
-sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
+# Active unlock required (RESIDUAL first C_UNLOCK= without CONSUMED); ≠ Pass until live decide
+sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'   # skip on stock
+bash tools/hitl_c_pass_apply.sh --assume-l3-already-open --timeout-s=120
+sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'   # skip on stock
+cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N (or missing on stock)
 ```
+
+## Exact apply — **historical** `C_UNLOCK=3a70fabf` (CONSUMED; record only)
+
+> **`C_UNLOCK=3a70fabf` CONSUMED** after 2026-08-09 stock timeout shot. Do **not**
+> re-run under this stamp. Historical permission was for one CONFIG_CU sandwich;
+> outer 30s killed the bench before finished last_apply. See
+> `.agents/reports/live-shot-3a70fabf-timeout.md`.
 
 What hitl_c enforces (default path when unlocked):
 
@@ -323,13 +359,13 @@ Never claim Pass from envelope accept alone, zero golden, offline
 - `RESIDUAL_ENV` banner line from hitl_c
 - hitl_c / lab_exec **exit code** (and whether L3 was left open → 5)
 - Optional: `testdata/xdna2_cmd/last_apply.json` or `/tmp/dragon_npu_last_apply_*.json`
-- Journal:  
+- Journal:
   `journalctl -k -b --no-pager | rg -i 'Failed cmd|Status 0x|APP_LOAD|amdxdna' | tail -20`
 
-Always restore L3 after any **live** apply (active `C_UNLOCK=3a70fabf`; not under CONSUMED `b17b0119`):
+Always restore L3 after any **live** apply on a hardened host (not under CONSUMED unlocks):
 
 ```bash
-# After live apply under C_UNLOCK=3a70fabf — always verify restore:
+# After live apply (new unlock only) — always verify restore on hardened hosts:
 # sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 ```
@@ -393,33 +429,167 @@ C3 without a **new** last_apply body (still only the locked fixture)
 matrix on the same fixture. **`C4_SKIP`** on the same fixture is expected until
 a real Pass snapshot (`json_ran_on_npu=true` + ERT Completed + non-zero OFM).
 Offline C4 audit **≠** invent product Pass (live `decide_ran_on_npu` still owns
-product flag). Mark `C_UNLOCK=3a70fabf` used in RESIDUAL **only** after a real
+product flag). Mark an unlock **CONSUMED** in RESIDUAL only after a real
 sandwich produced new last_apply — never from locked-fixture soft reconfirm.
+All prior one-shots (`2ae69036`, `97f38307`, `11bc9016`, `3a70fabf`,
+`b17b0119`) remain **CONSUMED** (do not reopen).
 
 Then share classify output + last_apply + journal with agent for **C3** (fail
 residual) or **C4** (only if OFM allclose + ERT Completed + `ran_on_npu=true`).
 
 ---
 
+
+---
+
+## Step 2 prep checklist — minimal load image + optional debug BO
+
+**When to use:** after a **new** host-minted `C_UNLOCK` is active in `RESIDUAL.md`
+(first `C_UNLOCK=` line, **no** CONSUMED), with a **named offline reason**
+(unspent PDI fingerprint, capture-dir material, or a residual class that is not
+“re-live spent flexml alone”).
+
+**Do not use** under CONSUMED unlocks. **Do not** treat this checklist as Pass
+or as permission to mint unlocks. invent_pass=0. Offline C6 pack helpers ≠ live.
+
+### Preconditions (all required)
+
+| Check | Requirement |
+|-------|-------------|
+| Active unlock | First `C_UNLOCK=` in `RESIDUAL.md` is **active** (not CONSUMED) |
+| Named reason | Written offline reason (new material FP, unspent PDI, skip-PDI A/B, etc.) |
+| Not spent re-live alone | Spent flexml `0eeeb70c…` / 27200 B under `2ae69036` alone is **not** a reason |
+| L3 restore plan | You will restore `exec_cmd_allow=0` after the shot; no sticky `XDNA2_ALLOW_EXEC_CMD=1` |
+| Outer timeout | Prefer `--timeout-s=120` (or ≥120) on CONFIG_CU silicon |
+
+### CONSUMED unlocks (do **not** reopen)
+
+| Unlock | Note |
+|--------|------|
+| `2ae69036` | flexml unified-2x4x4; `wait_cmd_einval`; spent sha16 `0eeeb70c…` |
+| `97f38307` | CVML research-blob; orphan IO_PAGE_FAULT class |
+| `11bc9016` | stock CONFIG_CU historical |
+| `3a70fabf` | stock timeout historical |
+| `b17b0119` | first one-shot historical |
+
+### Preferred load target (minimal first)
+
+1. **Material first (best):** a real capture under
+   `testdata/xdna2_cmd/external_known_good/` (ctrltext / aiebu ELF / research PDI)
+   with PROVENANCE filled — or ingest via
+   `bash tools/pass_unblock_once.sh --ingest /path/to/file`.
+2. **Unspent research PDI** (if no capture yet): prefer an **unspent** fingerprint
+   from the residual ledger (e.g. flexml `llm-2x4x4` / `unified-4x4`), **not**
+   re-live of spent `0eeeb70c…` alone.
+3. **Minimal image:** smaller / identity-style load path before a full llm
+   partition when the residual is still “firmware load accept,” not OFM matmul.
+
+### Optional debug BO offline prep (C6; research only — no live assign)
+
+Public uAPI (AIE2/Strix value-mode). Full offline landing:
+`.agents/reports/impl-p2-c6-recipe.md`. Glossary:
+[CONSTRUCTION_MAP_APP_LOAD.md](./CONSTRUCTION_MAP_APP_LOAD.md) DBG_BUF row.
+
+| Item | Detail |
+|------|--------|
+| Ops | `DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF` (=1) / `REMOVE_DBG_BUF` (=2) |
+| Pack | Pure helpers: `pack_config_hwctx_dbg_buf_aie2` /
+  `validate_config_hwctx_dbg_buf_aie2` in `direct.rs` (`param_val` = BO handle
+  **value**, `param_val_size=0`) |
+| Soft note | `format_c6_debug_bo_prep_note` / `debug_bo_uapi_prep_aie2` — always
+  `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 debug_bo_prep_alone_not_pass=1 research_only=1` |
+| Research gate | `XDNA2_LAB_RESEARCH_DEBUG_BO` — when **unset** (default),
+  `DirectSubmission::config_hwctx_dbg_buf` **refuses** and lab timed path
+  does **not** create/assign a debug BO. When set, lab timed_matmul may
+  CREATE 4096 B **Dev** (`AMDXDNA_BO_DEV`) + Assign after hwctx (and after
+  CONFIG_CU if used); guard REMOVE+destroy on teardown. Env alone ≠ Pass /
+  ≠ unlock / ≠ `ran_on_npu`. Not EXEC_CMD (no `XDNA2_ALLOW_EXEC_CMD`). |
+| Lab type/size | `LAB_RESEARCH_DEBUG_BO_TYPE=Dev` + size **4096**. Driver
+  `aie2_hwctx_cfg_debug_bo` looks up with `AMDXDNA_BO_DEV` only (Shmem-4096
+  failed live `48da6e60` / `Get bo N failed`). XRT: CACHEABLE+USE_DEBUG → Dev. |
+| Wire soft | `format_research_debug_bo_config_detail` / lab detail_token always
+  `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 debug_bo_alone_not_pass=1` |
+| Offline verify | `cargo test --features amd-xdna2 --lib debug_bo` (or `c6_debug` /
+  pack_config_hwctx_dbg / config_hwctx_dbg / research_debug_bo filter) |
+| Honesty | Debug BO pack / env / soft note / assign alone **≠** Pass / **≠**
+  `ran_on_npu` / **≠** C-ready |
+
+**Research lab path:** when env is set, `timed_matmul_direct` auto-creates a
+minimal **Dev** debug BO and Assigns (fail-closed on error; status
+`debug_bo_failed`). When unset, zero behavior change. Live L5b needs a **new**
+unlock + named reason (Dev vs spent Shmem); assign alone **≠ Pass**.
+
+### Skip-CONFIG_CU offline prep (load-path isolation; no live here)
+
+Full env / spent refuse / residual classes:
+[CONSTRUCTION_MAP_APP_LOAD.md](./CONSTRUCTION_MAP_APP_LOAD.md)
+§ Skip-CONFIG_CU offline prep checklist. Report:
+`.agents/reports/impl-next-load-path-offline.md`.
+
+| Offline now | Live later (new unlock only) |
+|-------------|------------------------------|
+| `bash tools/operator_app_load_kit.sh config-cu-skip` | `… config-cu-run-skip` |
+| `unset XDNA2_LAB_PDI_BLOB`; `export XDNA2_LAB_SKIP_CONFIG_CU=1` | same env under active `C_UNLOCK` |
+| Preflight: `bash tools/hitl_config_cu_once.sh preflight` after skip prep | outer `--timeout-s=120` |
+
+**B1 residual-ready hypothesis (not proven RC):** lab classic pack key
+`mladfmatmulbias_prmptflat_mladf_2x4x4_flat_a16fw4acc16f_1_1152_256_128` ran
+under flexml CONFIG_CU overlays that attached then failed post-attach. Possible
+overlay vs instruction topology mismatch — **hypothesis only**; invent_pass=0.
+**skip-CU prep ≠ Pass.** Do not re-export spent flexml sha16 as PDI for “new”
+progress.
+
+### Operator sequence (under active unlock only)
+
+| Step | Action |
+|------|--------|
+| 1 | Offline prep: `bash tools/operator_app_load_kit.sh config-cu` **or** `config-cu-skip` (A/B) (or `pass-unblock --agent-offline`) |
+| 2 | Export load image env (`XDNA2_LAB_PDI_BLOB=…` for CONFIG_CU arm) **or** keep PDI unset + `XDNA2_LAB_SKIP_CONFIG_CU=1` for skip arm; never spent flexml alone |
+| 3 | Optional research: set `XDNA2_LAB_RESEARCH_DEBUG_BO=1` so lab timed path
+  CREATE+Assign 4096 B **Dev** debug BO (invent_pass=0; still needs **new**
+  unlock for L5b; do not re-live spent Shmem-4096 under CONSUMED `48da6e60`) |
+| 4 | Live sandwich: kit `config-cu-run` **or** `config-cu-run-skip` / recipe L3 lines **only if unlock active**; outer `--timeout-s=120` |
+| 5 | **Restore L3** immediately (`exec_cmd_allow=0`) on hardened hosts |
+| 6 | Collect: `bash tools/operator_app_load_kit.sh post-evidence [/path/to/last_apply.json]` |
+| 7 | Interpret: `bash tools/p5_post_c2_interpret.sh` (or `c3_post_c2_classify` + `c4_pass_check` + `p6_true_pass_check`) |
+| 8 | Share last_apply + journal + classify with agent; mark unlock **CONSUMED** after a real shot |
+
+Also: `bash tools/collect_post_c2_evidence.sh` for journal + pack after the shot.
+
+### What this checklist never claims
+
+| Claim | Truth |
+|-------|--------|
+| Product Pass / `ran_on_npu` | **No** until OFM allclose + ERT Completed + real ioctl decide |
+| C6 pack helpers alone | Research layout only — **≠** C-ready |
+| Skip-CONFIG_CU prep / skip live alone | Isolation only — **≠** Pass |
+| Spent flexml re-live alone | **Not** progress without new unlock + named delta |
+| Empty capture dir soft-compare | **Not** progress |
+
+
 ## Highest-value next (after this recipe)
 
-1. **Operator: one CONFIG_CU live sandwich under `C_UNLOCK=3a70fabf`** —
-   `a-prep` → export `XDNA2_LAB_PDI_BLOB` → L3 sandwich → restore L3 →
-   `bash tools/p5_post_c2_interpret.sh` → `bash tools/p6_true_pass_check.sh` →
-   share last_apply + journal. Unlock **≠** Pass. Prior `b17b0119` already used
-   (historical only).
-2. **Post-apply offline residual / Pass audit (P5+P6):** `p5_post_c2_interpret.sh`
-   or `c3_post_c2_classify` + `c4_pass_check` + `p6_true_pass_check` +
-   `run_offline_gates` → agent **C3** when fingerprint differs / **C4** only if
-   `C4_PASS_CANDIDATE` (product Pass = live decide still; P6 still
-   `product_pass_requires_live_decide=1`). Same body as baseline → `C3_SKIP` +
-   `C4_SKIP` + `P6_SKIP`. If still `0x3000003` with `config_cu=1` → wrong PDI /
-   multi-CU / ctrltext residual (named next delta only if justified).
-3. **Capture path (optional, parallel):** place working-stack ctrltext under
-   `testdata/xdna2_cmd/external_known_good/` + PROVENANCE → soft compare.
+1. **No live sandwich until a new unlock** is host-minted in `RESIDUAL.md` with
+   a named offline reason (prefer **skip-CONFIG_CU isolation**, or new
+   capture-dir material / BO-map offline fix if Phase A lands one). Do **not**
+   reopen CONSUMED stamps (includes `efd44f35` / `8352882b` / all three flexml
+   STX research PDIs Spent). Follow **Step 2 prep checklist** above (minimal
+   load first; optional debug BO research offline). Prep-only anytime:
+   `bash tools/operator_app_load_kit.sh config-cu-skip` or `config-cu` (or
+   `pass-unblock --agent-offline`). Live shape still uses **`--timeout-s=120`**.
+   Unlock **≠** Pass.
+2. **Post-apply offline residual / Pass audit (P5+P6)** after any future live:
+   `p5_post_c2_interpret.sh` or `c3_post_c2_classify` + `c4_pass_check` +
+   `p6_true_pass_check` + `run_offline_gates` → agent **C3** when fingerprint
+   differs / **C4** only if `C4_PASS_CANDIDATE` (product Pass = live decide;
+   P6 still `product_pass_requires_live_decide=1`). Same body as baseline →
+   `C3_SKIP` + `C4_SKIP` + `P6_SKIP`.
+3. **Capture path (parallel, no unlock):** public-stack ctrltext playbook in
+   [CONSTRUCTION_MAP_APP_LOAD.md](./CONSTRUCTION_MAP_APP_LOAD.md) § Public-stack
+   ctrltext extract → `bash tools/pass_unblock_once.sh --ingest …` → fill
+   `testdata/xdna2_cmd/external_known_good/PROVENANCE.md` → soft compare.
    Empty gate-only maintain stamps remain **frozen**. Offline green alone still
-   **≠** Pass / C-ready / `ran_on_npu`. After this one-shot is used, further live
-   C needs a **new** agent unlock.
+   **≠** Pass / C-ready / `ran_on_npu`. invent_pass=0.
 
-**Active live path:** CONFIG_CU section above under `C_UNLOCK=3a70fabf`.  
+**Live path:** only under a **new** active unlock (never CONSUMED stamps above).
 **Always after live:** restore L3 + offline classify/gates.

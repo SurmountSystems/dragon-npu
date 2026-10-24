@@ -48,7 +48,7 @@ pub fn f32_slice_from_le_bytes(bytes: &[u8]) -> Result<Vec<f32>, DirectError> {
     }
     let n = bytes.len() / 4;
     let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(out)
@@ -1474,10 +1474,10 @@ pub fn create_and_fill_mladf_io_bos_ex(
     // Fail-closed for EXEC readiness when XDNA2_LAB_REQUIRE_NONZERO_WTS=1
     // (REQUIRE wins over ALLOW_ZERO_WTS; see check_mladf_wts_not_all_zero_for_exec).
     // Without REQUIRE, zero WTS is still allowed for BO plumbing (Err ignored).
-    if let Err(e) = check_mladf_wts_not_all_zero_for_exec(&wts) {
-        if lab_require_non_zero_wts_env() {
-            return Err(e);
-        }
+    if let Err(e) = check_mladf_wts_not_all_zero_for_exec(&wts)
+        && lab_require_non_zero_wts_env()
+    {
+        return Err(e);
     }
     let mut ios = create_io_bos(submission, plan.ifm_bytes, plan.wts_bytes, plan.ofm_bytes)?;
     if let Err(e) = fill_ifm_wts(submission, &ios, &ifm, &wts) {
@@ -1502,11 +1502,11 @@ pub fn create_and_fill_mladf_io_bos_ex(
             )));
         }
         // Pass-readiness: REQUIRE_CTRL refuses empty/all-zero (parity with WTS REQUIRE).
-        if lab_require_ctrl_env() {
-            if let Err(e) = validate_mladf_ctrl_packed_for_pass(ctrl, expect) {
-                destroy_io_bos(submission, &ios);
-                return Err(e);
-            }
+        if lab_require_ctrl_env()
+            && let Err(e) = validate_mladf_ctrl_packed_for_pass(ctrl, expect)
+        {
+            destroy_io_bos(submission, &ios);
+            return Err(e);
         }
         // Optional lab auto-patch: IFM/WTS/OFM base paddrs via meta read_add_write.
         let mut patched_owned: Option<Vec<u8>> = None;
@@ -1626,13 +1626,13 @@ pub fn load_ctrl_packed_from_env(
             "XDNA2_LAB_CTRL_PACKED file is empty: {path}"
         )));
     }
-    if let Some(exp) = expected_len {
-        if bytes.len() as u64 != exp {
-            return Err(DirectError::InvalidArgument(format!(
-                "XDNA2_LAB_CTRL_PACKED len {} != expected {exp}",
-                bytes.len()
-            )));
-        }
+    if let Some(exp) = expected_len
+        && bytes.len() as u64 != exp
+    {
+        return Err(DirectError::InvalidArgument(format!(
+            "XDNA2_LAB_CTRL_PACKED len {} != expected {exp}",
+            bytes.len()
+        )));
     }
     Ok(Some(bytes))
 }
@@ -1878,11 +1878,11 @@ pub fn create_and_fill_lab_io_bos_for_pack_mode(
                     plan.wts_bytes
                 )));
             }
-            if let Some(bytes) = wts.as_deref() {
-                if lab_require_non_zero_wts_env() {
-                    // Length already enforced by load_wts_packed_from_env.
-                    check_mladf_wts_not_all_zero_for_exec(bytes)?;
-                }
+            if let Some(bytes) = wts.as_deref()
+                && lab_require_non_zero_wts_env()
+            {
+                // Length already enforced by load_wts_packed_from_env.
+                check_mladf_wts_not_all_zero_for_exec(bytes)?;
             }
             let ctrl = load_ctrl_packed_from_env(if plan.ctrl_bytes > 0 {
                 Some(plan.ctrl_bytes)
@@ -1897,17 +1897,17 @@ pub fn create_and_fill_lab_io_bos_for_pack_mode(
                     plan.ctrl_bytes
                 )));
             }
-            if let Some(bytes) = ctrl.as_deref() {
-                if lab_require_ctrl_env() {
-                    // Length already enforced by load when plan.ctrl_bytes > 0;
-                    // Pass readiness also refuses empty/all-zero.
-                    let expect = if plan.ctrl_bytes > 0 {
-                        plan.ctrl_bytes
-                    } else {
-                        bytes.len() as u64
-                    };
-                    validate_mladf_ctrl_packed_for_pass(bytes, expect)?;
-                }
+            if let Some(bytes) = ctrl.as_deref()
+                && lab_require_ctrl_env()
+            {
+                // Length already enforced by load when plan.ctrl_bytes > 0;
+                // Pass readiness also refuses empty/all-zero.
+                let expect = if plan.ctrl_bytes > 0 {
+                    plan.ctrl_bytes
+                } else {
+                    bytes.len() as u64
+                };
+                validate_mladf_ctrl_packed_for_pass(bytes, expect)?;
             }
             let ios = create_and_fill_mladf_io_bos_ex(
                 submission,
@@ -2106,8 +2106,8 @@ mod tests {
     #[test]
     fn f32_from_le_empty_ok() {
         let v = f32_slice_from_le_bytes(&[]).expect("empty");
-        assert!(v.is_empty());
-        assert!(f32_slice_to_le_bytes(&[]).is_empty());
+        assert_eq!(v, [] as [f32; 0]);
+        assert_eq!(f32_slice_to_le_bytes(&[]), [] as [u8; 0]);
     }
 
     #[test]
@@ -2848,7 +2848,11 @@ mod tests {
         );
         // Staged contract size
         let mut staged =
-            vec![0_u8; crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_WTS_BYTES as usize];
+            vec![
+                0_u8;
+                usize::try_from(crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_WTS_BYTES)
+                    .expect("value fits in usize")
+            ];
         staged[0] = 1;
         validate_mladf_wts_packed_for_pass(
             &staged,
@@ -2856,7 +2860,11 @@ mod tests {
         )
         .unwrap();
         let zeros =
-            vec![0_u8; crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_WTS_BYTES as usize];
+            vec![
+                0_u8;
+                usize::try_from(crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_WTS_BYTES)
+                    .expect("value fits in usize")
+            ];
         assert!(
             validate_mladf_wts_packed_for_pass(
                 &zeros,
@@ -3032,7 +3040,11 @@ mod tests {
                 .contains("empty")
         );
         let mut staged =
-            vec![0_u8; crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_CTRL_BYTES as usize];
+            vec![
+                0_u8;
+                usize::try_from(crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_CTRL_BYTES)
+                    .expect("value fits in usize")
+            ];
         staged[100] = 0xCD;
         validate_mladf_ctrl_packed_for_pass(
             &staged,
@@ -3040,7 +3052,11 @@ mod tests {
         )
         .unwrap();
         let zeros =
-            vec![0_u8; crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_CTRL_BYTES as usize];
+            vec![
+                0_u8;
+                usize::try_from(crate::backends::amd_xdna2::mladf_pack::STAGED_MLADF_CTRL_BYTES)
+                    .expect("value fits in usize")
+            ];
         assert!(
             validate_mladf_ctrl_packed_for_pass(
                 &zeros,
@@ -3080,7 +3096,7 @@ mod tests {
             "err={err}"
         );
         // With matching non-zero ctrl payload, attach succeeds (no Pass claim).
-        let mut ctrl = vec![0_u8; plan.ctrl_bytes as usize];
+        let mut ctrl = vec![0_u8; usize::try_from(plan.ctrl_bytes).expect("value fits in usize")];
         ctrl[0] = 1;
         let ios = create_and_fill_mladf_io_bos_ex(&stub, &plan, None, None, Some(&ctrl))
             .expect("ctrl attach");
@@ -3107,10 +3123,13 @@ mod tests {
             "err={err_sz}"
         );
         // REQUIRE_CTRL + all-zero correct length refuses (fill API Pass gate).
-        let zeros = vec![0_u8; plan.ctrl_bytes as usize];
-        let err_z = create_and_fill_mladf_io_bos_ex(&stub, &plan, None, None, Some(&zeros))
+        let zeros = vec![0_u8; usize::try_from(plan.ctrl_bytes).expect("value fits in usize")];
+        let err_zeros = create_and_fill_mladf_io_bos_ex(&stub, &plan, None, None, Some(&zeros))
             .expect_err("all-zero ctrl");
-        assert!(err_z.to_string().contains("all zeros"), "err={err_z}");
+        assert!(
+            err_zeros.to_string().contains("all zeros"),
+            "err={err_zeros}"
+        );
         unsafe {
             match prev_req {
                 Some(v) => std::env::set_var("XDNA2_LAB_REQUIRE_CTRL", v),
@@ -3129,6 +3148,7 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)]
+    #[allow(clippy::too_many_lines)]
     fn ctrl_auto_patch_writes_io_paddrs_into_attached_bo() {
         let _guard = lab_env_test_lock();
         let stub = StubDirectSubmission::new(-1);
@@ -3632,6 +3652,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // test-only env isolation for ambient silicon-lab vars
     fn pack_mode_mladf_require_dims_match_refuses() {
+        let _guard = lab_env_test_lock();
         // Isolate ambient silicon-lab env so plan comes from staged key constants,
         // not operator META/WTS that change the error path before timed dims check.
         let prev_key = std::env::var("XDNA2_LAB_MLADF_KEY").ok();
@@ -3639,7 +3660,7 @@ mod tests {
         let prev_wts = std::env::var("XDNA2_LAB_WTS_PACKED").ok();
         let prev_req = std::env::var("XDNA2_LAB_REQUIRE_NONZERO_WTS").ok();
         let prev_ctrl_req = std::env::var("XDNA2_LAB_REQUIRE_CTRL").ok();
-        // SAFETY: test-only env isolation; single-threaded intent for this case.
+        // SAFETY: test-only env isolation; held under lab_env_test_lock.
         unsafe {
             std::env::remove_var("XDNA2_LAB_MLADF_KEY");
             std::env::remove_var("XDNA2_LAB_MLADF_META");
@@ -3761,8 +3782,7 @@ mod tests {
         .expect_err("zero golden");
         assert!(
             err.to_string().contains("all-zero") || err.to_string().contains("false-Pass"),
-            "msg={}",
-            err
+            "msg={err}"
         );
         // Escape hatch
         let ok = resolve_pack_mode_ofm_golden(

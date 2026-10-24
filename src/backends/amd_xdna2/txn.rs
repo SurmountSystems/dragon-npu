@@ -44,10 +44,25 @@ pub const HITL_MLADF_GET_TRANSACTION_BIN_NUM_OPS: u32 = 500;
 
 /// Classic (v0.1) WRITE op size including trailing size field.
 const OP_WRITE_V01_SIZE: usize = 24;
-/// Classic MASKWRITE / MASKPOLL / MASKPOLL_BUSY size.
-const OP_MASK_V01_SIZE: usize = 32;
+/// Classic MASKWRITE / MASKPOLL / MASKPOLL_BUSY **compact** size (mlir-aie / public AOT).
+///
+/// Wire layout through the size field: OpHdr(4)+pad(4)+RegOff(8)+Value(4)+Mask(4)+Size(4)
+/// = 28. Public mlir-aie npu2 peels (vector / single_core / whole_array / cascade) emit
+/// `size=28` with no trailing pad.
+const OP_MASK_V01_SIZE_COMPACT: usize = 28;
+/// Classic MASKWRITE / MASKPOLL / MASKPOLL_BUSY **padded** size (DynamicDispatch / aiebu lab).
+///
+/// Same fields as compact through size@+24, plus 4 trailing pad bytes → `size=32`.
+/// Lab classic 1688 and DD matmul txn dumps use this encoding.
+const OP_MASK_V01_SIZE_PADDED: usize = 32;
 /// NOOP / PREEMPT fixed size.
 const OP_SHORT_SIZE: usize = 4;
+
+/// True when `size` is a known classic v0.1 MASK* total (compact 28 or padded 32).
+#[must_use]
+const fn is_known_mask_v01_size(size: u32) -> bool {
+    size as usize == OP_MASK_V01_SIZE_COMPACT || size as usize == OP_MASK_V01_SIZE_PADDED
+}
 
 /// `XAie_TxnOpcode` values we understand for walking (v0.1).
 #[repr(u8)]
@@ -445,19 +460,28 @@ fn op_len_v01(bytes: &[u8], off: usize) -> Result<usize, DirectError> {
             Ok(OP_WRITE_V01_SIZE)
         }
         3 | 4 | 7 => {
-            // MASKWRITE / MASKPOLL / MASKPOLL_BUSY: 32 bytes (size at +24)
-            if off + OP_MASK_V01_SIZE > bytes.len() {
+            // MASKWRITE / MASKPOLL / MASKPOLL_BUSY:
+            //   compact 28 (mlir-aie public AOT) or padded 32 (lab DD/aiebu).
+            // Size field is always LE u32 at +24; total op length = size.
+            // Need at least compact length to read the size field.
+            if off + OP_MASK_V01_SIZE_COMPACT > bytes.len() {
                 return Err(DirectError::InvalidArgument(
                     "MASK* op truncated".to_string(),
                 ));
             }
             let size = u32::from_le_bytes(bytes[off + 24..off + 28].try_into().unwrap_or([0; 4]));
-            if size as usize != OP_MASK_V01_SIZE {
+            if !is_known_mask_v01_size(size) {
                 return Err(DirectError::InvalidArgument(format!(
-                    "MASK* size field {size} != {OP_MASK_V01_SIZE}"
+                    "MASK* size field {size} not in {{{OP_MASK_V01_SIZE_COMPACT},{OP_MASK_V01_SIZE_PADDED}}}"
                 )));
             }
-            Ok(OP_MASK_V01_SIZE)
+            let len = size as usize;
+            if off + len > bytes.len() {
+                return Err(DirectError::InvalidArgument(
+                    "MASK* op truncated past size field".to_string(),
+                ));
+            }
+            Ok(len)
         }
         1 | 2 => {
             // BLOCKWRITE / BLOCKSET: OpHdr(4)+pad(4)+RegOff u32 + Size u32 + payload
@@ -1170,6 +1194,7 @@ mod tests {
         let bases = [0_u64, ifm, wts, ofm, ctrl];
         for r in &relas {
             let base = bases.get(r.sym() as usize).copied().unwrap_or(0);
+            #[allow(clippy::cast_sign_loss)]
             let expect = base.wrapping_add(r.addend as u64);
             let o = r.offset as usize;
             let v = u64::from_le_bytes(patched[o..o + 8].try_into().unwrap());
@@ -1203,13 +1228,13 @@ mod tests {
         let ofm = 0x3333_0000_u64;
         let ctrl = 0x4444_0000_u64;
         // Capture first hole before patch (staged: 0xb1 at off 0x2c).
-        let (coff, clen) = match classify_instruction_blob(&elf) {
-            InstructionBlobKind::Aie2ElfCtrltext {
-                ctrltext_off,
-                ctrltext_len,
-                ..
-            } => (ctrltext_off, ctrltext_len),
-            _ => panic!("need elf"),
+        let InstructionBlobKind::Aie2ElfCtrltext {
+            ctrltext_off: coff,
+            ctrltext_len: clen,
+            ..
+        } = classify_instruction_blob(&elf)
+        else {
+            panic!("need elf")
         };
         let pre = &elf[coff..coff + clen];
         let hole0 = u64::from_le_bytes(pre[0x2c..0x2c + 8].try_into().unwrap());
@@ -1477,9 +1502,9 @@ mod tests {
         );
         // Garbage
         let g = validate_patched_ctrltext_classic(&[0xde, 0xad], false).expect_err("garbage");
-        assert!(!g.to_string().is_empty());
+        assert_ne!(g.to_string(), "");
         // Truncate classic mid-stream
-        let mut short = noop.clone();
+        let mut short = noop;
         short.truncate(20);
         assert!(validate_patched_ctrltext_classic(&short, false).is_err());
     }
@@ -1539,9 +1564,9 @@ mod tests {
     #[test]
     fn parse_dynsym_non_elf_returns_empty_ok() {
         let empty = parse_elf32_dynsym(&[]).expect("empty");
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [Elf32DynSym; 0]);
         let garbage = parse_elf32_dynsym(&[0xde, 0xad, 0xbe, 0xef]).expect("garbage");
-        assert!(garbage.is_empty());
+        assert_eq!(garbage, [] as [Elf32DynSym; 0]);
     }
 
     #[test]
@@ -1583,41 +1608,42 @@ mod tests {
     #[test]
     fn synthetic_write_mask_block_custom_walk() {
         // Hand-built classic stream: 1 WRITE + 1 MASKWRITE + 1 BLOCKWRITE + 1 CUSTOM + 1 MASKPOLL
+        // MASK* uses lab/DD padded size=32.
         let mut body = Vec::new();
         // WRITE 24
-        let mut w = vec![0_u8; 24];
-        w[0] = 0;
-        w[1] = 1; // col
+        let mut write_pkt = vec![0_u8; 24];
+        write_pkt[0] = 0;
+        write_pkt[1] = 1; // col
         // reg @ +8 = 0x1b0000
-        w[8..16].copy_from_slice(&0x1b0000_u64.to_le_bytes());
-        w[16..20].copy_from_slice(&0x8000_0007_u32.to_le_bytes());
-        w[20..24].copy_from_slice(&24_u32.to_le_bytes());
-        body.extend_from_slice(&w);
-        // MASKWRITE 32
-        let mut m = vec![0_u8; 32];
-        m[0] = 3;
-        m[8..16].copy_from_slice(&0x1f000_u64.to_le_bytes());
-        m[16..20].copy_from_slice(&0x400_u32.to_le_bytes());
-        m[20..24].copy_from_slice(&0xc00_u32.to_le_bytes());
-        m[24..28].copy_from_slice(&32_u32.to_le_bytes());
-        body.extend_from_slice(&m);
+        write_pkt[8..16].copy_from_slice(&0x001b_0000_u64.to_le_bytes());
+        write_pkt[16..20].copy_from_slice(&0x8000_0007_u32.to_le_bytes());
+        write_pkt[20..24].copy_from_slice(&24_u32.to_le_bytes());
+        body.extend_from_slice(&write_pkt);
+        // MASKWRITE 32 (padded lab encoding)
+        let mut mask_pkt = vec![0_u8; 32];
+        mask_pkt[0] = 3;
+        mask_pkt[8..16].copy_from_slice(&0x1f000_u64.to_le_bytes());
+        mask_pkt[16..20].copy_from_slice(&0x400_u32.to_le_bytes());
+        mask_pkt[20..24].copy_from_slice(&0xc00_u32.to_le_bytes());
+        mask_pkt[24..28].copy_from_slice(&32_u32.to_le_bytes());
+        body.extend_from_slice(&mask_pkt);
         // BLOCKWRITE total 24: hdr16 + 8 payload
-        let mut b = vec![0_u8; 24];
-        b[0] = 1;
-        b[8..12].copy_from_slice(&0x1d000_u32.to_le_bytes());
-        b[12..16].copy_from_slice(&24_u32.to_le_bytes());
-        body.extend_from_slice(&b);
+        let mut block_pkt = vec![0_u8; 24];
+        block_pkt[0] = 1;
+        block_pkt[8..12].copy_from_slice(&0x1d000_u32.to_le_bytes());
+        block_pkt[12..16].copy_from_slice(&24_u32.to_le_bytes());
+        body.extend_from_slice(&block_pkt);
         // CUSTOM DDR_PATCH-like total 16
-        let mut c = vec![0_u8; 16];
-        c[0] = 129;
-        c[4..8].copy_from_slice(&16_u32.to_le_bytes());
-        body.extend_from_slice(&c);
-        // MASKPOLL 32
-        let mut p = vec![0_u8; 32];
-        p[0] = 4;
-        p[8..16].copy_from_slice(&0x1d224_u64.to_le_bytes());
-        p[24..28].copy_from_slice(&32_u32.to_le_bytes());
-        body.extend_from_slice(&p);
+        let mut custom_pkt = vec![0_u8; 16];
+        custom_pkt[0] = 129;
+        custom_pkt[4..8].copy_from_slice(&16_u32.to_le_bytes());
+        body.extend_from_slice(&custom_pkt);
+        // MASKPOLL 32 (padded)
+        let mut poll_pkt = vec![0_u8; 32];
+        poll_pkt[0] = 4;
+        poll_pkt[8..16].copy_from_slice(&0x1d224_u64.to_le_bytes());
+        poll_pkt[24..28].copy_from_slice(&32_u32.to_le_bytes());
+        body.extend_from_slice(&poll_pkt);
 
         let total = 16 + body.len();
         let header = XaieTxnHeader {
@@ -1628,7 +1654,7 @@ mod tests {
             num_cols: 4,
             num_mem_tile_rows: 1,
             num_ops: 5,
-            txn_size: total as u32,
+            txn_size: u32::try_from(total).expect("value fits in u32"),
         };
         let mut bytes = header.to_bytes().to_vec();
         bytes.extend_from_slice(&body);
@@ -1638,11 +1664,101 @@ mod tests {
                 assert_eq!(ops.len(), 5);
                 assert_eq!(ops[0].opcode, 0);
                 assert_eq!(ops[1].opcode, 3);
+                assert_eq!(ops[1].byte_len, 32);
                 assert_eq!(ops[2].opcode, 1);
                 assert_eq!(ops[3].opcode, 129);
                 assert_eq!(ops[4].opcode, 4);
+                assert_eq!(ops[4].byte_len, 32);
             }
             other => panic!("{}", other.summary()),
+        }
+    }
+
+    /// mlir-aie public AOT MASK* uses compact size=28 (no 4-byte pad after size).
+    ///
+    /// Walk must accept both 28 and 32; invent_pass=0; not residual match to lab 1688.
+    #[test]
+    fn synthetic_mask_compact_28_walk() {
+        let mut body = Vec::new();
+        // WRITE 24
+        let mut w = vec![0_u8; 24];
+        w[0] = 0;
+        w[20..24].copy_from_slice(&24_u32.to_le_bytes());
+        body.extend_from_slice(&w);
+        // MASKWRITE compact 28 (public mlir-aie layout)
+        let mut m = vec![0_u8; 28];
+        m[0] = 3;
+        m[8..16].copy_from_slice(&0x1d200_u64.to_le_bytes());
+        m[16..20].copy_from_slice(&0xf_u32.to_le_bytes());
+        m[20..24].copy_from_slice(&0x1f_u32.to_le_bytes());
+        m[24..28].copy_from_slice(&28_u32.to_le_bytes());
+        body.extend_from_slice(&m);
+        // MASKPOLL compact 28
+        let mut p = vec![0_u8; 28];
+        p[0] = 4;
+        p[8..16].copy_from_slice(&0x1d224_u64.to_le_bytes());
+        p[24..28].copy_from_slice(&28_u32.to_le_bytes());
+        body.extend_from_slice(&p);
+
+        let total = 16 + body.len();
+        let header = XaieTxnHeader {
+            major: 0,
+            minor: 1,
+            dev_gen: 4,
+            num_rows: 6,
+            num_cols: 8,
+            num_mem_tile_rows: 1,
+            num_ops: 3,
+            txn_size: u32::try_from(total).expect("value fits in u32"),
+        };
+        let mut bytes = header.to_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        let kind = classify_instruction_blob(&bytes);
+        match kind {
+            InstructionBlobKind::ClassicTxnV01 { ops, header: h } => {
+                assert_eq!(ops.len(), 3);
+                assert_eq!(h.num_ops, 3);
+                assert_eq!(ops[0].opcode, 0);
+                assert_eq!(ops[0].byte_len, 24);
+                assert_eq!(ops[1].opcode, 3);
+                assert_eq!(ops[1].byte_len, 28);
+                assert_eq!(ops[2].opcode, 4);
+                assert_eq!(ops[2].byte_len, 28);
+            }
+            other => panic!("expected ClassicTxnV01 compact MASK*: {}", other.summary()),
+        }
+        validate_txn_blob(&bytes).expect("compact MASK* stream validates");
+    }
+
+    /// Unknown MASK* size (not 28/32) still fails closed as TxnHeaderOnly.
+    #[test]
+    fn mask_unknown_size_is_header_only() {
+        let mut body = Vec::new();
+        let mut m = vec![0_u8; 28];
+        m[0] = 3;
+        m[24..28].copy_from_slice(&20_u32.to_le_bytes()); // too small / unknown
+        body.extend_from_slice(&m);
+        let total = 16 + body.len();
+        let header = XaieTxnHeader {
+            major: 0,
+            minor: 1,
+            dev_gen: 4,
+            num_rows: 6,
+            num_cols: 4,
+            num_mem_tile_rows: 1,
+            num_ops: 1,
+            txn_size: u32::try_from(total).expect("value fits in u32"),
+        };
+        let mut bytes = header.to_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        match classify_instruction_blob(&bytes) {
+            InstructionBlobKind::TxnHeaderOnly { walk_error, .. } => {
+                assert!(
+                    walk_error.contains("MASK*") && walk_error.contains("20"),
+                    "walk_error={walk_error}"
+                );
+            }
+            other => panic!("expected TxnHeaderOnly, got {}", other.summary()),
         }
     }
 
@@ -1680,7 +1796,11 @@ mod tests {
         classic[4] = 8;
         classic[5] = 1;
         classic[8..12].copy_from_slice(&STAGED_MLADF_CLASSIC_NUM_OPS.to_le_bytes());
-        classic[12..16].copy_from_slice(&(STAGED_MLADF_CLASSIC_INSTR_BYTES as u32).to_le_bytes());
+        classic[12..16].copy_from_slice(
+            &u32::try_from(STAGED_MLADF_CLASSIC_INSTR_BYTES)
+                .expect("value fits in u32")
+                .to_le_bytes(),
+        );
         // Non-zero body so not all-zero (header already non-zero).
         classic[16] = 0x83;
 
@@ -1699,7 +1819,11 @@ mod tests {
         multi[4] = 8;
         multi[5] = 1;
         multi[8..12].copy_from_slice(&HITL_MLADF_GET_TRANSACTION_BIN_NUM_OPS.to_le_bytes());
-        multi[12..16].copy_from_slice(&(HITL_MLADF_GET_TRANSACTION_BIN_BYTES as u32).to_le_bytes());
+        multi[12..16].copy_from_slice(
+            &u32::try_from(HITL_MLADF_GET_TRANSACTION_BIN_BYTES)
+                .expect("value fits in u32")
+                .to_le_bytes(),
+        );
         multi[16] = 0xaa;
 
         assert!(is_hitl_mladf_multi_txn_wrong_body_profile(&multi));
@@ -1820,7 +1944,69 @@ mod tests {
         );
         if let InstructionBlobKind::ClassicTxnV01 { header, ops } = &kind {
             assert!(header.dev_gen >= 3, "dev_gen={}", header.dev_gen);
-            assert!(!ops.is_empty());
+            assert_ne!(ops.as_slice(), []);
+        }
+    }
+
+    /// Offline research: public mlir-aie cascade matmul npu2 AOT (when landed).
+    ///
+    /// Soft-skip when capture dir empty. Classifies as classic v0.1 START_NPU
+    /// txn stream (not residual match / not Pass). invent_pass=0 surface only.
+    #[test]
+    fn optional_cascade_public_aot_classifies_if_present() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd/external_known_good");
+        let ctrl_path = root.join("mlir_aie_cascade_matmul_npu2.ctrltext.bin");
+        let insts_path = root.join("mlir_aie_cascade_matmul_npu2.insts.bin");
+        let elf_path = root.join("mlir_aie_cascade_matmul_npu2.insts.elf");
+        if !ctrl_path.is_file() {
+            return;
+        }
+        let ctrl = std::fs::read(&ctrl_path).expect("read cascade ctrltext");
+        assert_eq!(ctrl.len(), 4512, "cascade ctrltext size");
+        // Distinct from insts.bin sha (aiebu may re-layout) but same size class.
+        assert_eq!(std::fs::metadata(&insts_path).map_or(0, |m| m.len()), 4512);
+        let kind = classify_instruction_blob(&ctrl);
+        eprintln!("cascade_ctrltext classify: {}", kind.summary());
+        match &kind {
+            InstructionBlobKind::ClassicTxnV01 { header, ops } => {
+                assert!(header.is_classic_v01(), "major/minor classic");
+                assert_eq!(header.txn_size as usize, 4512);
+                assert_eq!(header.num_ops as usize, ops.len());
+                assert_eq!(header.num_ops, 116);
+                assert_eq!(header.dev_gen, 4);
+                // aiebu-asm report: cols/rows 8×6 (array+shim geometry)
+                assert_eq!(header.num_cols, 8);
+                assert_eq!(header.num_rows, 6);
+            }
+            other => panic!(
+                "cascade ctrltext expected ClassicTxnV01, got {}",
+                other.summary()
+            ),
+        }
+        validate_txn_blob(&ctrl).expect("cascade ctrltext validates as txn");
+        // Not lab classic 1688 profile.
+        assert!(!is_staged_mladf_classic_instr_profile(&ctrl));
+
+        if elf_path.is_file() {
+            let elf = std::fs::read(&elf_path).expect("read cascade elf");
+            let ekind = classify_instruction_blob(&elf);
+            eprintln!("cascade_insts_elf classify: {}", ekind.summary());
+            match ekind {
+                InstructionBlobKind::Aie2ElfCtrltext {
+                    ctrltext_len,
+                    ctrltext,
+                    ..
+                } => {
+                    assert_eq!(ctrltext_len, 4512);
+                    assert!(
+                        matches!(*ctrltext, InstructionBlobKind::ClassicTxnV01 { .. }),
+                        "inner ctrltext classic: {}",
+                        ctrltext.summary()
+                    );
+                }
+                other => panic!("cascade elf expected Aie2ElfCtrltext: {}", other.summary()),
+            }
         }
     }
 }

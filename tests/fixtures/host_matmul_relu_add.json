@@ -1,0 +1,20 @@
+{
+  "ops": ["MatMul", "Relu", "Add"],
+  "nodes": [
+    {"op": "MatMul", "inputs": ["x", "W"], "outputs": ["y"]},
+    {"op": "Relu", "inputs": ["y"], "outputs": ["h"]},
+    {"op": "Add", "inputs": ["h", "bias"], "outputs": ["z"]}
+  ],
+  "initializers": [
+    {
+      "name": "W",
+      "shape": [2, 2],
+      "data": [1.0, 0.0, 0.0, 1.0]
+    },
+    {
+      "name": "bias",
+      "shape": [2],
+      "data": [0.5, 1.5]
+    }
+  ]
+}

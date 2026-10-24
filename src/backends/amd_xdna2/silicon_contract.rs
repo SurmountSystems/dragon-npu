@@ -12,11 +12,16 @@
 //! Note: `0x106` in [`aie2_fw_status_name`] is a **MSG_OP** (map_host), not APP status.
 
 use super::direct::{
-    DirectError, MAX_INSTRUCTION_BLOB_BYTES, TimedOpResult, build_ert_start_npu_cmd_bo,
-    build_ert_start_npu_cmd_bo_with_kernel_args,
+    DirectError, HwctxDbgBufOp, MAX_INSTRUCTION_BLOB_BYTES, TimedOpResult,
+    build_ert_start_npu_cmd_bo, build_ert_start_npu_cmd_bo_with_kernel_args,
+    format_debug_bo_aie2_pack_detail, pack_config_hwctx_dbg_buf_aie2,
+    validate_config_hwctx_dbg_buf_aie2,
 };
 use super::lab_io::{LabKernelArgLayout, pack_start_npu_kernel_args_with_ctrl_layout};
-use super::mladf_pack::MAX_MLADF_LAB_FILE_BYTES;
+use super::mladf_pack::{
+    MAX_MLADF_LAB_FILE_BYTES, STAGED_MLADF_CTRL_BYTES, STAGED_MLADF_IFM_BYTES,
+    STAGED_MLADF_OFM_BYTES, STAGED_MLADF_WTS_BYTES, read_lab_file_capped,
+};
 use super::txn::{
     InstructionBlobKind, LabRelaMode, classify_instruction_blob, format_dynsym_report,
     is_aiebu_elf_ctrltext, parse_elf32_dynsym, parse_elf32_rela_dyn,
@@ -298,14 +303,30 @@ pub struct LastApplyDetailSignals {
     pub cu_func: Option<u8>,
 }
 
-/// End of first whitespace/`;`/`,` delimited token.
+/// End of first whitespace/`;`/`,`/`)`/`:`/`(`/`+` delimited token.
+///
+/// Stops on trailing punctuation so live WAIT shapes like
+/// `request=0xc0106449):` yield a clean value for parsers.
 #[must_use]
 fn detail_token_end(s: &str) -> usize {
-    s.find(|c: char| c.is_whitespace() || c == ';' || c == ',' || c == ']')
-        .unwrap_or(s.len())
+    s.find(|c: char| {
+        c.is_whitespace()
+            || c == ';'
+            || c == ','
+            || c == ']'
+            || c == ')'
+            || c == '('
+            || c == ':'
+            || c == '+'
+    })
+    .unwrap_or(s.len())
 }
 
 /// Parse `0x…` / decimal token as `u64` (first token only).
+///
+/// Strips trailing non-hex / non-digit punctuation so detail strings that end
+/// with `):` or `)` (common on WAIT_CMD) still parse. Full 16-nibble hex
+/// (e.g. `map_offset=0xffffffffffffffff`) remains valid.
 #[must_use]
 fn parse_detail_u64_token(tok: &str) -> Option<u64> {
     let t = tok.trim();
@@ -313,10 +334,18 @@ fn parse_detail_u64_token(tok: &str) -> Option<u64> {
         return None;
     }
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        // Allow full 16-nibble values (e.g. map_offset=0xffffffffffffffff).
+        // Live WAIT often keeps `request=0xc0106449):` — drop trailing punct.
+        let hex = hex.trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+        if hex.is_empty() {
+            return None;
+        }
         return u64::from_str_radix(hex, 16).ok();
     }
-    t.parse::<u64>().ok()
+    let dec = t.trim_end_matches(|c: char| !c.is_ascii_digit());
+    if dec.is_empty() {
+        return None;
+    }
+    dec.parse::<u64>().ok()
 }
 
 /// Parse size token `1688` / `1688B` / `1688b` as `u32` bytes.
@@ -550,6 +579,970 @@ pub fn journal_line_has_app_load_hint(line: &str) -> bool {
         || l.contains("status 0x4000003")
 }
 
+// ---------------------------------------------------------------------------
+// Progressive last_apply status tokens (mid-path stamp; ≠ Pass)
+// ---------------------------------------------------------------------------
+
+/// Progressive last_apply after CREATE_HWCTX returned OK (before EXEC).
+pub const LAB_PARTIAL_STATUS_HWCTX_OK: &str = "lab_partial_hwctx_ok";
+/// Progressive last_apply after optional CONFIG_CU attach OK (before EXEC).
+pub const LAB_PARTIAL_STATUS_CONFIG_CU: &str = "lab_partial_config_cu";
+/// Progressive last_apply immediately before `submit_and_wait_command`.
+pub const LAB_PARTIAL_STATUS_PRE_SUBMIT: &str = "lab_partial_pre_submit";
+
+/// Honesty fragment required on every progressive / incomplete last_apply.
+///
+/// Hard-coded on partial stamps and journal soft notes. **Never** product Pass.
+#[must_use]
+pub const fn lab_partial_honesty_tokens() -> &'static str {
+    "invent_pass=0 not_ran_on_npu=1 not_c_ready=1"
+}
+
+/// True when `status` is a mid-path progressive stamp name (research only).
+#[must_use]
+pub fn is_lab_partial_progressive_status(status: &str) -> bool {
+    matches!(
+        status,
+        LAB_PARTIAL_STATUS_HWCTX_OK | LAB_PARTIAL_STATUS_CONFIG_CU | LAB_PARTIAL_STATUS_PRE_SUBMIT
+    )
+}
+
+/// Build detail text for a progressive last_apply stamp (pure; offline).
+///
+/// Always includes [`lab_partial_honesty_tokens`]. Callers may append stage notes.
+#[must_use]
+pub fn format_lab_partial_detail(stage_note: &str) -> String {
+    let note = stage_note.trim();
+    if note.is_empty() {
+        format!(
+            "progressive last_apply stamp; {}; kill mid-ioctl can still lose stage",
+            lab_partial_honesty_tokens()
+        )
+    } else {
+        format!(
+            "{note}; progressive last_apply stamp; {}; kill mid-ioctl can still lose stage",
+            lab_partial_honesty_tokens()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Journal soft taxonomy (timeout / IO_PAGE_FAULT / aie2_set_cmd_timeout)
+// ---------------------------------------------------------------------------
+
+/// Soft residual class token for incomplete outer-kill / journal-only evidence.
+///
+/// **Never** equals locked APP_LOAD, PassCandidate, or product Pass.
+pub const JOURNAL_SOFT_INCOMPLETE_CLASS: &str = "incomplete_timeout_or_journal";
+
+/// Soft signals from kernel journal / operator paste (research only).
+///
+/// Live 2026-08-09 shot: outer timeout kill + `IO_PAGE_FAULT` +
+/// `aie2_set_cmd_timeout`. These tokens **never** invent product Pass or map
+/// journal-only text to locked APP_LOAD without a finished last_apply snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JournalSoftTaxonomy {
+    /// Outer process kill / timeout (`timeout(1)` rc=124, outer kill language).
+    pub incomplete_outer_kill: bool,
+    /// Kernel `IO_PAGE_FAULT` (amdxdna / IOMMU) in the paste.
+    pub io_page_fault: bool,
+    /// Firmware `aie2_set_cmd_timeout` (or close spelling) in the paste.
+    pub aie2_set_cmd_timeout: bool,
+}
+
+impl JournalSoftTaxonomy {
+    /// True when any recognized soft signal is present.
+    #[must_use]
+    pub const fn has_any(&self) -> bool {
+        self.incomplete_outer_kill || self.io_page_fault || self.aie2_set_cmd_timeout
+    }
+
+    /// Soft residual class token when signals present; else `unclassified`.
+    ///
+    /// **Never** returns locked APP_LOAD class from journal alone.
+    #[must_use]
+    pub fn soft_residual_class_token(&self) -> &'static str {
+        if self.has_any() {
+            JOURNAL_SOFT_INCOMPLETE_CLASS
+        } else {
+            SiliconResidualClass::Unclassified.as_str()
+        }
+    }
+
+    /// Soft report line — always honesty trio; never Pass / C-ready.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format!(
+            "journal_soft_tax class={} incomplete_outer_kill={} io_page_fault={} \
+             aie2_set_cmd_timeout={} {} product_pass_requires_live_decide=1",
+            self.soft_residual_class_token(),
+            u8::from(self.incomplete_outer_kill),
+            u8::from(self.io_page_fault),
+            u8::from(self.aie2_set_cmd_timeout),
+            lab_partial_honesty_tokens(),
+        )
+    }
+}
+
+/// Classify multi-line journal / operator paste for timeout soft signals.
+///
+/// Pure offline research. **Never** invents Pass, C-ready, or locked APP_LOAD
+/// residual class from journal text alone.
+#[must_use]
+pub fn classify_journal_soft_signals(text: &str) -> JournalSoftTaxonomy {
+    let lower = text.to_ascii_lowercase();
+    let incomplete_outer_kill = lower.contains("killed by timeout")
+        || lower.contains("outer timeout")
+        || lower.contains("timeout kill")
+        || lower.contains("rc=124")
+        || lower.contains("exit 124")
+        || lower.contains("exit_code=124")
+        || lower.contains("lab exit 4")
+        || (lower.contains("timeout")
+            && lower.contains("npu_direct_bench")
+            && lower.contains("124"));
+    let io_page_fault = lower.contains("io_page_fault") || lower.contains("io page fault");
+    let aie2_set_cmd_timeout =
+        lower.contains("aie2_set_cmd_timeout") || lower.contains("aie2 set cmd timeout");
+    JournalSoftTaxonomy {
+        incomplete_outer_kill,
+        io_page_fault,
+        aie2_set_cmd_timeout,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3b — IO_PAGE_FAULT vs last_apply BO map (+ optional rela targets) audit
+// ---------------------------------------------------------------------------
+//
+// Pure residual science only. Never product Pass / never `ran_on_npu`.
+// Live 2026-08-10 pin: fault `0x2fff80007f40` vs DevHeap/instr/host UVAs → orphan.
+
+/// Default DevHeap span when building fault map spans from bo_diag (64 MiB heap).
+pub const BO_DIAG_DEFAULT_DEVHEAP_SIZE: u64 = 64 * 1024 * 1024;
+/// Default instruction BO span (page-padded lab instr BO).
+pub const BO_DIAG_DEFAULT_INSTR_SIZE: u64 = 4096;
+/// Near-base neighborhood when fault is outside known size but close to a base.
+pub const FAULT_NEAR_BO_BASE_WINDOW: u64 = 4096;
+
+/// Soft residual token for orphan / map-mismatch journal faults (research only).
+///
+/// **Never** locked APP_LOAD, PassCandidate, or product Pass.
+pub const IO_PAGE_FAULT_MAP_AUDIT_CLASS: &str = "io_page_fault_vs_bo_map";
+
+/// One entry from last_apply `bo_diag=[label: … xdna_addr=0x…; …]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoDiagEntry {
+    /// Label (`DevHeap`, `instr`, `ifm`, `wts`, `ofm`, `ctrl`, …).
+    pub label: String,
+    /// Device / PASID address when present and parseable.
+    pub xdna_addr: Option<u64>,
+    /// Host vaddr when present.
+    pub vaddr: Option<u64>,
+    /// Type hint (`DevHeap`, `Dev`, `Shmem`, …).
+    pub ty: Option<String>,
+    /// BO handle when present.
+    pub handle: Option<u32>,
+}
+
+/// Known BO base + size for span classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoSpan {
+    /// Label (same as bo_diag label when built from diag).
+    pub label: String,
+    /// Base `xdna_addr`.
+    pub base: u64,
+    /// Length in bytes (`[base, base+size)`).
+    pub size: u64,
+}
+
+impl BoSpan {
+    /// Construct from static label (unit tests / call sites).
+    #[must_use]
+    pub fn new(label: impl Into<String>, base: u64, size: u64) -> Self {
+        Self {
+            label: label.into(),
+            base,
+            size,
+        }
+    }
+}
+
+/// Classification of one journal fault address vs BO map / rela targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaultMapClass {
+    /// Fault falls in `[base, base+size)` for a labeled BO.
+    InBoSpan {
+        /// BO label from `bo_diag` (e.g. `ifm`, `instr`).
+        label: String,
+    },
+    /// Fault is within [`FAULT_NEAR_BO_BASE_WINDOW`] of a base but outside size.
+    NearBoBase {
+        /// BO label whose base is nearest within the near window.
+        label: String,
+    },
+    /// Fault equals an overwrite rela patch value `(base[sym]+addend)`.
+    MatchesRelaTarget {
+        /// Dynsym index used for the rela base.
+        sym: u32,
+        /// Rela offset field (bytes into ctrltext / as recorded).
+        offset: u32,
+    },
+    /// None of the above (11bc9016 live shape for `0x2fff80007f40`).
+    Orphan,
+}
+
+impl FaultMapClass {
+    /// Stable token for soft notes.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InBoSpan { .. } => "in_bo_span",
+            Self::NearBoBase { .. } => "near_bo_base",
+            Self::MatchesRelaTarget { .. } => "matches_rela_target",
+            Self::Orphan => "orphan",
+        }
+    }
+}
+
+/// One classified fault address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultClassified {
+    /// Journal fault address.
+    pub fault: u64,
+    /// Map class.
+    pub class: FaultMapClass,
+}
+
+/// Composite offline audit: last_apply bo_diag + journal faults (+ optional rela).
+///
+/// Research only. Soft note always carries honesty trio. **Never** product Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IoPageFaultMapAudit {
+    /// Parsed bo_diag entries (may be empty).
+    pub bo_entries: Vec<BoDiagEntry>,
+    /// Spans used for classification.
+    pub spans: Vec<BoSpan>,
+    /// Fault addresses from journal (or empty).
+    pub fault_addrs: Vec<u64>,
+    /// Per-fault classification.
+    pub classes: Vec<FaultClassified>,
+    /// Number of overwrite rela targets when ELF supplied and listed.
+    pub rela_targets_count: Option<usize>,
+    /// Count of orphan faults.
+    pub orphan_count: usize,
+    /// Count of in-span faults.
+    pub in_span_count: usize,
+    /// Count of near-base faults.
+    pub near_base_count: usize,
+    /// Count of rela-target matches.
+    pub rela_match_count: usize,
+}
+
+impl IoPageFaultMapAudit {
+    /// Soft residual class token — map audit class when faults present, else unclassified.
+    ///
+    /// **Never** returns locked APP_LOAD from this audit alone.
+    #[must_use]
+    pub fn soft_residual_class_token(&self) -> &'static str {
+        if self.fault_addrs.is_empty() && self.bo_entries.is_empty() {
+            SiliconResidualClass::Unclassified.as_str()
+        } else {
+            IO_PAGE_FAULT_MAP_AUDIT_CLASS
+        }
+    }
+
+    /// Soft report line — always honesty trio; audit alone ≠ Pass.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut class_parts: Vec<String> = self
+            .classes
+            .iter()
+            .map(|c| format!("0x{:x}:{}", c.fault, c.class.as_str()))
+            .collect();
+        if class_parts.is_empty() {
+            class_parts.push("none".into());
+        }
+        format!(
+            "io_page_fault_map_audit class={} faults={} orphan={} in_span={} \
+             near_base={} rela_match={} rela_targets={} bo_entries={} classes=[{}] \
+             invent_pass=0 not_c_ready=1 not_ran_on_npu=1 \
+             product_pass_requires_live_decide=1 audit_alone_not_pass=1",
+            self.soft_residual_class_token(),
+            self.fault_addrs.len(),
+            self.orphan_count,
+            self.in_span_count,
+            self.near_base_count,
+            self.rela_match_count,
+            self.rela_targets_count
+                .map_or_else(|| "absent".into(), |n| n.to_string()),
+            self.bo_entries.len(),
+            class_parts.join(","),
+        )
+    }
+}
+
+/// Parse hex token (`0x…` / bare hex) → `u64`.
+fn parse_hex_u64_token(raw: &str) -> Option<u64> {
+    let s = raw.trim().trim_end_matches([',', ';', ']', ')', '"', '\'']);
+    if s.is_empty() {
+        return None;
+    }
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    u64::from_str_radix(s, 16).ok()
+}
+
+/// Extract the body inside `bo_diag=[...]` (first `[` after key through matching `]`).
+fn bo_diag_bracket_body(detail: &str) -> Option<&str> {
+    let key = "bo_diag=";
+    let start = detail.find(key)?;
+    let after = &detail[start + key.len()..];
+    let after = after.trim_start();
+    if !after.starts_with('[') {
+        return None;
+    }
+    let inner = &after[1..];
+    let end = inner.find(']')?;
+    Some(&inner[..end])
+}
+
+/// Parse `bo_diag=[DevHeap: … xdna_addr=0x…; instr: …]` from last_apply detail.
+///
+/// Pure offline. Missing / unparseable → empty vec (never invents paddrs).
+#[must_use]
+pub fn parse_bo_diag_from_detail(detail: &str) -> Vec<BoDiagEntry> {
+    let Some(body) = bo_diag_bracket_body(detail) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for part in body.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((label_raw, rest)) = part.split_once(':') else {
+            continue;
+        };
+        let label = label_raw.trim();
+        if label.is_empty() {
+            continue;
+        }
+        let mut entry = BoDiagEntry {
+            label: label.to_string(),
+            ..BoDiagEntry::default()
+        };
+        for tok in rest.split_whitespace() {
+            let Some((k, v)) = tok.split_once('=') else {
+                continue;
+            };
+            match k {
+                "xdna_addr" => entry.xdna_addr = parse_hex_u64_token(v),
+                "vaddr" => entry.vaddr = parse_hex_u64_token(v),
+                "ty" => {
+                    entry.ty = Some(v.trim_end_matches([',', ';']).to_string());
+                }
+                "handle" => {
+                    let v = v.trim_end_matches([',', ';']);
+                    entry.handle = v
+                        .parse::<u32>()
+                        .ok()
+                        .or_else(|| parse_hex_u64_token(v).and_then(|n| u32::try_from(n).ok()));
+                }
+                _ => {}
+            }
+        }
+        out.push(entry);
+    }
+    out
+}
+
+/// Staged-size default for a bo_diag label (bytes); `None` if unknown.
+#[must_use]
+pub fn default_bo_diag_size_for_label(label: &str) -> Option<u64> {
+    match label.trim() {
+        "DevHeap" | "devheap" | "DEVHEAP" => Some(BO_DIAG_DEFAULT_DEVHEAP_SIZE),
+        "instr" | "Instr" | "INSTR" => Some(BO_DIAG_DEFAULT_INSTR_SIZE),
+        "ifm" | "IFM" => Some(STAGED_MLADF_IFM_BYTES),
+        "wts" | "WTS" => Some(STAGED_MLADF_WTS_BYTES),
+        "ofm" | "OFM" => Some(STAGED_MLADF_OFM_BYTES),
+        "ctrl" | "CTRL" => Some(STAGED_MLADF_CTRL_BYTES),
+        _ => None,
+    }
+}
+
+/// Build spans from parsed bo_diag entries (staged sizes when label known).
+#[must_use]
+pub fn bo_spans_from_diag_entries(entries: &[BoDiagEntry]) -> Vec<BoSpan> {
+    let mut out = Vec::new();
+    for e in entries {
+        let Some(base) = e.xdna_addr.filter(|&a| is_valid_device_paddr(a)) else {
+            continue;
+        };
+        let size = default_bo_diag_size_for_label(&e.label).unwrap_or(FAULT_NEAR_BO_BASE_WINDOW);
+        out.push(BoSpan::new(e.label.clone(), base, size));
+    }
+    out
+}
+
+/// Extract IO_PAGE_FAULT-related hex addresses from journal / operator paste.
+///
+/// Prefers `address=0x…` tokens on lines that mention `IO_PAGE_FAULT` (AMD-Vi).
+/// When no `address=` token exists on a fault line, also collects bare `0x…`
+/// tokens ≥ 12 hex digits on that line (avoids small flag/domain values).
+/// Empty / no IO_PAGE_FAULT → empty vec. Pure; never invents Pass.
+#[must_use]
+pub fn parse_journal_io_page_fault_addrs(text: &str) -> Vec<u64> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<u64> = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("io_page_fault") && !lower.contains("io page fault") {
+            continue;
+        }
+        // Prefer explicit address= tokens (AMD-Vi).
+        let mut found_address_eq = false;
+        let mut rest = line;
+        while let Some(idx) = rest.to_ascii_lowercase().find("address=") {
+            let after = &rest[idx + "address=".len()..];
+            let token = after
+                .split(|c: char| c.is_whitespace() || c == ']' || c == ',' || c == ';')
+                .next()
+                .unwrap_or("");
+            if let Some(a) = parse_hex_u64_token(token) {
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+                found_address_eq = true;
+            }
+            rest = &after[token.len().min(after.len())..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+        if found_address_eq {
+            continue;
+        }
+        // Fallback: long hex tokens on the fault line only.
+        for tok in line.split_whitespace() {
+            let t = tok.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != 'x' && c != 'X');
+            if !(t.starts_with("0x") || t.starts_with("0X")) {
+                continue;
+            }
+            let digits = &t[2..];
+            if digits.len() < 12 {
+                continue;
+            }
+            if let Some(a) = parse_hex_u64_token(t)
+                && !out.contains(&a)
+            {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+/// Classify one fault address against BO spans and optional rela overwrite targets.
+///
+/// Priority: exact rela target → tightest in-span (smallest size) → nearest base
+/// within [`FAULT_NEAR_BO_BASE_WINDOW`] → orphan.
+///
+/// Tightest-span wins so a page-sized `instr` BO inside a 64 MiB `DevHeap` is not
+/// mis-labeled as DevHeap.
+#[must_use]
+pub fn classify_fault_addr(
+    fault: u64,
+    spans: &[BoSpan],
+    rela_targets: &[(u32, u32, u64)],
+) -> FaultMapClass {
+    for &(sym, offset, value) in rela_targets {
+        if value == fault {
+            return FaultMapClass::MatchesRelaTarget { sym, offset };
+        }
+    }
+    let mut best_span: Option<(String, u64)> = None; // (label, size)
+    for s in spans {
+        if s.size == 0 {
+            continue;
+        }
+        let end = s.base.saturating_add(s.size);
+        if fault >= s.base && fault < end {
+            match &best_span {
+                None => best_span = Some((s.label.clone(), s.size)),
+                Some((_, sz)) if s.size < *sz => best_span = Some((s.label.clone(), s.size)),
+                _ => {}
+            }
+        }
+    }
+    if let Some((label, _)) = best_span {
+        return FaultMapClass::InBoSpan { label };
+    }
+    let mut best_near: Option<(String, u64)> = None; // (label, dist)
+    for s in spans {
+        let dist = fault.abs_diff(s.base);
+        if dist < FAULT_NEAR_BO_BASE_WINDOW {
+            match &best_near {
+                None => best_near = Some((s.label.clone(), dist)),
+                Some((_, d)) if dist < *d => best_near = Some((s.label.clone(), dist)),
+                _ => {}
+            }
+        }
+    }
+    if let Some((label, _)) = best_near {
+        return FaultMapClass::NearBoBase { label };
+    }
+    FaultMapClass::Orphan
+}
+
+/// List overwrite rela patch values: `(sym, ctrltext_offset, value=base[sym]+addend)`.
+///
+/// Same index map as live patch: `1→ifm, 2→wts, 3→ofm, 4→ctrl`. Pure; no mutate.
+///
+/// # Errors
+///
+/// When `.rela.dyn` cannot be parsed as ELF32 (empty rela is ok → empty vec).
+pub fn list_rela_patch_targets_overwrite(
+    elf: &[u8],
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    ctrl: u64,
+) -> Result<Vec<(u32, u32, u64)>, String> {
+    let relas = parse_elf32_rela_dyn(elf).map_err(|e| e.to_string())?;
+    let bases = [0_u64, ifm, wts, ofm, ctrl];
+    let mut out = Vec::with_capacity(relas.len());
+    for r in &relas {
+        let sym = r.sym();
+        let base = bases.get(sym as usize).copied().unwrap_or(0);
+        #[allow(clippy::cast_sign_loss)] // XRT-style wrapping addend math
+        let value = base.wrapping_add(r.addend as u64);
+        out.push((sym, r.offset, value));
+    }
+    Ok(out)
+}
+
+/// Composite: parse bo_diag + journal faults (+ optional ELF rela list) and classify.
+///
+/// Research only. Empty journal → no fault classes. Empty elf → skip rela match.
+/// Soft note always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1`.
+#[must_use]
+pub fn audit_io_page_fault_vs_lab_map(
+    detail: &str,
+    journal: Option<&str>,
+    elf: Option<&[u8]>,
+) -> IoPageFaultMapAudit {
+    let bo_entries = parse_bo_diag_from_detail(detail);
+    let spans = bo_spans_from_diag_entries(&bo_entries);
+
+    let mut rela_targets: Vec<(u32, u32, u64)> = Vec::new();
+    let mut rela_targets_count: Option<usize> = None;
+    if let Some(bytes) = elf.filter(|b| !b.is_empty()) {
+        // Prefer io paddrs from detail for rela bases; else bo_diag labels.
+        let (ifm, wts, ofm, ctrl) = parse_io_paddrs_from_detail(detail).unwrap_or_else(|| {
+            let mut ifm = 0;
+            let mut wts = 0;
+            let mut ofm = 0;
+            let mut ctrl = 0;
+            for e in &bo_entries {
+                if let Some(a) = e.xdna_addr {
+                    match e.label.as_str() {
+                        "ifm" | "IFM" => ifm = a,
+                        "wts" | "WTS" => wts = a,
+                        "ofm" | "OFM" => ofm = a,
+                        "ctrl" | "CTRL" => ctrl = a,
+                        _ => {}
+                    }
+                }
+            }
+            (ifm, wts, ofm, ctrl)
+        });
+        if is_valid_device_paddr(ifm) || is_valid_device_paddr(wts) || is_valid_device_paddr(ofm) {
+            match list_rela_patch_targets_overwrite(bytes, ifm, wts, ofm, ctrl) {
+                Ok(t) => {
+                    rela_targets_count = Some(t.len());
+                    rela_targets = t;
+                }
+                Err(_) => rela_targets_count = Some(0),
+            }
+        } else {
+            rela_targets_count = Some(0);
+        }
+    }
+
+    let fault_addrs = journal.map_or_else(Vec::new, parse_journal_io_page_fault_addrs);
+    let mut classes = Vec::with_capacity(fault_addrs.len());
+    let mut orphan_count = 0usize;
+    let mut in_span_count = 0usize;
+    let mut near_base_count = 0usize;
+    let mut rela_match_count = 0usize;
+    for &fault in &fault_addrs {
+        let class = classify_fault_addr(fault, &spans, &rela_targets);
+        match &class {
+            FaultMapClass::Orphan => orphan_count += 1,
+            FaultMapClass::InBoSpan { .. } => in_span_count += 1,
+            FaultMapClass::NearBoBase { .. } => near_base_count += 1,
+            FaultMapClass::MatchesRelaTarget { .. } => rela_match_count += 1,
+        }
+        classes.push(FaultClassified { fault, class });
+    }
+
+    IoPageFaultMapAudit {
+        bo_entries,
+        spans,
+        fault_addrs,
+        classes,
+        rela_targets_count,
+        orphan_count,
+        in_span_count,
+        near_base_count,
+        rela_match_count,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3c — research PDI identity honesty + offline fingerprint (not product Pass)
+// ---------------------------------------------------------------------------
+
+/// Soft residual class token: default dump / lab attach is research overlay only.
+///
+/// **Never** product known-good matmul PDI. **Never** Pass / `ran_on_npu`.
+pub const RESEARCH_PDI_IDENTITY_CLASS: &str = "research_pdi_not_product_known_good";
+
+/// Measured live size under `11bc9016` (`pdi_bytes=283840` CVML AIE2P research dump).
+///
+/// Size match alone ≠ product known-good and ≠ Pass.
+pub const RESEARCH_PDI_DEFAULT_DUMP_BYTES: u64 = 283_840;
+
+/// Soft fingerprint uses first 16 hex chars of SHA-256 (8 bytes).
+pub const PDI_FINGERPRINT_SHA_PREFIX_HEX: usize = 16;
+
+/// Source kind for research PDI identity (opaque; no PDI field decode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResearchPdiSourceKind {
+    /// No blob / no `pdi_bytes` signal.
+    #[default]
+    Absent,
+    /// Default dump path: CVML / AIE2P research overlay (`dump_xclbin_pdi`).
+    CvmlAie2pResearchOverlay,
+    /// Opaque path or last_apply size only (not classified as product known-good).
+    UnknownOpaque,
+}
+
+impl ResearchPdiSourceKind {
+    /// Stable token for soft notes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::CvmlAie2pResearchOverlay => "cvml_aie2p_research_overlay",
+            Self::UnknownOpaque => "unknown_opaque",
+        }
+    }
+}
+
+/// Pure PDI blob fingerprint: length + SHA-256 prefix (research only).
+///
+/// Digests only. **Not** FW decode. **Not** product known-good. **Not** Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PdiBlobFingerprint {
+    /// Blob length in bytes.
+    pub len_bytes: u64,
+    /// First [`PDI_FINGERPRINT_SHA_PREFIX_HEX`] hex of SHA-256 (lowercase).
+    /// Empty when digest refused or empty input.
+    pub sha256_prefix16: String,
+    /// Full 64-char lowercase hex when available; empty when refused.
+    pub sha256_hex: String,
+}
+
+impl PdiBlobFingerprint {
+    /// Soft token `pdi_fp len=N sha16=…` (sha16=`absent` when empty).
+    #[must_use]
+    pub fn format_token(&self) -> String {
+        let sha = if self.sha256_prefix16.is_empty() {
+            "absent"
+        } else {
+            self.sha256_prefix16.as_str()
+        };
+        format!("pdi_fp len={} sha16={sha}", self.len_bytes)
+    }
+}
+
+/// Fingerprint opaque PDI bytes (len + sha256 prefix16). Empty data → len 0, empty sha.
+#[must_use]
+pub fn fingerprint_pdi_blob_bytes(data: &[u8]) -> PdiBlobFingerprint {
+    let len_bytes = data.len() as u64;
+    if data.is_empty() {
+        return PdiBlobFingerprint {
+            len_bytes: 0,
+            sha256_prefix16: String::new(),
+            sha256_hex: String::new(),
+        };
+    }
+    let sha256_hex = sha256_hex_lower(data);
+    let sha256_prefix16 = if sha256_hex.is_empty() {
+        String::new()
+    } else {
+        sha256_hex
+            .chars()
+            .take(PDI_FINGERPRINT_SHA_PREFIX_HEX)
+            .collect()
+    };
+    PdiBlobFingerprint {
+        len_bytes,
+        sha256_prefix16,
+        sha256_hex,
+    }
+}
+
+/// Research PDI identity scorecard (default dump ≠ product matmul known-good).
+///
+/// Soft always: `research_pdi_not_product_known_good=1 invent_pass=0 not_ran_on_npu=1`.
+/// Attach measured ≠ Pass; wrong overlay may still IO_PAGE_FAULT / APP_LOAD.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResearchPdiIdentity {
+    /// Where the bytes / size signal came from (research taxonomy).
+    pub source_kind: ResearchPdiSourceKind,
+    /// Length when known (`pdi_bytes=` or blob).
+    pub len_bytes: Option<u64>,
+    /// Fingerprint when full bytes supplied; `None` for size-only last_apply.
+    pub fingerprint: Option<PdiBlobFingerprint>,
+    /// Always `false` offline for research dumps (never invent product known-good).
+    pub product_known_good: bool,
+    /// True when `len_bytes == RESEARCH_PDI_DEFAULT_DUMP_BYTES` (11bc9016 shape).
+    pub matches_live_research_dump_size: bool,
+}
+
+impl ResearchPdiIdentity {
+    /// Soft residual class token (always research-not-product when bytes/size present).
+    #[must_use]
+    pub fn soft_residual_class_token(&self) -> &'static str {
+        match self.source_kind {
+            ResearchPdiSourceKind::Absent => "research_pdi_absent",
+            _ => RESEARCH_PDI_IDENTITY_CLASS,
+        }
+    }
+
+    /// Soft note for classify / preflight. Always honesty; never Pass.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let fp = self
+            .fingerprint
+            .as_ref()
+            .map_or_else(|| "fp=absent".into(), PdiBlobFingerprint::format_token);
+        let len = self
+            .len_bytes
+            .map_or_else(|| "absent".into(), |n| n.to_string());
+        format!(
+            "research_pdi_identity class={} source={} len={} {fp} \
+             research_pdi_not_product_known_good=1 product_known_good={} \
+             matches_live_research_dump_size={} attach_measured_not_pass=1 \
+             wrong_overlay_may_fault_or_app_load=1 invent_pass=0 not_c_ready=1 \
+             not_ran_on_npu=1 product_pass_requires_live_decide=1",
+            self.soft_residual_class_token(),
+            self.source_kind.as_str(),
+            len,
+            u8::from(self.product_known_good),
+            u8::from(self.matches_live_research_dump_size),
+        )
+    }
+}
+
+/// Soft preflight when `XDNA2_LAB_PDI_BLOB` is set (or last_apply had CONFIG_CU PDI).
+///
+/// Alias of [`ResearchPdiIdentity::format_soft_note`] for tool call sites.
+#[must_use]
+pub fn format_research_pdi_preflight_note(identity: &ResearchPdiIdentity) -> String {
+    identity.format_soft_note()
+}
+
+/// Classify path/source hint for research dump vs unknown opaque.
+///
+/// Looks for CVML / AIE2P / `dump_xclbin_pdi` / `research_pdi` markers in the hint.
+#[must_use]
+pub fn research_pdi_source_kind_from_hint(hint: Option<&str>) -> ResearchPdiSourceKind {
+    let Some(h) = hint.map(str::trim).filter(|s| !s.is_empty()) else {
+        return ResearchPdiSourceKind::UnknownOpaque;
+    };
+    let lower = h.to_ascii_lowercase();
+    if lower.contains("cvml")
+        || lower.contains("aie2p")
+        || lower.contains("dump_xclbin_pdi")
+        || lower.contains("research_pdi")
+        || lower.contains("amd_aie2p")
+        || lower.contains("overlay")
+    {
+        ResearchPdiSourceKind::CvmlAie2pResearchOverlay
+    } else {
+        ResearchPdiSourceKind::UnknownOpaque
+    }
+}
+
+/// Score research PDI from optional bytes + source hint.
+///
+/// Empty / missing bytes → [`ResearchPdiSourceKind::Absent`] when no size override.
+/// Always `product_known_good=false`. Never invents Pass.
+#[must_use]
+pub fn research_pdi_identity_from_bytes(
+    data: Option<&[u8]>,
+    source_hint: Option<&str>,
+) -> ResearchPdiIdentity {
+    match data {
+        None | Some([]) => ResearchPdiIdentity {
+            source_kind: ResearchPdiSourceKind::Absent,
+            len_bytes: None,
+            fingerprint: None,
+            product_known_good: false,
+            matches_live_research_dump_size: false,
+        },
+        Some(bytes) => {
+            let fp = fingerprint_pdi_blob_bytes(bytes);
+            let len = fp.len_bytes;
+            ResearchPdiIdentity {
+                source_kind: research_pdi_source_kind_from_hint(source_hint),
+                len_bytes: Some(len),
+                fingerprint: Some(fp),
+                product_known_good: false,
+                matches_live_research_dump_size: len == RESEARCH_PDI_DEFAULT_DUMP_BYTES,
+            }
+        }
+    }
+}
+
+/// Score from last_apply signals (+ optional full blob for sha prefix).
+///
+/// Size-only path when blob absent: still marks research-not-product when
+/// `pdi_bytes` / `config_cu` present. Always `product_known_good=false`.
+#[must_use]
+pub fn research_pdi_identity_from_last_apply_signals(
+    sig: &LastApplyDetailSignals,
+    optional_blob: Option<&[u8]>,
+    source_hint: Option<&str>,
+) -> ResearchPdiIdentity {
+    if let Some(bytes) = optional_blob.filter(|b| !b.is_empty()) {
+        let mut id = research_pdi_identity_from_bytes(Some(bytes), source_hint);
+        // Prefer live size token when present and disagrees (should not).
+        if let Some(n) = sig.pdi_bytes {
+            id.len_bytes = Some(u64::from(n));
+            id.matches_live_research_dump_size = u64::from(n) == RESEARCH_PDI_DEFAULT_DUMP_BYTES;
+        }
+        return id;
+    }
+    if let Some(n) = sig.pdi_bytes {
+        let len = u64::from(n);
+        let kind = if source_hint.is_some() {
+            research_pdi_source_kind_from_hint(source_hint)
+        } else if len == RESEARCH_PDI_DEFAULT_DUMP_BYTES {
+            // 11bc9016 default dump shape without path: still research overlay class.
+            ResearchPdiSourceKind::CvmlAie2pResearchOverlay
+        } else {
+            ResearchPdiSourceKind::UnknownOpaque
+        };
+        return ResearchPdiIdentity {
+            source_kind: kind,
+            len_bytes: Some(len),
+            fingerprint: None,
+            product_known_good: false,
+            matches_live_research_dump_size: len == RESEARCH_PDI_DEFAULT_DUMP_BYTES,
+        };
+    }
+    if sig.config_cu.is_some() || sig.config_cu_failed {
+        // CONFIG_CU attempted without size: still research attach, not product KG.
+        return ResearchPdiIdentity {
+            source_kind: research_pdi_source_kind_from_hint(source_hint).max_absent_to_unknown(),
+            len_bytes: None,
+            fingerprint: None,
+            product_known_good: false,
+            matches_live_research_dump_size: false,
+        };
+    }
+    research_pdi_identity_from_bytes(None, None)
+}
+
+/// Default dump path locked identity (no bytes): CVML AIE2P research, not product KG.
+///
+/// Used by soft preflight / docs when only the default dump recipe is known.
+#[must_use]
+pub fn research_pdi_identity_default_dump_locked() -> ResearchPdiIdentity {
+    ResearchPdiIdentity {
+        source_kind: ResearchPdiSourceKind::CvmlAie2pResearchOverlay,
+        len_bytes: Some(RESEARCH_PDI_DEFAULT_DUMP_BYTES),
+        fingerprint: None,
+        product_known_good: false,
+        matches_live_research_dump_size: true,
+    }
+}
+
+/// Parse soft `pdi_fp len=N sha16=HEX` or `pdi_fp_len=` / `pdi_fp_sha16=` from detail.
+///
+/// Missing → `None`. Pure offline; never invents product known-good.
+#[must_use]
+pub fn parse_pdi_fingerprint_from_detail(detail: &str) -> Option<PdiBlobFingerprint> {
+    if detail.is_empty() {
+        return None;
+    }
+    // Compact form: pdi_fp len=283840 sha16=abcdef0123456789
+    if let Some(idx) = detail.find("pdi_fp ") {
+        let rest = &detail[idx + "pdi_fp ".len()..];
+        let mut len_bytes: Option<u64> = None;
+        let mut sha16 = String::new();
+        for tok in rest.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("len=") {
+                let v = v.trim_end_matches([',', ';']);
+                len_bytes = v.parse().ok();
+            } else if let Some(v) = tok.strip_prefix("sha16=") {
+                let v = v.trim_end_matches([',', ';']);
+                if v != "absent" && !v.is_empty() {
+                    sha16 = v.to_ascii_lowercase();
+                }
+            } else if tok.contains('=') {
+                // next key=value field — stop if not ours
+                break;
+            }
+        }
+        if let Some(len) = len_bytes {
+            return Some(PdiBlobFingerprint {
+                len_bytes: len,
+                sha256_prefix16: sha16,
+                sha256_hex: String::new(),
+            });
+        }
+    }
+    // Split form: pdi_fp_len=N pdi_fp_sha16=HEX
+    let mut len_bytes: Option<u64> = None;
+    let mut sha16 = String::new();
+    for tok in detail.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("pdi_fp_len=") {
+            let v = v.trim_end_matches([',', ';']);
+            len_bytes = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("pdi_fp_sha16=") {
+            let v = v.trim_end_matches([',', ';']);
+            if v != "absent" && !v.is_empty() {
+                sha16 = v.to_ascii_lowercase();
+            }
+        }
+    }
+    len_bytes.map(|len| PdiBlobFingerprint {
+        len_bytes: len,
+        sha256_prefix16: sha16,
+        sha256_hex: String::new(),
+    })
+}
+
+impl ResearchPdiSourceKind {
+    /// When CONFIG_CU present without size and no useful hint → unknown opaque.
+    fn max_absent_to_unknown(self) -> Self {
+        match self {
+            Self::Absent => Self::UnknownOpaque,
+            other => other,
+        }
+    }
+}
+
 /// Live C2 journal dual-status pair (research only; never invents product Pass).
 ///
 /// Operator C2 (2026-07-18): `Failed cmd … 0x3000003` + nearby `Status 0x4000003`.
@@ -608,15 +1601,15 @@ impl JournalFwStatusPair {
 pub fn parse_journal_fw_status_pair(text: &str) -> JournalFwStatusPair {
     let mut out = JournalFwStatusPair::default();
     for line in text.lines() {
-        if out.failed_cmd_status.is_none() {
-            if let Some(c) = parse_failed_cmd_status_token(line) {
-                out.failed_cmd_status = Some(c);
-            }
+        if out.failed_cmd_status.is_none()
+            && let Some(c) = parse_failed_cmd_status_token(line)
+        {
+            out.failed_cmd_status = Some(c);
         }
-        if out.chain_status.is_none() {
-            if let Some(c) = parse_chain_status_token(line) {
-                out.chain_status = Some(c);
-            }
+        if out.chain_status.is_none()
+            && let Some(c) = parse_chain_status_token(line)
+        {
+            out.chain_status = Some(c);
         }
     }
     out
@@ -904,7 +1897,9 @@ pub fn c2_live_cmdbuf_words_embedded() -> &'static [u32] {
 #[must_use]
 pub fn format_c2_cmdbuf_research_note(pure_bo: &[u8], live_words: &[u32]) -> String {
     let pure_words: Vec<u32> = pure_bo
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let d = diff_u32_word_lists(&pure_words, live_words);
@@ -1236,7 +2231,9 @@ pub fn decode_c2_live_cmdbuf_research(
             m.suspected_framing_extra_words = live_words.len().saturating_sub(bo.len() / 4);
         } else {
             let pure_words: Vec<u32> = bo
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let d = diff_u32_word_lists(&pure_words, live_words);
@@ -1587,7 +2584,7 @@ pub fn sha256_digest(data: &[u8]) -> Option<[u8; 32]> {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
     debug_assert_eq!(msg.len() % 64, 0);
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0_u32; 64];
         for i in 0..16 {
             let j = i * 4;
@@ -1695,8 +2692,18 @@ impl TxnOpOpcodeProfile {
     /// Compact soft tokens (`op_write=N …`).
     #[must_use]
     pub fn format_soft_tokens(&self) -> String {
+        self.format_soft_tokens_with_prefix("")
+    }
+
+    /// Compact soft tokens with optional key prefix (`external_op_write=N …`).
+    ///
+    /// Empty prefix → bare `op_*` keys (legacy [`Self::format_soft_tokens`]).
+    /// Non-empty prefix is joined without extra underscore when it already ends
+    /// with `_` (callers pass `"external_"` / `"lab_"`).
+    #[must_use]
+    pub fn format_soft_tokens_with_prefix(&self, prefix: &str) -> String {
         format!(
-            "op_total={} op_write={} op_block_write={} op_block_set={} op_mask_write={} op_mask_poll={} op_noop={} op_preempt={} op_mask_poll_busy={} op_custom_or_other={}",
+            "{p}op_total={} {p}op_write={} {p}op_block_write={} {p}op_block_set={} {p}op_mask_write={} {p}op_mask_poll={} {p}op_noop={} {p}op_preempt={} {p}op_mask_poll_busy={} {p}op_custom_or_other={}",
             self.total,
             self.write,
             self.block_write,
@@ -1706,8 +2713,26 @@ impl TxnOpOpcodeProfile {
             self.noop,
             self.preempt,
             self.mask_poll_busy,
-            self.custom_or_other
+            self.custom_or_other,
+            p = prefix,
         )
+    }
+
+    /// L1 distance over classic opcode bins (excludes derived `total`).
+    ///
+    /// Research only — distance **≠** Pass.
+    #[must_use]
+    pub fn l1_distance(&self, other: &Self) -> u32 {
+        self.write
+            .abs_diff(other.write)
+            .saturating_add(self.block_write.abs_diff(other.block_write))
+            .saturating_add(self.block_set.abs_diff(other.block_set))
+            .saturating_add(self.mask_write.abs_diff(other.mask_write))
+            .saturating_add(self.mask_poll.abs_diff(other.mask_poll))
+            .saturating_add(self.noop.abs_diff(other.noop))
+            .saturating_add(self.preempt.abs_diff(other.preempt))
+            .saturating_add(self.mask_poll_busy.abs_diff(other.mask_poll_busy))
+            .saturating_add(self.custom_or_other.abs_diff(other.custom_or_other))
     }
 }
 
@@ -3825,6 +4850,8 @@ pub struct CtrltextFingerprintExport {
     pub txn_num_cols: Option<u8>,
     /// Classic header rows (u8).
     pub txn_num_rows: Option<u8>,
+    /// Opcode histogram when unpatched peel classic-walked (Route B / soft compare).
+    pub op_profile: Option<TxnOpOpcodeProfile>,
     /// SHA-256 of **unpatched** peeled ctrltext (stable; empty if peel absent).
     pub unpatched_sha256_hex: String,
     /// Always **false** from [`export_ctrltext_fingerprint_research`] — do not invent.
@@ -3846,6 +4873,7 @@ impl Default for CtrltextFingerprintExport {
             txn_dev_gen: None,
             txn_num_cols: None,
             txn_num_rows: None,
+            op_profile: None,
             unpatched_sha256_hex: String::new(),
             known_good_present: false,
             known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
@@ -3901,6 +4929,9 @@ impl CtrltextFingerprintExport {
         }
         if let Some(r) = self.txn_num_rows {
             parts.push(format!("txn_num_rows={r}"));
+        }
+        if let Some(ref op) = self.op_profile {
+            parts.push(op.format_soft_tokens());
         }
         if self.unpatched_sha256_hex.is_empty() {
             parts.push("unpatched_sha=absent".into());
@@ -3978,6 +5009,7 @@ pub fn export_ctrltext_fingerprint_research(elf: &[u8]) -> CtrltextFingerprintEx
         txn_dev_gen: profile.txn_dev_gen,
         txn_num_cols: profile.txn_num_cols,
         txn_num_rows: profile.txn_num_rows,
+        op_profile: profile.op_profile,
         unpatched_sha256_hex: sha256_hex_lower(&peeled),
         known_good_present: false,
         known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
@@ -4024,6 +5056,26 @@ pub struct ExternalCtrltextCompareResearch {
     /// Pass (see soft-note honesty trio + always `known_good_present=0` /
     /// `product_known_good=0` on [`Self::format_soft_note`]).
     pub known_good_absent: bool,
+    /// External classic header `num_ops` when walkable (Route B surface).
+    pub external_txn_num_ops: Option<u32>,
+    /// External classic header `dev_gen` when present.
+    pub external_txn_dev_gen: Option<u8>,
+    /// External classic header cols when present.
+    pub external_txn_num_cols: Option<u8>,
+    /// External classic header rows when present.
+    pub external_txn_num_rows: Option<u8>,
+    /// Lab classic header `num_ops` echo from export.
+    pub lab_txn_num_ops: Option<u32>,
+    /// Lab classic header `dev_gen` echo.
+    pub lab_txn_dev_gen: Option<u8>,
+    /// Lab classic header cols echo.
+    pub lab_txn_num_cols: Option<u8>,
+    /// Lab classic header rows echo.
+    pub lab_txn_num_rows: Option<u8>,
+    /// External opcode histogram when classic walk OK.
+    pub external_op_profile: Option<TxnOpOpcodeProfile>,
+    /// Lab opcode histogram when export classic-walked (Route B).
+    pub lab_op_profile: Option<TxnOpOpcodeProfile>,
     /// Research detail token.
     pub detail: String,
 }
@@ -4044,6 +5096,16 @@ impl Default for ExternalCtrltextCompareResearch {
             lab_staged_mladf_classic_profile: false,
             structural_match: false,
             known_good_absent: true,
+            external_txn_num_ops: None,
+            external_txn_dev_gen: None,
+            external_txn_num_cols: None,
+            external_txn_num_rows: None,
+            lab_txn_num_ops: None,
+            lab_txn_dev_gen: None,
+            lab_txn_num_cols: None,
+            lab_txn_num_rows: None,
+            external_op_profile: None,
+            lab_op_profile: None,
             detail: "default_known_good_absent".into(),
         }
     }
@@ -4055,6 +5117,10 @@ impl ExternalCtrltextCompareResearch {
     /// Always emits `known_good_present=0` and `product_known_good=0` so a
     /// log skim cannot confuse `known_good_absent=0` (research external bytes
     /// supplied) with product known-good capture.
+    ///
+    /// Route B: when classic headers / opcode histograms are present, surfaces
+    /// per-side `external_txn_*` / `lab_txn_*` and `external_op_*` / `lab_op_*`
+    /// tokens. Structural match / histogram **≠** Pass.
     #[must_use]
     pub fn format_soft_note(&self) -> String {
         let mut parts = vec![
@@ -4090,6 +5156,36 @@ impl ExternalCtrltextCompareResearch {
         }
         if let Some(n) = self.external_len {
             parts.push(format!("external_len={n}"));
+        }
+        if let Some(n) = self.lab_txn_num_ops {
+            parts.push(format!("lab_txn_num_ops={n}"));
+        }
+        if let Some(g) = self.lab_txn_dev_gen {
+            parts.push(format!("lab_txn_dev_gen={g}"));
+        }
+        if let Some(c) = self.lab_txn_num_cols {
+            parts.push(format!("lab_txn_num_cols={c}"));
+        }
+        if let Some(r) = self.lab_txn_num_rows {
+            parts.push(format!("lab_txn_num_rows={r}"));
+        }
+        if let Some(n) = self.external_txn_num_ops {
+            parts.push(format!("external_txn_num_ops={n}"));
+        }
+        if let Some(g) = self.external_txn_dev_gen {
+            parts.push(format!("external_txn_dev_gen={g}"));
+        }
+        if let Some(c) = self.external_txn_num_cols {
+            parts.push(format!("external_txn_num_cols={c}"));
+        }
+        if let Some(r) = self.external_txn_num_rows {
+            parts.push(format!("external_txn_num_rows={r}"));
+        }
+        if let Some(ref op) = self.lab_op_profile {
+            parts.push(op.format_soft_tokens_with_prefix("lab_"));
+        }
+        if let Some(ref op) = self.external_op_profile {
+            parts.push(op.format_soft_tokens_with_prefix("external_"));
         }
         if !self.lab_unpatched_sha256_hex.is_empty() {
             parts.push(format!(
@@ -4140,6 +5236,16 @@ pub fn compare_external_ctrltext_to_lab_export(
             lab_staged_mladf_classic_profile: lab_staged,
             structural_match: false,
             known_good_absent: true,
+            external_txn_num_ops: None,
+            external_txn_dev_gen: None,
+            external_txn_num_cols: None,
+            external_txn_num_rows: None,
+            lab_txn_num_ops: lab.txn_num_ops,
+            lab_txn_dev_gen: lab.txn_dev_gen,
+            lab_txn_num_cols: lab.txn_num_cols,
+            lab_txn_num_rows: lab.txn_num_rows,
+            external_op_profile: None,
+            lab_op_profile: lab.op_profile.clone(),
             detail: "external_absent_awaiting_capture".into(),
         };
     };
@@ -4188,7 +5294,706 @@ pub fn compare_external_ctrltext_to_lab_export(
         // Bytes present for research compare — still never product known-good /
         // Pass (`invent_pass=0` soft note). Working public-stack capture is open.
         known_good_absent: false,
+        external_txn_num_ops: ext_profile.txn_num_ops,
+        external_txn_dev_gen: ext_profile.txn_dev_gen,
+        external_txn_num_cols: ext_profile.txn_num_cols,
+        external_txn_num_rows: ext_profile.txn_num_rows,
+        lab_txn_num_ops: lab.txn_num_ops,
+        lab_txn_dev_gen: lab.txn_dev_gen,
+        lab_txn_num_cols: lab.txn_num_cols,
+        lab_txn_num_rows: lab.txn_num_rows,
+        external_op_profile: ext_profile.op_profile,
+        lab_op_profile: lab.op_profile.clone(),
         detail,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route B — structural distance / size-class / capture-dir fingerprint
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`ExternalVsLabStructuralDistance::format_soft_note`].
+pub const EXTERNAL_VS_LAB_STRUCTURAL_DISTANCE_NOTE: &str = "external_vs_lab_structural_distance";
+
+/// Soft-note bag name for [`CaptureMaterialFingerprint::format_soft_note`].
+pub const CAPTURE_MATERIAL_FINGERPRINT_NOTE: &str = "capture_material_fingerprint";
+
+/// Soft-note bag name for [`RelaStructureCompareResearch::format_soft_note`].
+pub const RELA_STRUCTURE_COMPARE_NOTE: &str = "rela_structure_compare";
+
+/// Upper inclusive bound for [`CtrltextSizeClass::SmallPublicNpu2`] length class.
+///
+/// Covers public npu2 minimal AOT peels under `testdata/xdna2_cmd/external_known_good/`:
+/// mlir-aie `vector_scalar_add` ~300 B and single_core matmul ~660 B, plus room for
+/// other small research peels. Lab classic **1688** is classified first as
+/// [`CtrltextSizeClass::MladfClassic1688`] (not this band). Not a Pass identity;
+/// length-only small-public still sets `residual_matched_claim=0`.
+pub const CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES: usize = 1024;
+
+/// Research size-class for ctrltext / classic peels (Route B).
+///
+/// Length-first labels for multi-axis distance. **Never** product known-good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CtrltextSizeClass {
+    /// Zero-length / absent peel.
+    #[default]
+    Empty,
+    /// Staged mladf classic 1688 B class (or `staged_mladf_classic_profile`).
+    MladfClassic1688,
+    /// Small public npu2 / minimal AOT class (`1..=CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES`).
+    SmallPublicNpu2,
+    /// Other non-empty length (not 1688 / not small-public band).
+    Other,
+}
+
+impl CtrltextSizeClass {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::MladfClassic1688 => "mladf_classic_1688",
+            Self::SmallPublicNpu2 => "small_public_npu2",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Classify ctrltext length (+ optional payload profile) into a size class.
+///
+/// - `0` → [`CtrltextSizeClass::Empty`]
+/// - staged mladf profile **or** len == 1688 → [`CtrltextSizeClass::MladfClassic1688`]
+/// - `1..=CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES` (1024) → [`CtrltextSizeClass::SmallPublicNpu2`]
+///   (covers public research peels 300 B + 660 B)
+/// - else → [`CtrltextSizeClass::Other`]
+///
+/// Research only; class label **≠** Pass / known-good.
+#[must_use]
+pub fn classify_ctrltext_size_class(
+    len: usize,
+    profile: Option<&InstrPayloadProfile>,
+) -> CtrltextSizeClass {
+    if len == 0 {
+        return CtrltextSizeClass::Empty;
+    }
+    if profile.is_some_and(|p| p.staged_mladf_classic_profile)
+        || len == super::txn::STAGED_MLADF_CLASSIC_INSTR_BYTES
+    {
+        return CtrltextSizeClass::MladfClassic1688;
+    }
+    if len <= CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES {
+        return CtrltextSizeClass::SmallPublicNpu2;
+    }
+    CtrltextSizeClass::Other
+}
+
+/// Size class from a lab fingerprint export (no re-profile required).
+#[must_use]
+pub fn classify_ctrltext_size_class_from_export(
+    lab: &CtrltextFingerprintExport,
+) -> CtrltextSizeClass {
+    let len = lab.ctrltext_len.unwrap_or(0);
+    if len == 0 {
+        return CtrltextSizeClass::Empty;
+    }
+    if lab.staged_mladf_classic_profile || len == super::txn::STAGED_MLADF_CLASSIC_INSTR_BYTES {
+        return CtrltextSizeClass::MladfClassic1688;
+    }
+    if len <= CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES {
+        return CtrltextSizeClass::SmallPublicNpu2;
+    }
+    CtrltextSizeClass::Other
+}
+
+/// Multi-axis structural distance: external raw ctrltext vs lab fingerprint export.
+///
+/// Surfaces size class, classic walk, opcode-histogram L1, header diffs, sha/len.
+/// Soft note always `distance_alone_not_pass=1 invent_pass=0 not_c_ready=1
+/// not_ran_on_npu=1 product_known_good=0`. Distance / match **≠** Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct ExternalVsLabStructuralDistance {
+    /// External size class label.
+    pub external_size_class: CtrltextSizeClass,
+    /// Lab size class label.
+    pub lab_size_class: CtrltextSizeClass,
+    /// `external_size_class == lab_size_class`.
+    pub size_class_match: bool,
+    /// Both sides classic-walk OK.
+    pub classic_both: bool,
+    /// L1 over opcode bins when both histograms present; else 0.
+    pub op_hist_l1: u32,
+    /// True when both sides had opcode histograms for L1.
+    pub op_hist_both: bool,
+    /// Absolute cols header diff when both present.
+    pub header_cols_diff: Option<u32>,
+    /// Absolute rows header diff when both present.
+    pub header_rows_diff: Option<u32>,
+    /// Absolute ops header diff when both present.
+    pub header_ops_diff: Option<u32>,
+    /// Absolute dev_gen header diff when both present.
+    pub header_dev_gen_diff: Option<u32>,
+    /// External sha equals lab unpatched sha (both non-empty).
+    pub sha_match: bool,
+    /// External len equals lab len when lab len known.
+    pub len_match: bool,
+    /// Lab ctrltext length when known.
+    pub lab_len: Option<usize>,
+    /// External byte length.
+    pub external_len: usize,
+    /// External classic walk.
+    pub external_classic_walk_ok: bool,
+    /// Lab classic walk echo.
+    pub lab_classic_walk_ok: bool,
+    /// Research detail token.
+    pub detail: String,
+}
+
+impl ExternalVsLabStructuralDistance {
+    /// Soft research note — always honesty + `distance_alone_not_pass=1`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            EXTERNAL_VS_LAB_STRUCTURAL_DISTANCE_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "distance_alone_not_pass=1".into(),
+            format!("external_size_class={}", self.external_size_class.as_str()),
+            format!("lab_size_class={}", self.lab_size_class.as_str()),
+            format!("size_class_match={}", u8::from(self.size_class_match)),
+            format!("classic_both={}", u8::from(self.classic_both)),
+            format!("op_hist_l1={}", self.op_hist_l1),
+            format!("op_hist_both={}", u8::from(self.op_hist_both)),
+            format!("sha_match={}", u8::from(self.sha_match)),
+            format!("len_match={}", u8::from(self.len_match)),
+            format!("external_len={}", self.external_len),
+            format!(
+                "external_classic_walk_ok={}",
+                u8::from(self.external_classic_walk_ok)
+            ),
+            format!("lab_classic_walk_ok={}", u8::from(self.lab_classic_walk_ok)),
+        ];
+        if let Some(n) = self.lab_len {
+            parts.push(format!("lab_len={n}"));
+        }
+        if let Some(d) = self.header_cols_diff {
+            parts.push(format!("header_cols_diff={d}"));
+        }
+        if let Some(d) = self.header_rows_diff {
+            parts.push(format!("header_rows_diff={d}"));
+        }
+        if let Some(d) = self.header_ops_diff {
+            parts.push(format!("header_ops_diff={d}"));
+        }
+        if let Some(d) = self.header_dev_gen_diff {
+            parts.push(format!("header_dev_gen_diff={d}"));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+fn option_abs_diff_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.abs_diff(y)),
+        _ => None,
+    }
+}
+
+fn option_abs_diff_u8(a: Option<u8>, b: Option<u8>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(u32::from(x.abs_diff(y))),
+        _ => None,
+    }
+}
+
+/// Multi-axis structural distance of external ctrltext bytes vs lab export.
+///
+/// Empty external → size class empty + detail `external_empty_for_distance`.
+/// Self-match (same peel) → zero L1 / size_class_match=1 still invent_pass=0.
+/// Expected mismatch (300 vs 1688) → size_class_match=0 + non-empty detail.
+///
+/// **Never** invents Pass / C-ready / `ran_on_npu` / unlock.
+#[must_use]
+pub fn research_external_vs_lab_structural_distance(
+    lab: &CtrltextFingerprintExport,
+    external: &[u8],
+) -> ExternalVsLabStructuralDistance {
+    let lab_size_class = classify_ctrltext_size_class_from_export(lab);
+    let lab_classic = lab.classic_walk_ok;
+    let lab_len = lab.ctrltext_len;
+
+    if external.is_empty() {
+        return ExternalVsLabStructuralDistance {
+            external_size_class: CtrltextSizeClass::Empty,
+            lab_size_class,
+            size_class_match: lab_size_class == CtrltextSizeClass::Empty,
+            classic_both: false,
+            op_hist_l1: 0,
+            op_hist_both: false,
+            header_cols_diff: None,
+            header_rows_diff: None,
+            header_ops_diff: None,
+            header_dev_gen_diff: None,
+            sha_match: false,
+            len_match: lab_len == Some(0),
+            lab_len,
+            external_len: 0,
+            external_classic_walk_ok: false,
+            lab_classic_walk_ok: lab_classic,
+            detail: "external_empty_for_distance".into(),
+        };
+    }
+
+    let ext_profile = profile_instr_payload_bytes(external);
+    let external_size_class = classify_ctrltext_size_class(external.len(), Some(&ext_profile));
+    let size_class_match = external_size_class == lab_size_class;
+    let external_classic = ext_profile.classic_walk_ok;
+    let classic_both = lab_classic && external_classic;
+    let (op_hist_l1, op_hist_both) = match (&lab.op_profile, &ext_profile.op_profile) {
+        (Some(a), Some(b)) => (a.l1_distance(b), true),
+        _ => (0, false),
+    };
+    let header_cols_diff = option_abs_diff_u8(lab.txn_num_cols, ext_profile.txn_num_cols);
+    let header_rows_diff = option_abs_diff_u8(lab.txn_num_rows, ext_profile.txn_num_rows);
+    let header_ops_diff = option_abs_diff_u32(lab.txn_num_ops, ext_profile.txn_num_ops);
+    let header_dev_gen_diff = option_abs_diff_u8(lab.txn_dev_gen, ext_profile.txn_dev_gen);
+    let ext_sha = sha256_hex_lower(external);
+    let sha_match = !lab.unpatched_sha256_hex.is_empty() && lab.unpatched_sha256_hex == ext_sha;
+    let len_match = lab_len == Some(external.len());
+
+    let detail = if sha_match && size_class_match && classic_both && op_hist_both && op_hist_l1 == 0
+    {
+        "structural_distance_zero_self_match".into()
+    } else if !size_class_match {
+        "size_class_mismatch_distance".into()
+    } else if !classic_both {
+        "classic_walk_incomplete_distance".into()
+    } else if op_hist_both && op_hist_l1 > 0 {
+        "op_hist_l1_nonzero_distance".into()
+    } else if !sha_match {
+        "content_diff_distance".into()
+    } else {
+        "structural_distance_partial".into()
+    };
+
+    ExternalVsLabStructuralDistance {
+        external_size_class,
+        lab_size_class,
+        size_class_match,
+        classic_both,
+        op_hist_l1,
+        op_hist_both,
+        header_cols_diff,
+        header_rows_diff,
+        header_ops_diff,
+        header_dev_gen_diff,
+        sha_match,
+        len_match,
+        lab_len,
+        external_len: external.len(),
+        external_classic_walk_ok: external_classic,
+        lab_classic_walk_ok: lab_classic,
+        detail,
+    }
+}
+
+/// Multi-file capture-dir material family fingerprint (Route B).
+///
+/// Counts allowed ctrltext bins under a confined root, profiles first peel,
+/// optional xclbin/ELF magic flags. Empty dir → `blocked_on_external_bytes=1`.
+/// Always `product_known_good=0 invent_pass=0`. Fingerprint **≠** Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct CaptureMaterialFingerprint {
+    /// Number of `.bin` / `.ctrltext` files found (non-refused basenames).
+    pub bin_count: usize,
+    /// Number of `*.elf` siblings found (magic/name).
+    pub elf_count: usize,
+    /// Number of files starting with public xclbin2 magic.
+    pub xclbin_count: usize,
+    /// First ctrltext length when present.
+    pub first_ctrltext_len: Option<usize>,
+    /// Size class of first ctrltext.
+    pub first_ctrltext_size_class: CtrltextSizeClass,
+    /// Classic walk OK on first ctrltext.
+    pub first_classic_walk_ok: bool,
+    /// Staged mladf classic profile on first ctrltext.
+    pub first_staged_mladf: bool,
+    /// Any xclbin2 magic seen.
+    pub has_xclbin_magic: bool,
+    /// Any ELF magic seen.
+    pub has_elf_magic: bool,
+    /// True when no allowed ctrltext bins (empty / blocked bag).
+    pub blocked_on_external_bytes: bool,
+    /// Always false from constructors.
+    pub product_known_good: bool,
+    /// Research detail token.
+    pub detail: String,
+}
+
+impl CaptureMaterialFingerprint {
+    /// Soft research note — always honesty + `capture_material_alone_not_pass=1`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            CAPTURE_MATERIAL_FINGERPRINT_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "capture_material_alone_not_pass=1".into(),
+            format!("bin_count={}", self.bin_count),
+            format!("elf_count={}", self.elf_count),
+            format!("xclbin_count={}", self.xclbin_count),
+            format!(
+                "first_ctrltext_size_class={}",
+                self.first_ctrltext_size_class.as_str()
+            ),
+            format!(
+                "first_classic_walk_ok={}",
+                u8::from(self.first_classic_walk_ok)
+            ),
+            format!("first_staged_mladf={}", u8::from(self.first_staged_mladf)),
+            format!("has_xclbin_magic={}", u8::from(self.has_xclbin_magic)),
+            format!("has_elf_magic={}", u8::from(self.has_elf_magic)),
+            format!(
+                "blocked_on_external_bytes={}",
+                u8::from(self.blocked_on_external_bytes)
+            ),
+        ];
+        if let Some(n) = self.first_ctrltext_len {
+            parts.push(format!("first_ctrltext_len={n}"));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+fn path_is_elf_name(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("elf"))
+}
+
+fn path_is_xclbin_name(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xclbin"))
+}
+
+fn bytes_have_elf_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[0..4] == [0x7f, b'E', b'L', b'F']
+}
+
+/// Blocked capture-material bag with research detail (always product_known_good=0).
+fn capture_material_blocked(detail: &'static str) -> CaptureMaterialFingerprint {
+    CaptureMaterialFingerprint {
+        blocked_on_external_bytes: true,
+        product_known_good: false,
+        detail: detail.into(),
+        ..CaptureMaterialFingerprint::default()
+    }
+}
+
+/// True when `root` is under allowed temp or external known-good bag roots.
+fn capture_material_root_is_allowed(root: &std::path::Path) -> bool {
+    let temp_root = last_apply_temp_root();
+    let bag_root = external_known_good_lab_root();
+    let resolved = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    resolved.starts_with(&temp_root)
+        || resolved.starts_with(&bag_root)
+        || resolved == temp_root
+        || resolved == bag_root
+        || root.starts_with(&temp_root)
+        || root.starts_with(&bag_root)
+}
+
+/// Scan dir entries for ctrltext bins + ELF/xclbin sibling counters.
+fn scan_capture_material_dir_entries(
+    rd: std::fs::ReadDir,
+) -> (Vec<std::path::PathBuf>, usize, usize, bool, bool) {
+    let mut bin_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut elf_count = 0usize;
+    let mut xclbin_count = 0usize;
+    let mut has_elf_magic = false;
+    let mut has_xclbin_magic = false;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_file() || is_refused_local_post_patch_as_known_good(&path) {
+            continue;
+        }
+        if external_ctrltext_extension_ok(&path) {
+            bin_paths.push(path.clone());
+        }
+        if path_is_elf_name(&path) {
+            elf_count = elf_count.saturating_add(1);
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                let mut hdr = [0_u8; 4];
+                if std::io::Read::read_exact(&mut f, &mut hdr).is_ok() && bytes_have_elf_magic(&hdr)
+                {
+                    has_elf_magic = true;
+                }
+            }
+        }
+        if path_is_xclbin_name(&path) {
+            xclbin_count = xclbin_count.saturating_add(1);
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                let mut hdr = [0_u8; 8];
+                if std::io::Read::read_exact(&mut f, &mut hdr).is_ok()
+                    && xclbin_magic_is_xclbin2(&hdr)
+                {
+                    has_xclbin_magic = true;
+                }
+            }
+        }
+    }
+    bin_paths.sort();
+    (
+        bin_paths,
+        elf_count,
+        xclbin_count,
+        has_elf_magic,
+        has_xclbin_magic,
+    )
+}
+
+/// Fingerprint allowed capture material under `root` (multi-file research bag).
+///
+/// **Confinement:** root must resolve under [`last_apply_temp_root`] or
+/// [`external_known_good_lab_root`] (or equal those roots). Outside → refused
+/// detail, no invent Pass.
+///
+/// Empty / no ctrltext bins → `blocked_on_external_bytes=1`.
+/// Present material classifies; always `product_known_good=0`.
+#[must_use]
+pub fn fingerprint_capture_material_dir_research(
+    root: &std::path::Path,
+) -> CaptureMaterialFingerprint {
+    if root.as_os_str().is_empty() {
+        return capture_material_blocked("root_empty");
+    }
+    if root
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return capture_material_blocked("root_parent_dir_refused");
+    }
+    if !capture_material_root_is_allowed(root) {
+        return capture_material_blocked("root_outside_allowed_confinement");
+    }
+    let resolved = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Ok(rd) = std::fs::read_dir(&resolved) else {
+        return capture_material_blocked("root_read_dir_failed");
+    };
+
+    let (bin_paths, elf_count, xclbin_count, has_elf_magic, has_xclbin_magic) =
+        scan_capture_material_dir_entries(rd);
+    let bin_count = bin_paths.len();
+    if bin_count == 0 {
+        return CaptureMaterialFingerprint {
+            bin_count: 0,
+            elf_count,
+            xclbin_count,
+            first_ctrltext_len: None,
+            first_ctrltext_size_class: CtrltextSizeClass::Empty,
+            first_classic_walk_ok: false,
+            first_staged_mladf: false,
+            has_xclbin_magic,
+            has_elf_magic,
+            blocked_on_external_bytes: true,
+            product_known_good: false,
+            detail: if elf_count > 0 || xclbin_count > 0 {
+                "no_ctrltext_bins_siblings_only".into()
+            } else {
+                "empty_dir_blocked_on_external_bytes".into()
+            },
+        };
+    }
+
+    // First sorted ctrltext file → profile (size-capped).
+    let first = &bin_paths[0];
+    let Ok(bytes) =
+        read_lab_file_capped(first.to_str().unwrap_or(""), "capture_material_fingerprint")
+    else {
+        return CaptureMaterialFingerprint {
+            bin_count,
+            elf_count,
+            xclbin_count,
+            has_xclbin_magic,
+            has_elf_magic,
+            blocked_on_external_bytes: false,
+            product_known_good: false,
+            detail: "first_ctrltext_read_failed".into(),
+            ..CaptureMaterialFingerprint::default()
+        };
+    };
+    // Peel ELF if operator placed an ELF with .ctrltext extension (rare); else raw.
+    let peel = if is_aiebu_elf_ctrltext(&bytes) {
+        super::txn::instruction_payload_bytes(&bytes).unwrap_or_else(|_| bytes.clone())
+    } else {
+        bytes
+    };
+    let profile = profile_instr_payload_bytes(&peel);
+    let size_class = classify_ctrltext_size_class(peel.len(), Some(&profile));
+    CaptureMaterialFingerprint {
+        bin_count,
+        elf_count,
+        xclbin_count,
+        first_ctrltext_len: Some(peel.len()),
+        first_ctrltext_size_class: size_class,
+        first_classic_walk_ok: profile.classic_walk_ok,
+        first_staged_mladf: profile.staged_mladf_classic_profile,
+        has_xclbin_magic,
+        has_elf_magic,
+        blocked_on_external_bytes: false,
+        product_known_good: false,
+        detail: "ctrltext_present_classified_not_pass".into(),
+    }
+}
+
+/// Rela structure compare lab ELF vs external ELF (Route B optional).
+///
+/// Counts + first-N offsets + sym multiset equality. Soft always invent_pass=0.
+/// Match **≠** Pass. Missing external ELF → absent detail.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct RelaStructureCompareResearch {
+    /// Lab `.rela.dyn` entry count when parseable.
+    pub lab_rela_count: Option<usize>,
+    /// External rela count when present + parseable.
+    pub external_rela_count: Option<usize>,
+    /// Counts equal when both present.
+    pub count_match: bool,
+    /// First-N offset lists equal (research cap).
+    pub offsets_match: bool,
+    /// Sym index multisets equal when both present.
+    pub sym_multiset_match: bool,
+    /// External ELF bytes were supplied.
+    pub external_present: bool,
+    /// Research detail token.
+    pub detail: String,
+}
+
+/// Cap for first-N rela offset compare (research; not full dump).
+pub const RELA_STRUCTURE_COMPARE_FIRST_N: usize = 8;
+
+impl RelaStructureCompareResearch {
+    /// Soft research note — always honesty + `rela_structure_alone_not_pass=1`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        let mut parts = vec![
+            RELA_STRUCTURE_COMPARE_NOTE.into(),
+            "not_c_ready=1".into(),
+            "not_ran_on_npu=1".into(),
+            "invent_pass=0".into(),
+            "product_known_good=0".into(),
+            "rela_structure_alone_not_pass=1".into(),
+            format!("external_present={}", u8::from(self.external_present)),
+            format!("count_match={}", u8::from(self.count_match)),
+            format!("offsets_match={}", u8::from(self.offsets_match)),
+            format!("sym_multiset_match={}", u8::from(self.sym_multiset_match)),
+        ];
+        if let Some(n) = self.lab_rela_count {
+            parts.push(format!("lab_rela_count={n}"));
+        }
+        if let Some(n) = self.external_rela_count {
+            parts.push(format!("external_rela_count={n}"));
+        }
+        if !self.detail.is_empty() {
+            parts.push(format!(
+                "detail={}",
+                sanitize_soft_note_field_value(&self.detail)
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+fn rela_offsets_and_syms(elf: &[u8]) -> Option<(usize, Vec<u32>, Vec<u32>)> {
+    let relas = parse_elf32_rela_dyn(elf).ok()?;
+    let count = relas.len();
+    let offsets: Vec<u32> = relas
+        .iter()
+        .take(RELA_STRUCTURE_COMPARE_FIRST_N)
+        .map(|r| r.offset)
+        .collect();
+    let mut syms: Vec<u32> = relas.iter().map(super::txn::Elf32Rela::sym).collect();
+    syms.sort_unstable();
+    Some((count, offsets, syms))
+}
+
+/// Compare rela structure of lab vs optional external aiebu ELF.
+///
+/// - External missing/empty → `external_absent_rela_compare`.
+/// - Both present → count / first-N offsets / sym multiset.
+/// - Match still invent_pass=0 / not product known-good.
+#[must_use]
+pub fn compare_rela_structure_lab_vs_external_elf(
+    lab_elf: &[u8],
+    external_elf: Option<&[u8]>,
+) -> RelaStructureCompareResearch {
+    let lab_parsed = if lab_elf.is_empty() {
+        None
+    } else {
+        rela_offsets_and_syms(lab_elf)
+    };
+    let lab_rela_count = lab_parsed.as_ref().map(|(c, _, _)| *c);
+
+    let Some(ext) = external_elf.filter(|b| !b.is_empty()) else {
+        return RelaStructureCompareResearch {
+            lab_rela_count,
+            external_rela_count: None,
+            count_match: false,
+            offsets_match: false,
+            sym_multiset_match: false,
+            external_present: false,
+            detail: "external_absent_rela_compare".into(),
+        };
+    };
+
+    let ext_parsed = rela_offsets_and_syms(ext);
+    let external_rela_count = ext_parsed.as_ref().map(|(c, _, _)| *c);
+
+    let (count_match, offsets_match, sym_multiset_match, detail) = match (lab_parsed, ext_parsed) {
+        (Some((lc, lo, ls)), Some((ec, eo, es))) => {
+            let count_match = lc == ec;
+            let offsets_match = lo == eo;
+            let sym_multiset_match = ls == es;
+            let detail = if count_match && offsets_match && sym_multiset_match {
+                "rela_structure_match_neq_pass"
+            } else if !count_match {
+                "rela_count_mismatch"
+            } else if !offsets_match {
+                "rela_offsets_mismatch"
+            } else {
+                "rela_sym_multiset_mismatch"
+            };
+            (count_match, offsets_match, sym_multiset_match, detail)
+        }
+        (None, Some(_)) => (false, false, false, "lab_rela_unparseable"),
+        (Some(_), None) => (false, false, false, "external_rela_unparseable"),
+        (None, None) => (false, false, false, "both_rela_unparseable"),
+    };
+
+    RelaStructureCompareResearch {
+        lab_rela_count,
+        external_rela_count,
+        count_match,
+        offsets_match,
+        sym_multiset_match,
+        external_present: true,
+        detail: detail.into(),
     }
 }
 
@@ -4326,10 +6131,10 @@ pub fn external_known_good_load_path_is_allowed(path: &std::path::Path) -> bool 
     if !external_known_good_path_is_allowed(path) {
         return false;
     }
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return false;
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return false;
     }
     if path.exists() {
         let Ok(canon) = std::fs::canonicalize(path) else {
@@ -4405,10 +6210,10 @@ pub fn read_external_known_good_provenance_text(path: &std::path::Path) -> Optio
             if !meta.is_file() || meta.len() == 0 {
                 continue;
             }
-            if let Ok(text) = std::fs::read_to_string(&cand) {
-                if !text.trim().is_empty() {
-                    return Some(text);
-                }
+            if let Ok(text) = std::fs::read_to_string(&cand)
+                && !text.trim().is_empty()
+            {
+                return Some(text);
             }
         }
     }
@@ -4572,6 +6377,335 @@ pub fn validate_external_known_good_provenance_text(
         research_present_eligible: eligible,
         detail: detail.into(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// W7-3 — PROVENANCE `completed_on_this_fw` soft research parse (pure offline)
+// ---------------------------------------------------------------------------
+//
+// Parses operator PROVENANCE field completed_on_this_fw=yes|no from load-accepted
+// / external known-good notes. Soft scorecard only. **Never** invents product
+// Pass, residual_matched, or load_accepted from the field alone:
+// completed_on_this_fw=yes ≠ Pass ≠ residual_matched ≠ load_accepted claim
+// (load_accepted still requires live ERT Completed + OFM allclose via
+// decide_ran_on_npu). Always invent_pass=0.
+
+/// Soft bag name for [`format_completed_on_this_fw_note`].
+pub const COMPLETED_ON_THIS_FW_NOTE: &str = "completed_on_this_fw_research";
+
+/// Parsed value of PROVENANCE `completed_on_this_fw` (research only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompletedOnThisFwValue {
+    /// Explicit yes / true / 1 (still ≠ product Pass / load_accepted alone).
+    Yes,
+    /// Explicit no / false / 0.
+    No,
+    /// Key not found (or only instructional template language skipped).
+    #[default]
+    Absent,
+    /// Key present but value not yes/no (or empty after key).
+    Malformed,
+}
+
+impl CompletedOnThisFwValue {
+    /// Stable soft-note token (`yes` / `no` / `absent` / `malformed`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Absent => "absent",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// Soft research parse of PROVENANCE `completed_on_this_fw` (offline only).
+///
+/// **Locked honesty:** `residual_matched_claim` and `load_accepted_claim` are
+/// always false on this surface — field parse alone never claims residual match
+/// or product load-accepted. Soft note always `invent_pass=0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research honesty flags; always invent_pass=0 surface
+pub struct CompletedOnThisFwResearch {
+    /// Parsed field value.
+    pub value: CompletedOnThisFwValue,
+    /// First raw value token when present (empty if absent); sanitized for notes.
+    pub raw_value: String,
+    /// **Always false** — field alone ≠ residual match.
+    pub residual_matched_claim: bool,
+    /// **Always false** — field alone ≠ load_accepted (needs live decide).
+    pub load_accepted_claim: bool,
+    /// **Always false** — research surface only.
+    pub product_known_good: bool,
+    /// Research detail token.
+    pub detail: String,
+}
+
+impl Default for CompletedOnThisFwResearch {
+    fn default() -> Self {
+        Self {
+            value: CompletedOnThisFwValue::Absent,
+            raw_value: String::new(),
+            residual_matched_claim: false,
+            load_accepted_claim: false,
+            product_known_good: false,
+            detail: "absent".into(),
+        }
+    }
+}
+
+impl CompletedOnThisFwResearch {
+    /// Soft note — always invent_pass=0; never residual_matched / load_accepted.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_completed_on_this_fw_note(self)
+    }
+}
+
+/// Classify a raw field value token into [`CompletedOnThisFwValue`].
+///
+/// Accepts `yes`/`true`/`1` → Yes; `no`/`false`/`0` → No; empty → Absent;
+/// anything else → Malformed. Case-insensitive; strips surrounding markdown
+/// bold markers and backticks from the token.
+#[must_use]
+pub fn classify_completed_on_this_fw_token(raw: &str) -> CompletedOnThisFwValue {
+    let t = raw
+        .trim()
+        .trim_matches(|c: char| c == '*' || c == '`' || c == '"' || c == '\'')
+        .to_ascii_lowercase();
+    if t.is_empty() {
+        return CompletedOnThisFwValue::Absent;
+    }
+    match t.as_str() {
+        "yes" | "true" | "1" => CompletedOnThisFwValue::Yes,
+        "no" | "false" | "0" => CompletedOnThisFwValue::No,
+        _ => CompletedOnThisFwValue::Malformed,
+    }
+}
+
+/// True when `hay[idx..]` starts with key `completed_on_this_fw` (ascii lower)
+/// as a whole token (not `iron_completed_on_this_fw` or longer prefix).
+#[must_use]
+fn provenance_has_completed_on_this_fw_key_at(hay_lower: &str, idx: usize) -> bool {
+    const KEY: &str = "completed_on_this_fw";
+    if !hay_lower[idx..].starts_with(KEY) {
+        return false;
+    }
+    let end = idx + KEY.len();
+    // Not preceded by alnum / `_` (excludes iron_completed_on_this_fw).
+    if idx > 0 {
+        let prev = hay_lower.as_bytes()[idx - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return false;
+        }
+    }
+    // Not continued as longer identifier.
+    if end < hay_lower.len() {
+        let next = hay_lower.as_bytes()[end];
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract a value token after a key match at `key_end` in original `text`
+/// (same indices as lower). Returns (raw_token, is_instructional_template).
+///
+/// Instructional template: value is yes/no but next word is `only` (PROVENANCE
+/// table row `yes only if live ERT…`). Those are skipped so a later filled row
+/// can win.
+fn extract_completed_on_this_fw_value_after(text: &str, key_end: usize) -> (String, bool) {
+    let rest = text.get(key_end..).unwrap_or("");
+    // Skip markdown bold/backtick noise, spaces, and optional `|` cell edges.
+    let mut i = 0usize;
+    let bytes = rest.as_bytes();
+    let skip_noise = |b: u8| b.is_ascii_whitespace() || b == b'*' || b == b'`' || b == b'"';
+    while i < bytes.len() && skip_noise(bytes[i]) {
+        i += 1;
+    }
+    // key=value form
+    if i < bytes.len() && bytes[i] == b'=' {
+        i += 1;
+        while i < bytes.len() && skip_noise(bytes[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'|' {
+            i += 1;
+        }
+        let raw = rest[start..i].trim_matches(|c: char| c == '*' || c == '`' || c == '"');
+        let instructional = is_instructional_yes_only_rest(&rest[i..]);
+        return (raw.to_string(), instructional);
+    }
+    // Markdown table: after key cell, next `|` starts value cell.
+    // Also accept `:` as prose separator (`completed_on_this_fw: yes`).
+    if i < bytes.len() && (bytes[i] == b'|' || bytes[i] == b':') {
+        i += 1;
+        while i < bytes.len() && skip_noise(bytes[i]) {
+            i += 1;
+        }
+        let start = i;
+        // First whitespace-delimited token in the value cell (stop at | or newline).
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'|'
+            && bytes[i] != b'\n'
+            && bytes[i] != b'\r'
+        {
+            i += 1;
+        }
+        let raw = rest[start..i].trim_matches(|c: char| c == '*' || c == '`' || c == '"');
+        let instructional = is_instructional_yes_only_rest(&rest[i..]);
+        return (raw.to_string(), instructional);
+    }
+    // Bare trailing token on same line (rare): take next word.
+    if i < bytes.len() {
+        let start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'|'
+            && bytes[i] != b'\n'
+        {
+            i += 1;
+        }
+        let raw = rest[start..i].trim_matches(|c: char| c == '*' || c == '`' || c == '"');
+        let instructional = is_instructional_yes_only_rest(&rest[i..]);
+        return (raw.to_string(), instructional);
+    }
+    (String::new(), false)
+}
+
+/// True when rest after a value token looks like template `yes only if …`.
+fn is_instructional_yes_only_rest(rest: &str) -> bool {
+    let t = rest.trim_start();
+    let lower = t.to_ascii_lowercase();
+    lower.starts_with("only")
+        && (lower.len() == 4
+            || lower
+                .as_bytes()
+                .get(4)
+                .is_some_and(|b| !b.is_ascii_alphanumeric() && *b != b'_'))
+}
+
+/// Parse PROVENANCE text for `completed_on_this_fw` (pure research).
+///
+/// Recognizes:
+/// - `completed_on_this_fw=yes|no|true|false|1|0` (case-insensitive)
+/// - Markdown table cells `| completed_on_this_fw | yes |` (bold/backticks ok)
+/// - Prose `completed_on_this_fw: yes`
+///
+/// Skips instructional template language (`yes only if …`). Prefers the **last**
+/// non-instructional concrete value when multiple keys appear.
+///
+/// Does **not** treat `iron_completed_on_this_fw` as this field (separate key).
+///
+/// **Honesty:** always `residual_matched_claim=0` `load_accepted_claim=0`
+/// `product_known_good=0` — yes ≠ Pass ≠ residual match ≠ load_accepted alone.
+#[must_use]
+pub fn parse_completed_on_this_fw_from_provenance(text: &str) -> CompletedOnThisFwResearch {
+    const KEY: &str = "completed_on_this_fw";
+    let lower = text.to_ascii_lowercase();
+    let mut last: Option<(CompletedOnThisFwValue, String, &'static str)> = None;
+    let mut saw_key = false;
+    let mut search_from = 0usize;
+    while search_from < lower.len() {
+        let Some(rel) = lower[search_from..].find(KEY) else {
+            break;
+        };
+        let idx = search_from + rel;
+        if !provenance_has_completed_on_this_fw_key_at(&lower, idx) {
+            search_from = idx + 1;
+            continue;
+        }
+        saw_key = true;
+        let key_end = idx + KEY.len();
+        let (raw, instructional) = extract_completed_on_this_fw_value_after(text, key_end);
+        if instructional {
+            // Template row — do not lock yes; keep scanning.
+            search_from = key_end;
+            continue;
+        }
+        let value = classify_completed_on_this_fw_token(&raw);
+        let detail = match value {
+            CompletedOnThisFwValue::Yes => "completed_on_this_fw_yes",
+            CompletedOnThisFwValue::No => "completed_on_this_fw_no",
+            CompletedOnThisFwValue::Absent => "completed_on_this_fw_empty_value",
+            CompletedOnThisFwValue::Malformed => "completed_on_this_fw_malformed",
+        };
+        last = Some((value, raw, detail));
+        search_from = key_end;
+    }
+    if let Some((value, raw, detail)) = last {
+        return CompletedOnThisFwResearch {
+            value,
+            raw_value: raw,
+            residual_matched_claim: false,
+            load_accepted_claim: false,
+            product_known_good: false,
+            detail: detail.into(),
+        };
+    }
+    if saw_key {
+        // Only instructional / empty values seen.
+        return CompletedOnThisFwResearch {
+            value: CompletedOnThisFwValue::Absent,
+            raw_value: String::new(),
+            residual_matched_claim: false,
+            load_accepted_claim: false,
+            product_known_good: false,
+            detail: "completed_on_this_fw_instructional_or_empty".into(),
+        };
+    }
+    CompletedOnThisFwResearch {
+        value: CompletedOnThisFwValue::Absent,
+        raw_value: String::new(),
+        residual_matched_claim: false,
+        load_accepted_claim: false,
+        product_known_good: false,
+        detail: "completed_on_this_fw_absent".into(),
+    }
+}
+
+/// Soft research note for PROVENANCE `completed_on_this_fw` — always invent_pass=0.
+///
+/// `completed_on_this_fw=yes` still emits `load_accepted_claim=0` and
+/// `residual_matched_claim=0` and `product_pass_requires_live_decide=1`.
+#[must_use]
+pub fn format_completed_on_this_fw_note(r: &CompletedOnThisFwResearch) -> String {
+    let mut parts = vec![
+        COMPLETED_ON_THIS_FW_NOTE.into(),
+        format!("completed_on_this_fw={}", r.value.as_str()),
+        format!(
+            "residual_matched_claim={}",
+            u8::from(r.residual_matched_claim)
+        ),
+        format!("load_accepted_claim={}", u8::from(r.load_accepted_claim)),
+        format!("product_known_good={}", u8::from(r.product_known_good)),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "field_alone_not_pass=1".into(),
+        "field_alone_not_load_accepted=1".into(),
+        "field_alone_not_residual_matched=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    if r.raw_value.is_empty() {
+        parts.push("raw=absent".into());
+    } else {
+        parts.push(format!(
+            "raw={}",
+            sanitize_soft_note_field_value(&r.raw_value)
+        ));
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
 }
 
 /// Pure lab-bag PROVENANCE load gate given already-read text.
@@ -5217,14 +7351,14 @@ pub fn external_compare_status_from_surfaces(
     {
         return ExternalCompareStatus::Refused;
     }
-    if let Some(c) = compare {
-        if c.external_present {
-            return if c.sha_match {
-                ExternalCompareStatus::Match
-            } else {
-                ExternalCompareStatus::Mismatch
-            };
-        }
+    if let Some(c) = compare
+        && c.external_present
+    {
+        return if c.sha_match {
+            ExternalCompareStatus::Match
+        } else {
+            ExternalCompareStatus::Mismatch
+        };
     }
     if bag_drop.ctrltext_bytes_present {
         return ExternalCompareStatus::Loaded;
@@ -7050,10 +9184,10 @@ pub fn xclbin_section_markers_load_path_is_allowed(path: &std::path::Path) -> bo
     if !xclbin_section_markers_path_is_allowed(path) {
         return false;
     }
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return false;
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return false;
     }
     if path.exists() {
         let Ok(canon) = std::fs::canonicalize(path) else {
@@ -8818,7 +10952,7 @@ pub fn sanitize_soft_note_field_value(raw: &str) -> String {
 /// Matches classify example `env_flag_truthy` (PRINT / research hard-opt-ins).
 #[must_use]
 pub fn env_flag_truthy_os(key: &str) -> bool {
-    std::env::var(key).ok().is_some_and(|v| {
+    std::env::var(key).is_ok_and(|v| {
         let t = v.trim();
         t == "1" || t.eq_ignore_ascii_case("true")
     })
@@ -8857,10 +10991,10 @@ pub fn parse_last_apply_detail_signals(detail: &str) -> LastApplyDetailSignals {
         let rest = &detail[i + "ert_state=".len()..];
         let tok = &rest[..detail_token_end(rest)];
         let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
-        if num_end > 0 {
-            if let Ok(n) = tok[..num_end].parse::<u32>() {
-                s.ert_state = Some(n);
-            }
+        if num_end > 0
+            && let Ok(n) = tok[..num_end].parse::<u32>()
+        {
+            s.ert_state = Some(n);
         }
         // Parenthetical name on the same token only (not rest of detail).
         let mut name_error = false;
@@ -8890,10 +11024,10 @@ pub fn parse_last_apply_detail_signals(detail: &str) -> LastApplyDetailSignals {
         let rest = &detail[i + "rela_count=".len()..];
         let tok = &rest[..detail_token_end(rest)];
         let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
-        if num_end > 0 {
-            if let Ok(n) = tok[..num_end].parse::<usize>() {
-                s.rela_count = Some(n);
-            }
+        if num_end > 0
+            && let Ok(n) = tok[..num_end].parse::<usize>()
+        {
+            s.rela_count = Some(n);
         }
     }
     // Token-ish: require `aiebu_rela_patched` not as a longer identifier prefix.
@@ -8941,10 +11075,10 @@ pub fn parse_last_apply_detail_signals(detail: &str) -> LastApplyDetailSignals {
         let rest = &detail[i + "raw_nonzero_bytes=".len()..];
         let tok = &rest[..detail_token_end(rest)];
         let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
-        if num_end > 0 {
-            if let Ok(n) = tok[..num_end].parse::<u64>() {
-                s.ofm_raw_nonzero_bytes = Some(n);
-            }
+        if num_end > 0
+            && let Ok(n) = tok[..num_end].parse::<u64>()
+        {
+            s.ofm_raw_nonzero_bytes = Some(n);
         }
     }
     // Known journal codes only when literally present (no invent).
@@ -9014,10 +11148,10 @@ fn parse_last_apply_app_load_tokens(detail: &str, s: &mut LastApplyDetailSignals
     }
     // Substring match (detail may embed `Some(SubmitWaitNotOk)`); not a bare token.
     s.submit_wait_not_ok = detail.contains("SubmitWaitNotOk");
-    if let Some(tok) = detail_first_token_after(detail, "rela_mode=") {
-        if tok == "overwrite" || tok == "add" {
-            s.rela_mode = Some(tok.to_string());
-        }
+    if let Some(tok) = detail_first_token_after(detail, "rela_mode=")
+        && (tok == "overwrite" || tok == "add")
+    {
+        s.rela_mode = Some(tok.to_string());
     }
     // Lab CONFIG_CU attach tokens (research; attach alone ≠ Pass / ≠ residual class change).
     if let Some(tok) = detail_first_token_after(detail, "config_cu=") {
@@ -9040,10 +11174,10 @@ fn parse_last_apply_app_load_tokens(detail: &str, s: &mut LastApplyDetailSignals
     }
     if let Some(tok) = detail_first_token_after(detail, "cu_func=") {
         let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
-        if num_end > 0 {
-            if let Ok(n) = tok[..num_end].parse::<u8>() {
-                s.cu_func = Some(n);
-            }
+        if num_end > 0
+            && let Ok(n) = tok[..num_end].parse::<u8>()
+        {
+            s.cu_func = Some(n);
         }
     }
     // Failed attach: bare token or live timed-path phrase.
@@ -9345,10 +11479,10 @@ pub fn classify_last_apply_residual_ex(
         parse_last_apply_detail_signals(d)
     });
     // Schema-2 top-level rela_count when detail lacks rela evidence.
-    if !last_apply_has_rela_evidence(&sig) {
-        if let Some(n) = rela_count_field.filter(|&n| n > 0) {
-            sig.rela_count = Some(n);
-        }
+    if !last_apply_has_rela_evidence(&sig)
+        && let Some(n) = rela_count_field.filter(|&n| n > 0)
+    {
+        sig.rela_count = Some(n);
     }
     let status_ert = status.is_some_and(|s| {
         let t = s.trim();
@@ -9432,6 +11566,4059 @@ pub fn format_silicon_residual_class_note(
             parts.push("no_ert_error_signal=1".to_string());
         }
         SiliconResidualClass::Unclassified => {}
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Pass-unblock offline P0: C1 validators + C2 structural FP + C3 residual splits
+// ---------------------------------------------------------------------------
+//
+// Pure research only. Soft notes always invent_pass=0 not_c_ready=1 not_ran_on_npu=1.
+// Never product Pass / never C-ready from validate or fingerprint alone.
+// Plan: pass-unblock sequence P0 (C1+C2+C3).
+
+/// Soft bag name for C1 aiebu / ELF / rela / ctrltext structure validation.
+pub const C1_AIEBU_VALIDATOR_NOTE: &str = "c1_aiebu_elf_ctrltext_validator";
+
+/// Soft bag name for C2 structural lab fingerprint dump.
+pub const C2_STRUCTURAL_FINGERPRINT_NOTE: &str = "c2_structural_lab_fingerprint";
+
+/// Soft bag name for C3 residual classifier split.
+pub const C3_RESIDUAL_SPLIT_NOTE: &str = "c3_residual_classifier_split";
+
+/// Upper bound for ctrltext size class acceptance (matches
+/// [`MAX_INSTRUCTION_BLOB_BYTES`] = 64 MiB).
+///
+/// Larger peels are structural refuse (`ctrltext_size_class_refuse`), not Pass.
+const C1_CTRLTEXT_SIZE_CLASS_MAX: usize = 64 * 1024 * 1024;
+
+/// Why [`validate_aiebu_elf_ctrltext_structure`] accepted or refused bytes.
+///
+/// Research only — **never** C-ready / product Pass by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiebuElfCtrltextValidateReason {
+    /// ELF32 LE with `.ctrltext`, rela table parseable, rela offsets in range,
+    /// non-empty ctrltext within size class (classic walk optional — see
+    /// [`AiebuElfCtrltextValidateResult::classic_walk_ok`]).
+    Ok,
+    /// Empty input.
+    Empty,
+    /// Missing `0x7f ELF` magic.
+    BadMagic,
+    /// ELF magic present but not ELFCLASS32 + ELFDATA2LSB.
+    NotElf32Le,
+    /// ELF32 LE header shape but no `.ctrltext` PROGBITS section.
+    MissingCtrltext,
+    /// `.rela.dyn` section present but truncated / invalid size.
+    RelaParseFail,
+    /// At least one rela `r_offset` is OOB for pealed `.ctrltext` length.
+    RelaOffsetOob,
+    /// `.ctrltext` section length is zero (should not reach via classify).
+    CtrltextEmpty,
+    /// Ctrltext length exceeds [`C1_CTRLTEXT_SIZE_CLASS_MAX`].
+    CtrltextSizeClassRefuse,
+}
+
+impl AiebuElfCtrltextValidateReason {
+    /// Stable token for soft notes / tests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Empty => "empty",
+            Self::BadMagic => "bad_magic",
+            Self::NotElf32Le => "not_elf32_le",
+            Self::MissingCtrltext => "missing_ctrltext",
+            Self::RelaParseFail => "rela_parse_fail",
+            Self::RelaOffsetOob => "rela_offset_oob",
+            Self::CtrltextEmpty => "ctrltext_empty",
+            Self::CtrltextSizeClassRefuse => "ctrltext_size_class_refuse",
+        }
+    }
+}
+
+/// Result of C1 structural validation (header + rela + size class).
+///
+/// Soft only. `ok=true` means structure is usable for further research compare —
+/// **not** Pass, **not** C-ready, **not** `ran_on_npu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiebuElfCtrltextValidateResult {
+    /// True only when [`AiebuElfCtrltextValidateReason::Ok`].
+    pub ok: bool,
+    /// Primary refuse / accept reason.
+    pub reason: AiebuElfCtrltextValidateReason,
+    /// Peeled `.ctrltext` length when known.
+    pub ctrltext_len: Option<usize>,
+    /// `.rela.dyn` entry count when parseable (`Some(0)` = empty table).
+    pub rela_count: Option<usize>,
+    /// True when peeled ctrltext walks as classic v0.1 txn (optional honesty).
+    pub classic_walk_ok: bool,
+    /// Short research detail token (sanitized for soft notes).
+    pub detail: String,
+}
+
+impl Default for AiebuElfCtrltextValidateResult {
+    fn default() -> Self {
+        Self {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::Empty,
+            ctrltext_len: None,
+            rela_count: None,
+            classic_walk_ok: false,
+            detail: "default_empty".into(),
+        }
+    }
+}
+
+/// Validate aiebu-style ELF32 LE + `.ctrltext` + `.rela.dyn` structure (pure).
+///
+/// Stronger than [`is_aiebu_elf_ctrltext`] alone: refuses bad magic, non-ELF32 LE,
+/// missing `.ctrltext`, rela parse fail, rela offset OOB, empty / oversize
+/// ctrltext. Classic walk is reported but **not** required for `ok` (IRON /
+/// non-classic research images may still be structurally ELF-valid).
+///
+/// Always research; never invents Pass / C-ready / `ran_on_npu`.
+#[must_use]
+#[allow(clippy::too_many_lines)] // structural refuse matrix; single pure entry
+pub fn validate_aiebu_elf_ctrltext_structure(bytes: &[u8]) -> AiebuElfCtrltextValidateResult {
+    if bytes.is_empty() {
+        return AiebuElfCtrltextValidateResult {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::Empty,
+            ctrltext_len: None,
+            rela_count: None,
+            classic_walk_ok: false,
+            detail: "empty_input".into(),
+        };
+    }
+    if bytes.len() < 4 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return AiebuElfCtrltextValidateResult {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::BadMagic,
+            ctrltext_len: None,
+            rela_count: None,
+            classic_walk_ok: false,
+            detail: "bad_elf_magic".into(),
+        };
+    }
+    if bytes.len() < 52 || bytes[4] != 1 || bytes[5] != 1 {
+        return AiebuElfCtrltextValidateResult {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::NotElf32Le,
+            ctrltext_len: None,
+            rela_count: None,
+            classic_walk_ok: false,
+            detail: "not_elf32_le".into(),
+        };
+    }
+
+    // Classify for .ctrltext presence (same rules as is_aiebu_elf_ctrltext).
+    let kind = classify_instruction_blob(bytes);
+    let (ctrl_off, ctrl_len, classic_walk_ok) = match &kind {
+        InstructionBlobKind::Aie2ElfCtrltext {
+            ctrltext_off,
+            ctrltext_len,
+            ctrltext,
+        } => {
+            let walk_ok = matches!(ctrltext.as_ref(), InstructionBlobKind::ClassicTxnV01 { .. });
+            (*ctrltext_off, *ctrltext_len, walk_ok)
+        }
+        _ => {
+            return AiebuElfCtrltextValidateResult {
+                ok: false,
+                reason: AiebuElfCtrltextValidateReason::MissingCtrltext,
+                ctrltext_len: None,
+                rela_count: None,
+                classic_walk_ok: false,
+                detail: "missing_ctrltext_or_not_aiebu".into(),
+            };
+        }
+    };
+
+    if ctrl_len == 0 {
+        return AiebuElfCtrltextValidateResult {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::CtrltextEmpty,
+            ctrltext_len: Some(0),
+            rela_count: None,
+            classic_walk_ok: false,
+            detail: "ctrltext_empty".into(),
+        };
+    }
+    if ctrl_len > C1_CTRLTEXT_SIZE_CLASS_MAX {
+        return AiebuElfCtrltextValidateResult {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::CtrltextSizeClassRefuse,
+            ctrltext_len: Some(ctrl_len),
+            rela_count: None,
+            classic_walk_ok: false,
+            detail: format!("ctrltext_len={ctrl_len}_gt_max"),
+        };
+    }
+
+    let rela_parse = parse_elf32_rela_dyn(bytes);
+    let Ok(relas) = rela_parse else {
+        return AiebuElfCtrltextValidateResult {
+            ok: false,
+            reason: AiebuElfCtrltextValidateReason::RelaParseFail,
+            ctrltext_len: Some(ctrl_len),
+            rela_count: None,
+            classic_walk_ok,
+            detail: "rela_parse_fail".into(),
+        };
+    };
+    for r in &relas {
+        let o = r.offset as usize;
+        if o.checked_add(8).is_none_or(|end| end > ctrl_len) {
+            return AiebuElfCtrltextValidateResult {
+                ok: false,
+                reason: AiebuElfCtrltextValidateReason::RelaOffsetOob,
+                ctrltext_len: Some(ctrl_len),
+                rela_count: Some(relas.len()),
+                classic_walk_ok,
+                detail: format!("rela_off={o}_oob_ctrl={ctrl_len}"),
+            };
+        }
+    }
+
+    // Bounds check that peel window is inside file (classify already did this).
+    let _ = ctrl_off;
+    let detail = if classic_walk_ok {
+        if relas.is_empty() {
+            "ok_classic_walk_empty_rela"
+        } else {
+            "ok_classic_walk_with_rela"
+        }
+    } else if relas.is_empty() {
+        "ok_nonclassic_empty_rela"
+    } else {
+        "ok_nonclassic_with_rela"
+    };
+    AiebuElfCtrltextValidateResult {
+        ok: true,
+        reason: AiebuElfCtrltextValidateReason::Ok,
+        ctrltext_len: Some(ctrl_len),
+        rela_count: Some(relas.len()),
+        classic_walk_ok,
+        detail: detail.into(),
+    }
+}
+
+/// Soft C1 validator note — always honesty trio; validate alone ≠ C-ready / Pass.
+#[must_use]
+pub fn format_c1_validator_note(r: &AiebuElfCtrltextValidateResult) -> String {
+    let mut parts = vec![
+        C1_AIEBU_VALIDATOR_NOTE.into(),
+        format!("ok={}", u8::from(r.ok)),
+        format!("reason={}", r.reason.as_str()),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "validate_alone_not_c_ready=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    if let Some(n) = r.ctrltext_len {
+        parts.push(format!("ctrltext_len={n}"));
+    } else {
+        parts.push("ctrltext_len=absent".into());
+    }
+    if let Some(n) = r.rela_count {
+        parts.push(format!("rela_count={n}"));
+    } else {
+        parts.push("rela_count=absent".into());
+    }
+    parts.push(format!("classic_walk_ok={}", u8::from(r.classic_walk_ok)));
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// C2 structural fingerprint: BO sizes, map_offset, rela, CU/PDI layout tokens.
+///
+/// Comparable record for future capture / capture-dir soft compare. Research
+/// only — never invents product known-good or Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StructuralLabFingerprint {
+    /// `content_size=` / `content=` from detail when present.
+    pub content_size_b: Option<u32>,
+    /// `bo_size=` instruction BO alloc when present.
+    pub bo_size_b: Option<u32>,
+    /// `start_npu_size=` when present.
+    pub start_npu_size_b: Option<u32>,
+    /// First `ty=` buffer type token (often `Dev`).
+    pub instr_bo_type: Option<String>,
+    /// First `map_offset=` (often `u64::MAX` = no host mmap).
+    pub instr_map_offset: Option<u64>,
+    /// True when map_offset is DRM no-mmap sentinel.
+    pub map_offset_is_no_mmap: bool,
+    /// `rela_count=` when present (detail) or from ELF parse.
+    pub rela_count: Option<usize>,
+    /// Compact rela target summary (`n=N` / `absent` / `offsets=…` truncated).
+    pub rela_targets_summary: String,
+    /// `config_cu=0|1` when present.
+    pub config_cu: Option<u8>,
+    /// `pdi_bytes=` when present.
+    pub pdi_bytes: Option<u32>,
+    /// `cu_func=` when present.
+    pub cu_func: Option<u8>,
+    /// `layout=` token when present.
+    pub layout: Option<String>,
+    /// `aiebu_elf=` when present.
+    pub aiebu_elf: Option<bool>,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl StructuralLabFingerprint {
+    /// Soft note for dump / classify — always honesty trio.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_c2_structural_fingerprint_note(self)
+    }
+}
+
+/// Build C2 structural fingerprint from parsed last_apply detail signals.
+#[must_use]
+pub fn structural_fingerprint_from_lab_signals(
+    sig: &LastApplyDetailSignals,
+) -> StructuralLabFingerprint {
+    let map_off = sig.instr_map_offset;
+    StructuralLabFingerprint {
+        content_size_b: sig.content_size_b,
+        bo_size_b: sig.bo_size_b,
+        start_npu_size_b: sig.start_npu_size_b,
+        instr_bo_type: sig.instr_bo_type.clone(),
+        instr_map_offset: map_off,
+        map_offset_is_no_mmap: map_off.is_some_and(instr_map_offset_is_no_mmap),
+        rela_count: sig.rela_count,
+        rela_targets_summary: sig
+            .rela_count
+            .map_or_else(|| "absent".into(), |n| format!("n={n}")),
+        config_cu: sig.config_cu,
+        pdi_bytes: sig.pdi_bytes,
+        cu_func: sig.cu_func,
+        layout: sig.layout.clone(),
+        aiebu_elf: sig.aiebu_elf,
+        detail: "from_detail_signals".into(),
+    }
+}
+
+/// Build C2 structural fingerprint from raw last_apply `detail` text.
+#[must_use]
+pub fn structural_fingerprint_from_lab_detail(detail: &str) -> StructuralLabFingerprint {
+    let sig = parse_last_apply_detail_signals(detail);
+    let mut fp = structural_fingerprint_from_lab_signals(&sig);
+    if detail.trim().is_empty() {
+        fp.detail = "detail_empty".into();
+    }
+    fp
+}
+
+/// Merge ELF-side rela offsets into a structural fingerprint (research dump).
+///
+/// When `elf` validates as aiebu structure, fills `rela_count` + compact offset
+/// list (first 8 offsets). Does **not** invent BO paddrs.
+#[must_use]
+pub fn structural_fingerprint_merge_elf(
+    mut base: StructuralLabFingerprint,
+    elf: &[u8],
+) -> StructuralLabFingerprint {
+    let v = validate_aiebu_elf_ctrltext_structure(elf);
+    if !v.ok {
+        if base.detail.is_empty() || base.detail == "from_detail_signals" {
+            base.detail = format!("elf_validate_{}", v.reason.as_str());
+        }
+        return base;
+    }
+    if base.rela_count.is_none() {
+        base.rela_count = v.rela_count;
+    }
+    if base.content_size_b.is_none()
+        && let Some(n) = v.ctrltext_len
+    {
+        base.content_size_b = u32::try_from(n).ok();
+    }
+    if base.aiebu_elf.is_none() {
+        base.aiebu_elf = Some(true);
+    }
+    if let Ok(relas) = parse_elf32_rela_dyn(elf) {
+        let n = relas.len();
+        base.rela_count = Some(n);
+        let mut offs: Vec<String> = relas
+            .iter()
+            .take(8)
+            .map(|r| format!("0x{:x}", r.offset))
+            .collect();
+        if n > 8 {
+            offs.push("…".into());
+        }
+        base.rela_targets_summary = if n == 0 {
+            "n=0".into()
+        } else {
+            format!("n={n};offsets={}", offs.join(","))
+        };
+    }
+    base.detail = "from_detail_plus_elf".into();
+    base
+}
+
+/// Soft C2 structural fingerprint note — always honesty; FP alone ≠ Pass.
+#[must_use]
+pub fn format_c2_structural_fingerprint_note(fp: &StructuralLabFingerprint) -> String {
+    let mut parts = vec![
+        C2_STRUCTURAL_FINGERPRINT_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "fingerprint_alone_not_pass=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    match fp.content_size_b {
+        Some(n) => parts.push(format!("content_size={n}")),
+        None => parts.push("content_size=absent".into()),
+    }
+    match fp.bo_size_b {
+        Some(n) => parts.push(format!("bo_size={n}")),
+        None => parts.push("bo_size=absent".into()),
+    }
+    match fp.start_npu_size_b {
+        Some(n) => parts.push(format!("start_npu_size={n}")),
+        None => parts.push("start_npu_size=absent".into()),
+    }
+    match fp.instr_bo_type.as_deref() {
+        Some(t) if !t.is_empty() => {
+            parts.push(format!("ty={}", sanitize_soft_note_field_value(t)));
+        }
+        _ => parts.push("ty=absent".into()),
+    }
+    match fp.instr_map_offset {
+        Some(o) => parts.push(format!("map_offset=0x{o:x}")),
+        None => parts.push("map_offset=absent".into()),
+    }
+    parts.push(format!(
+        "map_offset_is_no_mmap={}",
+        u8::from(fp.map_offset_is_no_mmap)
+    ));
+    match fp.rela_count {
+        Some(n) => parts.push(format!("rela_count={n}")),
+        None => parts.push("rela_count=absent".into()),
+    }
+    parts.push(format!(
+        "rela_targets={}",
+        sanitize_soft_note_field_value(&fp.rela_targets_summary)
+    ));
+    match fp.config_cu {
+        Some(v) => parts.push(format!("config_cu={v}")),
+        None => parts.push("config_cu=absent".into()),
+    }
+    match fp.pdi_bytes {
+        Some(n) => parts.push(format!("pdi_bytes={n}")),
+        None => parts.push("pdi_bytes=absent".into()),
+    }
+    match fp.cu_func {
+        Some(n) => parts.push(format!("cu_func={n}")),
+        None => parts.push("cu_func=absent".into()),
+    }
+    match fp.layout.as_deref() {
+        Some(l) if !l.is_empty() => {
+            parts.push(format!("layout={}", sanitize_soft_note_field_value(l)));
+        }
+        _ => parts.push("layout=absent".into()),
+    }
+    match fp.aiebu_elf {
+        Some(true) => parts.push("aiebu_elf=1".into()),
+        Some(false) => parts.push("aiebu_elf=0".into()),
+        None => parts.push("aiebu_elf=absent".into()),
+    }
+    if !fp.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&fp.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// C3 residual classifier split axis (PDI vs CU map vs protocol vs wait / APP_LOAD).
+///
+/// Research labels only. **Never** invent Pass / `ran_on_npu`. Does **not**
+/// collapse `wait_cmd_einval` back to `wait_timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualClassifierSplit {
+    /// Opaque PDI geometry / size / fingerprint residual surface.
+    PdiGeometry,
+    /// CONFIG_CU / cu_func / CU map attach residual surface.
+    CuMap,
+    /// Protocol / layout / START_NPU envelope mismatch (not FW APP_LOAD class).
+    ProtocolMismatch,
+    /// WAIT_CMD returned EINVAL (`wait_cmd_einval`) — not timeout.
+    WaitCmdEinval,
+    /// Locked / heuristic APP_LOAD residual class surface.
+    AppLoad,
+    /// Insufficient or mixed signals.
+    Unknown,
+}
+
+impl ResidualClassifierSplit {
+    /// Stable token for soft notes / tests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PdiGeometry => "pdi_geometry",
+            Self::CuMap => "cu_map",
+            Self::ProtocolMismatch => "protocol_mismatch",
+            Self::WaitCmdEinval => "wait_cmd_einval",
+            Self::AppLoad => "app_load",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of C3 residual classifier split (pure research).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidualClassifierSplitResult {
+    /// Primary split axis.
+    pub split: ResidualClassifierSplit,
+    /// Existing [`SiliconResidualClass`] when classifiable from same inputs.
+    pub residual_class: SiliconResidualClass,
+    /// Status string echo (trimmed) when provided.
+    pub status: Option<String>,
+    /// Short research detail token.
+    pub detail: String,
+}
+
+impl Default for ResidualClassifierSplitResult {
+    fn default() -> Self {
+        Self {
+            split: ResidualClassifierSplit::Unknown,
+            residual_class: SiliconResidualClass::Unclassified,
+            status: None,
+            detail: "default_unknown".into(),
+        }
+    }
+}
+
+/// Classify residual **split** from status + detail (+ optional aiebu/ert fields).
+///
+/// Priority (first match wins):
+/// 1. status / detail status token `wait_cmd_einval` → [`ResidualClassifierSplit::WaitCmdEinval`]
+///    (**not** `wait_timeout`)
+/// 2. locked / raw APP_LOAD residual class → [`ResidualClassifierSplit::AppLoad`]
+/// 3. `config_cu_failed` or CONFIG_CU present with fail signal → [`ResidualClassifierSplit::CuMap`]
+/// 4. PDI fingerprint / `pdi_bytes` + research dump residual language →
+///    [`ResidualClassifierSplit::PdiGeometry`]
+/// 5. protocol / layout / `SubmitWaitNotOk` without APP_LOAD class →
+///    [`ResidualClassifierSplit::ProtocolMismatch`]
+/// 6. else [`ResidualClassifierSplit::Unknown`]
+///
+/// Soft only; never invents Pass / C-ready / `ran_on_npu`.
+#[must_use]
+pub fn classify_residual_split(
+    status: Option<&str>,
+    detail: Option<&str>,
+    aiebu_elf_field: Option<bool>,
+    ert_error_field: Option<bool>,
+) -> ResidualClassifierSplitResult {
+    classify_residual_split_ex(status, detail, aiebu_elf_field, ert_error_field, None)
+}
+
+/// Same as [`classify_residual_split`] with optional top-level `rela_count`.
+#[must_use]
+pub fn classify_residual_split_ex(
+    status: Option<&str>,
+    detail: Option<&str>,
+    aiebu_elf_field: Option<bool>,
+    ert_error_field: Option<bool>,
+    rela_count_field: Option<usize>,
+) -> ResidualClassifierSplitResult {
+    let status_trim = status.map(str::trim).filter(|s| !s.is_empty());
+    let detail_s = detail.unwrap_or("");
+    let residual_class = classify_last_apply_residual_ex(
+        status,
+        detail,
+        aiebu_elf_field,
+        ert_error_field,
+        rela_count_field,
+    );
+    let mut sig = if detail_s.trim().is_empty() {
+        LastApplyDetailSignals::default()
+    } else {
+        parse_last_apply_detail_signals(detail_s)
+    };
+    merge_last_apply_status_config_cu(status, &mut sig);
+
+    let status_l = status_trim.unwrap_or("").to_ascii_lowercase();
+    let detail_l = detail_s.to_ascii_lowercase();
+
+    // 1) wait_cmd_einval — never fold into wait_timeout.
+    let wait_einval = status_l == "wait_cmd_einval"
+        || detail_l
+            .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+            .any(|t| t == "wait_cmd_einval" || t == "status=wait_cmd_einval")
+        || detail_l.contains("status=wait_cmd_einval");
+    if wait_einval {
+        return ResidualClassifierSplitResult {
+            split: ResidualClassifierSplit::WaitCmdEinval,
+            residual_class,
+            status: status_trim.map(str::to_string),
+            detail: "split_wait_cmd_einval_not_timeout".into(),
+        };
+    }
+
+    // 2) APP_LOAD residual classes.
+    if residual_class.is_locked_app_load_after_aiebu()
+        || matches!(
+            residual_class,
+            SiliconResidualClass::AppLoadLikelyRawOrUnpatched
+        )
+        || sig.fw_status_code == Some(AIE2_FW_APP_LOAD_PDI_FAIL)
+        || detail_l.contains("app_load_pdi_fail")
+        || detail_l.contains("0x3000003")
+    {
+        return ResidualClassifierSplitResult {
+            split: ResidualClassifierSplit::AppLoad,
+            residual_class,
+            status: status_trim.map(str::to_string),
+            detail: "split_app_load".into(),
+        };
+    }
+
+    // 3) CU map / CONFIG_CU fail surface.
+    if sig.config_cu_failed
+        || status_l == "config_cu_failed"
+        || detail_l.contains("config_cu attach failed")
+    {
+        return ResidualClassifierSplitResult {
+            split: ResidualClassifierSplit::CuMap,
+            residual_class,
+            status: status_trim.map(str::to_string),
+            detail: "split_cu_map_config_cu_failed".into(),
+        };
+    }
+
+    // 4) PDI geometry surface (size/fingerprint present without APP_LOAD class).
+    if sig.pdi_bytes.is_some()
+        || detail_l.contains("pdi_fp")
+        || detail_l.contains("research_pdi")
+        || detail_l.contains("pdi_geometry")
+    {
+        // Prefer cu_map when config_cu=1 attach measured without fail + pdi present
+        // is still geometry/identity research unless fail — keep geometry.
+        return ResidualClassifierSplitResult {
+            split: ResidualClassifierSplit::PdiGeometry,
+            residual_class,
+            status: status_trim.map(str::to_string),
+            detail: "split_pdi_geometry".into(),
+        };
+    }
+
+    // CU attach present without fail and without pdi_bytes already handled —
+    // config_cu alone with no other residual → cu_map research surface.
+    if last_apply_config_cu_present(&sig) {
+        return ResidualClassifierSplitResult {
+            split: ResidualClassifierSplit::CuMap,
+            residual_class,
+            status: status_trim.map(str::to_string),
+            detail: "split_cu_map_config_cu_present".into(),
+        };
+    }
+
+    // 5) Protocol / layout mismatch (not wait_timeout label — that is separate).
+    let protocol = sig.submit_wait_not_ok
+        || status_l == "submit_wait_failed"
+        || status_l.contains("protocol")
+        || detail_l.contains("protocol_mismatch")
+        || (sig.layout.is_some()
+            && status_l != "wait_timeout"
+            && residual_class == SiliconResidualClass::NotPassNoErtError
+            && detail_l.contains("kernel_arg"));
+    if protocol {
+        return ResidualClassifierSplitResult {
+            split: ResidualClassifierSplit::ProtocolMismatch,
+            residual_class,
+            status: status_trim.map(str::to_string),
+            detail: "split_protocol_mismatch".into(),
+        };
+    }
+
+    ResidualClassifierSplitResult {
+        split: ResidualClassifierSplit::Unknown,
+        residual_class,
+        status: status_trim.map(str::to_string),
+        detail: "split_unknown".into(),
+    }
+}
+
+/// Soft C3 residual split note — always honesty; split alone ≠ Pass.
+#[must_use]
+pub fn format_c3_residual_split_note(r: &ResidualClassifierSplitResult) -> String {
+    let mut parts = vec![
+        C3_RESIDUAL_SPLIT_NOTE.into(),
+        format!("split={}", r.split.as_str()),
+        format!("residual={}", r.residual_class.as_str()),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "split_alone_not_pass=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        // Explicit: wait_cmd_einval must never be relabeled wait_timeout here.
+        "wait_cmd_einval_neq_wait_timeout=1".into(),
+    ];
+    if let Some(s) = r.status.as_deref() {
+        parts.push(format!("status={}", sanitize_soft_note_field_value(s)));
+    } else {
+        parts.push("status=absent".into());
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Offline dig: WAIT_CMD EINVAL on lab classic START_NPU alone (no CONFIG_CU)
+// ---------------------------------------------------------------------------
+//
+// Pure research axes from last_apply status/detail. Hypothesis + measured tokens
+// only — does **not** invent a proven FW root cause. Soft always invent_pass=0
+// not_c_ready=1 not_ran_on_npu=1. Axes alone ≠ Pass / ≠ unlock.
+
+/// Soft bag name for WAIT_CMD EINVAL lab-classic axes (offline dig).
+pub const WAIT_CMD_EINVAL_AXES_NOTE: &str = "wait_cmd_einval_lab_classic_axes";
+
+/// Soft bag name for driver-shaped WAIT EINVAL / ETIME axis map (offline honesty).
+pub const WAIT_CMD_EINVAL_DRIVER_AXES_NOTE: &str = "wait_cmd_einval_driver_axes";
+
+/// Soft bag name for residual-matched vs research-only material inventory.
+pub const MATERIAL_RESIDUAL_MATCH_NOTE: &str = "material_residual_match_inventory";
+
+/// Measured WAIT_CMD EINVAL axes on lab classic START_NPU (offline research).
+///
+/// Built from status + detail tokens only. Does **not** prove root cause.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct WaitCmdEinvalAxes {
+    /// Product/status token is `wait_cmd_einval` (not `wait_timeout`).
+    pub status_is_wait_cmd_einval: bool,
+    /// Detail embeds `Invalid argument` and/or `os error 22`.
+    pub invalid_argument: bool,
+    /// `timeout_ms=` on WAIT_CMD path when present.
+    pub timeout_ms: Option<u32>,
+    /// `hwctx=` on WAIT_CMD path when present.
+    pub hwctx: Option<u32>,
+    /// `seq=` on WAIT_CMD path when present.
+    pub seq: Option<u32>,
+    /// `request=` ioctl id (e.g. `0xc0106449`) when present.
+    pub wait_cmd_request: Option<u64>,
+    /// CONFIG_CU attach signals present (`config_cu=` / `config_cu_failed`).
+    pub config_cu_present: bool,
+    /// `pdi_bytes=` when present.
+    pub pdi_bytes: Option<u32>,
+    /// `aiebu_elf=` when present.
+    pub aiebu_elf: Option<bool>,
+    /// `rela_count=` when present.
+    pub rela_count: Option<usize>,
+    /// `aiebu_rela_patched` whole token.
+    pub aiebu_rela_patched: bool,
+    /// Instruction content size bytes when present.
+    pub content_size_b: Option<u32>,
+    /// START_NPU size bytes when present.
+    pub start_npu_size_b: Option<u32>,
+    /// Content or start_npu size is lab classic 1688.
+    pub lab_classic_1688: bool,
+    /// `ert_state=` when present (often absent on pure WAIT EINVAL).
+    pub ert_state: Option<u32>,
+    /// ERT Error signal when present.
+    pub ert_error: bool,
+    /// WAIT EINVAL + no CONFIG_CU + no pdi_bytes (skip-CONFIG_CU shape).
+    pub skip_config_cu_shape: bool,
+    /// Userspace aiebu+rela evidence present (rela or patched).
+    pub userspace_elf_rela_ok: bool,
+    /// Short research detail token (hypothesis class, not proven root).
+    pub detail: String,
+}
+
+impl WaitCmdEinvalAxes {
+    /// Soft note — always honesty; axes alone ≠ Pass / C-ready / `ran_on_npu`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_wait_cmd_einval_axes_note(self)
+    }
+}
+
+/// Parse WAIT_CMD EINVAL research axes from status + detail (pure).
+///
+/// Prefer WAIT_CMD region for `hwctx` / `seq` / `timeout_ms` / `request` so
+/// earlier `hwctx ok (handle=…)` does not steal first-match when both exist.
+/// Does **not** invent root cause or Pass.
+#[must_use]
+pub fn parse_wait_cmd_einval_axes(status: Option<&str>, detail: Option<&str>) -> WaitCmdEinvalAxes {
+    let status_trim = status.map(str::trim).filter(|s| !s.is_empty());
+    let detail_s = detail.unwrap_or("");
+    let mut sig = if detail_s.trim().is_empty() {
+        LastApplyDetailSignals::default()
+    } else {
+        parse_last_apply_detail_signals(detail_s)
+    };
+    merge_last_apply_status_config_cu(status, &mut sig);
+
+    let status_l = status_trim.unwrap_or("").to_ascii_lowercase();
+    let detail_l = detail_s.to_ascii_lowercase();
+    let status_is_wait_cmd_einval = status_l == "wait_cmd_einval"
+        || detail_l
+            .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+            .any(|t| t == "wait_cmd_einval" || t == "status=wait_cmd_einval")
+        || detail_l.contains("status=wait_cmd_einval")
+        || detail_l.contains("(wait_cmd_einval)");
+
+    let invalid_argument = detail_l.contains("invalid argument")
+        || detail_l.contains("os error 22")
+        || detail_l.contains("os error=22");
+
+    // Prefer the WAIT_CMD failure region for seq/timeout/request/hwctx.
+    let wait_region = detail_s
+        .find("WAIT_CMD")
+        .or_else(|| detail_s.find("wait_cmd"))
+        .map_or(detail_s, |i| &detail_s[i..]);
+
+    let parse_u32_key = |src: &str, key: &str| -> Option<u32> {
+        let tok = detail_first_token_after(src, key)?;
+        let num_end = tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len());
+        if num_end == 0 {
+            return None;
+        }
+        tok[..num_end].parse::<u32>().ok()
+    };
+
+    let timeout_ms = parse_u32_key(wait_region, "timeout_ms=")
+        .or_else(|| parse_u32_key(detail_s, "timeout_ms="));
+    let seq = parse_u32_key(wait_region, "seq=").or_else(|| parse_u32_key(detail_s, "seq="));
+    // hwctx= on WAIT_CMD path; fall back to full detail only if WAIT region lacks it.
+    let hwctx = parse_u32_key(wait_region, "hwctx=").or_else(|| {
+        // Avoid stealing `hwctx ok (handle=1)` — require `hwctx=` digit form.
+        parse_u32_key(detail_s, "hwctx=")
+    });
+    // `request=0xc0106449):` — `detail_token_end` + `parse_detail_u64_token`
+    // strip trailing punctuation for all detail u64 hex/decimal tokens.
+    let wait_cmd_request = detail_first_token_after(wait_region, "request=")
+        .or_else(|| detail_first_token_after(detail_s, "request="))
+        .and_then(parse_detail_u64_token);
+
+    let config_cu_present = last_apply_config_cu_present(&sig);
+    let lab_classic_1688 = sig.content_size_b == Some(1688)
+        || sig.start_npu_size_b == Some(1688)
+        || detail_s.contains("content=1688")
+        || detail_s.contains("content_size=1688")
+        || detail_s.contains("start_npu_size=1688");
+
+    let userspace_elf_rela_ok = sig.aiebu_elf == Some(true)
+        && (sig.aiebu_rela_patched || sig.rela_count.is_some_and(|n| n > 0));
+
+    let skip_config_cu_shape =
+        status_is_wait_cmd_einval && !config_cu_present && sig.pdi_bytes.is_none();
+
+    let detail_tok = if !status_is_wait_cmd_einval {
+        "not_wait_cmd_einval"
+    } else if skip_config_cu_shape && lab_classic_1688 && userspace_elf_rela_ok {
+        "skip_cu_lab_classic_wait_einval"
+    } else if skip_config_cu_shape {
+        "skip_cu_wait_einval"
+    } else if config_cu_present {
+        "wait_einval_with_config_cu"
+    } else if invalid_argument {
+        "wait_einval_invalid_argument"
+    } else {
+        "wait_einval_partial"
+    };
+
+    WaitCmdEinvalAxes {
+        status_is_wait_cmd_einval,
+        invalid_argument,
+        timeout_ms,
+        hwctx,
+        seq,
+        wait_cmd_request,
+        config_cu_present,
+        pdi_bytes: sig.pdi_bytes,
+        aiebu_elf: sig.aiebu_elf,
+        rela_count: sig.rela_count,
+        aiebu_rela_patched: sig.aiebu_rela_patched,
+        content_size_b: sig.content_size_b,
+        start_npu_size_b: sig.start_npu_size_b,
+        lab_classic_1688,
+        ert_state: sig.ert_state,
+        ert_error: sig.ert_error,
+        skip_config_cu_shape,
+        userspace_elf_rela_ok,
+        detail: detail_tok.into(),
+    }
+}
+
+/// Soft WAIT_CMD EINVAL axes note — always honesty; dig alone ≠ Pass.
+#[must_use]
+pub fn format_wait_cmd_einval_axes_note(r: &WaitCmdEinvalAxes) -> String {
+    let mut parts = vec![
+        WAIT_CMD_EINVAL_AXES_NOTE.into(),
+        format!(
+            "status_is_wait_cmd_einval={}",
+            u8::from(r.status_is_wait_cmd_einval)
+        ),
+        format!("invalid_argument={}", u8::from(r.invalid_argument)),
+        format!("config_cu_present={}", u8::from(r.config_cu_present)),
+        format!("skip_config_cu_shape={}", u8::from(r.skip_config_cu_shape)),
+        format!("lab_classic_1688={}", u8::from(r.lab_classic_1688)),
+        format!(
+            "userspace_elf_rela_ok={}",
+            u8::from(r.userspace_elf_rela_ok)
+        ),
+        format!("aiebu_rela_patched={}", u8::from(r.aiebu_rela_patched)),
+        format!("ert_error={}", u8::from(r.ert_error)),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "axes_alone_not_pass=1".into(),
+        "hypothesis_not_proven_root=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "wait_cmd_einval_neq_wait_timeout=1".into(),
+    ];
+    if let Some(ms) = r.timeout_ms {
+        parts.push(format!("timeout_ms={ms}"));
+    } else {
+        parts.push("timeout_ms=absent".into());
+    }
+    if let Some(h) = r.hwctx {
+        parts.push(format!("hwctx={h}"));
+    } else {
+        parts.push("hwctx=absent".into());
+    }
+    if let Some(s) = r.seq {
+        parts.push(format!("seq={s}"));
+    } else {
+        parts.push("seq=absent".into());
+    }
+    if let Some(req) = r.wait_cmd_request {
+        parts.push(format!("request=0x{req:x}"));
+    } else {
+        parts.push("request=absent".into());
+    }
+    if let Some(n) = r.pdi_bytes {
+        parts.push(format!("pdi_bytes={n}"));
+    } else {
+        parts.push("pdi_bytes=absent".into());
+    }
+    if let Some(a) = r.aiebu_elf {
+        parts.push(format!("aiebu_elf={}", u8::from(a)));
+    } else {
+        parts.push("aiebu_elf=absent".into());
+    }
+    if let Some(n) = r.rela_count {
+        parts.push(format!("rela_count={n}"));
+    } else {
+        parts.push("rela_count=absent".into());
+    }
+    if let Some(n) = r.content_size_b {
+        parts.push(format!("content_size={n}"));
+    } else {
+        parts.push("content_size=absent".into());
+    }
+    if let Some(n) = r.start_npu_size_b {
+        parts.push(format!("start_npu_size={n}"));
+    } else {
+        parts.push("start_npu_size=absent".into());
+    }
+    if let Some(e) = r.ert_state {
+        parts.push(format!("ert_state={e}"));
+    } else {
+        parts.push("ert_state=absent".into());
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Wait-cmd driver axis map (W1 O2 offline) — invent_pass=0 always
+// ---------------------------------------------------------------------------
+//
+// Staged driver ground truth (amdxdna_cmd_wait / aie2_cmd_wait):
+//   - xa_load(ctx_xa, hwctx) miss            → -EINVAL  (hwctx missing)
+//   - aie2_cmd_get_out_fence NULL            → -EINVAL  ("Invalid syncobj or sequence number")
+//   - dma_fence_wait_timeout expiry         → -ETIME   (true timeout; product wait_timeout)
+// Product WAIT packing uses WAIT_CMD only; CREATE_HWCTX syncobj_handle is retained
+// for observability/parity research but is **not** proven root of live EINVAL.
+// This map is soft classify honesty only — axes alone ≠ Pass / C-ready / ran_on_npu.
+
+/// Driver-side WAIT failure axis (from staged `amdxdna_cmd_wait` / `aie2_cmd_wait`).
+///
+/// Both `HwctxMissing` and `FenceOrSyncobjOrSeqMiss` surface as product
+/// `wait_cmd_einval` (os EINVAL / error 22). `EtimeTimeout` surfaces as
+/// `wait_timeout`. Userspace often cannot split fence vs hwctx without journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCmdDriverAxis {
+    /// `xa_load(ctx_xa, hwctx)` miss → driver `-EINVAL`.
+    HwctxMissing,
+    /// `aie2_cmd_get_out_fence` NULL (invalid syncobj or sequence) → `-EINVAL`.
+    FenceOrSyncobjOrSeqMiss,
+    /// `dma_fence_wait_timeout` → `-ETIME` (product `wait_timeout`, not EINVAL).
+    EtimeTimeout,
+    /// Product/os EINVAL without tokens that split fence vs hwctx.
+    OsEinvalUndifferentiated,
+    /// Not an EINVAL/ETIME wait residual class.
+    NotWaitFailureAxis,
+}
+
+impl WaitCmdDriverAxis {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HwctxMissing => "hwctx_missing",
+            Self::FenceOrSyncobjOrSeqMiss => "fence_or_syncobj_or_seq_miss",
+            Self::EtimeTimeout => "etime_timeout",
+            Self::OsEinvalUndifferentiated => "os_einval_undifferentiated",
+            Self::NotWaitFailureAxis => "not_wait_failure_axis",
+        }
+    }
+
+    /// True when this driver axis surfaces as product `wait_cmd_einval` (os EINVAL).
+    #[must_use]
+    pub const fn is_product_einval(self) -> bool {
+        matches!(
+            self,
+            Self::HwctxMissing | Self::FenceOrSyncobjOrSeqMiss | Self::OsEinvalUndifferentiated
+        )
+    }
+
+    /// True when this driver axis surfaces as product `wait_timeout` (ETIME).
+    #[must_use]
+    pub const fn is_product_timeout(self) -> bool {
+        matches!(self, Self::EtimeTimeout)
+    }
+}
+
+/// Product residual class token for submit/wait (mirrors classify honesty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitSubmitProductClass {
+    /// Product status `wait_cmd_einval` (os EINVAL on WAIT_CMD).
+    WaitCmdEinval,
+    /// Product status `wait_timeout` (ETIME / true timeout).
+    WaitTimeout,
+    /// Other / not a WAIT residual class.
+    Other,
+}
+
+impl WaitSubmitProductClass {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitCmdEinval => "wait_cmd_einval",
+            Self::WaitTimeout => "wait_timeout",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Driver-shaped WAIT failure map from product status/detail + optional journal.
+///
+/// Soft research bag only. Always `invent_pass=0` / not C-ready / not `ran_on_npu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct WaitCmdEinvalDriverAxesMap {
+    /// Product residual class (`wait_cmd_einval` vs `wait_timeout` vs other).
+    pub product_class: WaitSubmitProductClass,
+    /// Ranked driver axis (best effort from tokens + optional journal).
+    pub driver_axis: WaitCmdDriverAxis,
+    /// `1` when axis is fence miss, hwctx miss, or undifferentiated os EINVAL.
+    pub driver_einval_fence_or_hwctx: bool,
+    /// `1` when true timeout is ETIME class (not EINVAL).
+    pub etime_is_timeout: bool,
+    /// Journal (or detail) hinted `Invalid syncobj or sequence number`.
+    pub journal_syncobj_seq_hint: bool,
+    /// Journal (or detail) hinted missing / invalid hwctx context.
+    pub journal_hwctx_miss_hint: bool,
+    /// Short research detail token (not proven root cause).
+    pub detail: String,
+}
+
+impl WaitCmdEinvalDriverAxesMap {
+    /// Soft note — always honesty; map alone ≠ Pass / C-ready / `ran_on_npu`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_wait_cmd_einval_driver_axes_note(self)
+    }
+}
+
+/// True when text looks like product/os EINVAL (Invalid argument / os error 22).
+#[must_use]
+pub fn wait_message_looks_like_os_einval(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("invalid argument") || l.contains("os error 22") || l.contains("os error=22")
+}
+
+/// True when text looks like true wait timeout (ETIME), not mere `timeout_ms=` field.
+///
+/// Neutralizes `timeout_ms=` the same way product classify honesty does.
+#[must_use]
+pub fn wait_message_looks_like_true_timeout(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    if l.contains("etimedout") || l.contains("timed out") {
+        return true;
+    }
+    // Bare etime / ETIME token (driver -ETIME).
+    if l.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == "etime")
+    {
+        return true;
+    }
+    let stripped = l.replace("timeout_ms=", "wait_budget_ms=");
+    stripped.contains("timeout")
+}
+
+/// Journal/detail hint: driver log `Invalid syncobj or sequence number`.
+#[must_use]
+pub fn journal_hints_invalid_syncobj_or_seq(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("invalid syncobj")
+        || l.contains("invalid sequence number")
+        || l.contains("syncobj or sequence")
+}
+
+/// Journal/detail hint: missing / invalid hwctx for wait.
+#[must_use]
+pub fn journal_hints_hwctx_missing(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("invalid context")
+        || l.contains("invalid hwctx")
+        || l.contains("hwctx not found")
+        || l.contains("context not found")
+        || l.contains("failed to find context")
+        || l.contains("no such context")
+}
+
+/// Pure: map product wait status/detail (+ optional journal) to driver axes.
+///
+/// Does **not** invent Pass, C-ready, or proven single root cause. When journal
+/// is absent, live skip-CU / flexml EINVAL maps to `OsEinvalUndifferentiated`
+/// (driver could be fence **or** hwctx; both are EINVAL).
+#[must_use]
+pub fn map_wait_cmd_einval_driver_axes(
+    product_status: Option<&str>,
+    detail: Option<&str>,
+    journal_hint: Option<&str>,
+) -> WaitCmdEinvalDriverAxesMap {
+    let status = product_status.map_or("", str::trim);
+    let detail_s = detail.unwrap_or("");
+    let journal_s = journal_hint.unwrap_or("");
+    let combined = format!("{detail_s}\n{journal_s}");
+
+    let status_l = status.to_ascii_lowercase();
+    let status_is_einval = status_l == "wait_cmd_einval" || status_l.contains("wait_cmd_einval");
+    let status_is_timeout = status_l == "wait_timeout" || status_l.contains("wait_timeout");
+
+    let os_einval = wait_message_looks_like_os_einval(&combined) || status_is_einval;
+    let true_timeout = wait_message_looks_like_true_timeout(&combined) || status_is_timeout;
+    let journal_syncobj_seq_hint = journal_hints_invalid_syncobj_or_seq(&combined);
+    let journal_hwctx_miss_hint = journal_hints_hwctx_missing(&combined);
+
+    // Product classify: EINVAL wins over loose timeout field names when both
+    // appear (live WAIT always embeds timeout_ms= even on immediate EINVAL).
+    let product_class = if status_is_einval || (os_einval && !status_is_timeout) {
+        WaitSubmitProductClass::WaitCmdEinval
+    } else if status_is_timeout || (true_timeout && !os_einval) {
+        WaitSubmitProductClass::WaitTimeout
+    } else if os_einval {
+        // os EINVAL without status token still product einval class.
+        WaitSubmitProductClass::WaitCmdEinval
+    } else if true_timeout {
+        WaitSubmitProductClass::WaitTimeout
+    } else {
+        WaitSubmitProductClass::Other
+    };
+
+    let driver_axis = match product_class {
+        WaitSubmitProductClass::WaitTimeout => WaitCmdDriverAxis::EtimeTimeout,
+        WaitSubmitProductClass::WaitCmdEinval => {
+            if journal_hwctx_miss_hint && !journal_syncobj_seq_hint {
+                WaitCmdDriverAxis::HwctxMissing
+            } else if journal_syncobj_seq_hint {
+                WaitCmdDriverAxis::FenceOrSyncobjOrSeqMiss
+            } else {
+                WaitCmdDriverAxis::OsEinvalUndifferentiated
+            }
+        }
+        WaitSubmitProductClass::Other => WaitCmdDriverAxis::NotWaitFailureAxis,
+    };
+
+    let driver_einval_fence_or_hwctx = driver_axis.is_product_einval();
+    let etime_is_timeout = driver_axis.is_product_timeout();
+
+    let detail_tok = match driver_axis {
+        WaitCmdDriverAxis::HwctxMissing => "driver_hwctx_missing_einval",
+        WaitCmdDriverAxis::FenceOrSyncobjOrSeqMiss => "driver_fence_syncobj_seq_einval",
+        WaitCmdDriverAxis::EtimeTimeout => "driver_etime_is_timeout",
+        WaitCmdDriverAxis::OsEinvalUndifferentiated => "driver_os_einval_undifferentiated",
+        WaitCmdDriverAxis::NotWaitFailureAxis => "not_wait_failure_axis",
+    };
+
+    WaitCmdEinvalDriverAxesMap {
+        product_class,
+        driver_axis,
+        driver_einval_fence_or_hwctx,
+        etime_is_timeout,
+        journal_syncobj_seq_hint,
+        journal_hwctx_miss_hint,
+        detail: detail_tok.into(),
+    }
+}
+
+/// Soft driver WAIT axes note — always honesty; map alone ≠ Pass.
+#[must_use]
+pub fn format_wait_cmd_einval_driver_axes_note(r: &WaitCmdEinvalDriverAxesMap) -> String {
+    let parts = [
+        WAIT_CMD_EINVAL_DRIVER_AXES_NOTE.into(),
+        format!("product_class={}", r.product_class.as_str()),
+        format!("driver_axis={}", r.driver_axis.as_str()),
+        format!(
+            "driver_einval_fence_or_hwctx={}",
+            u8::from(r.driver_einval_fence_or_hwctx)
+        ),
+        format!("etime_is_timeout={}", u8::from(r.etime_is_timeout)),
+        format!(
+            "journal_syncobj_seq_hint={}",
+            u8::from(r.journal_syncobj_seq_hint)
+        ),
+        format!(
+            "journal_hwctx_miss_hint={}",
+            u8::from(r.journal_hwctx_miss_hint)
+        ),
+        format!("detail={}", sanitize_soft_note_field_value(&r.detail)),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "axes_alone_not_pass=1".into(),
+        "hypothesis_not_proven_root=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "wait_cmd_einval_neq_wait_timeout=1".into(),
+        "syncobj_wait_parity_alone_not_pass=1".into(),
+    ];
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// W3 O13 — XRT-parity wait path *decision* (offline pure only)
+//
+// Staged shim (`src/shim/hwq.cpp` wait_command):
+//   syncobj = CREATE_HWCTX.syncobj_handle
+//   if syncobj != AMDXDNA_INVALID_FENCE_HANDLE (0):
+//     DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT(handle=syncobj, point=EXEC seq,
+//       flags=WAIT_FOR_SUBMIT, timeout abs nsec)
+//   else:
+//     DRM_IOCTL_AMDXDNA_WAIT_CMD(hwctx, seq, timeout_ms)
+//
+// Product today: always WAIT_CMD. HardwareContext retains syncobj_handle
+// (W1 O2). This slice only locks the pure *selection* rule + soft honesty;
+// it does **not** wire live SYNCOBJ_TIMELINE_WAIT, open L3/ALLOW, or claim
+// that syncobj wait would clear live wait_cmd_einval. invent_pass=0 always.
+// ---------------------------------------------------------------------------
+
+/// Soft bag name for XRT-parity wait-path decision (offline research).
+pub const SYNCOBJ_WAIT_PATH_DECISION_NOTE: &str = "syncobj_wait_path_decision";
+
+/// uAPI `AMDXDNA_INVALID_FENCE_HANDLE` — CREATE_HWCTX / fence sentinel.
+///
+/// XRT treats this as "no syncobj": fall back to `WAIT_CMD`. Any non-zero
+/// handle is treated as a valid DRM syncobj for timeline wait *selection*
+/// (XRT parity). Zero is also product "not recorded" after CREATE.
+pub const AMDXDNA_INVALID_FENCE_HANDLE: u32 = 0;
+
+/// How product *should* complete a submitted EXEC seq (XRT-parity design).
+///
+/// **Not live-wired.** Product still issues only `WAIT_CMD` until a separate
+/// offline-justified + unlocked live slice lands the ioctl path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCompletionPath {
+    /// Prefer `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` on CREATE_HWCTX `syncobj_handle`
+    /// with EXEC `seq` as the timeline timepoint (XRT when handle ≠ 0).
+    SyncobjTimeline,
+    /// `DRM_IOCTL_AMDXDNA_WAIT_CMD` with hwctx + seq (XRT fallback; product today).
+    WaitCmd,
+}
+
+impl WaitCompletionPath {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SyncobjTimeline => "syncobj_timeline",
+            Self::WaitCmd => "wait_cmd",
+        }
+    }
+}
+
+/// Pure XRT-parity args sketch for timeline wait (no ioctl, no `/dev/accel`).
+///
+/// Maps shim `wait_cmd_syncobj` → `wait_syncobj_arg`:
+/// `handle` = CREATE syncobj, `timepoint` = EXEC seq, `timeout_ms` as given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncobjTimelineWaitArgs {
+    /// DRM syncobj handle from `CREATE_HWCTX.syncobj_handle`.
+    pub handle: u32,
+    /// Timeline point = EXEC_CMD returned sequence number.
+    pub timepoint: u64,
+    /// Wait budget in milliseconds (shim converts to absolute nsec at ioctl).
+    pub timeout_ms: u32,
+}
+
+/// XRT parity: wait via drm_syncobj timeline when CREATE_HWCTX returned a
+/// non-zero `syncobj_handle` (`!=` [`AMDXDNA_INVALID_FENCE_HANDLE`]).
+///
+/// Pure decision only. Does **not** prove live residual root, does **not**
+/// issue an ioctl, does **not** unlock live apply.
+#[must_use]
+pub fn should_wait_via_syncobj(syncobj_handle: u32) -> bool {
+    syncobj_handle != AMDXDNA_INVALID_FENCE_HANDLE
+}
+
+/// Select wait completion path from CREATE_HWCTX `syncobj_handle` (XRT parity).
+///
+/// | `syncobj_handle` | Path |
+/// |------------------|------|
+/// | `0` (invalid) | [`WaitCompletionPath::WaitCmd`] |
+/// | non-zero | [`WaitCompletionPath::SyncobjTimeline`] |
+///
+/// Product still uses `WaitCmd` only on the live path today.
+#[must_use]
+pub fn select_wait_completion_path(syncobj_handle: u32) -> WaitCompletionPath {
+    if should_wait_via_syncobj(syncobj_handle) {
+        WaitCompletionPath::SyncobjTimeline
+    } else {
+        WaitCompletionPath::WaitCmd
+    }
+}
+
+/// Pack pure timeline-wait args when selection prefers syncobj; else `None`.
+///
+/// When `Some`, `timepoint` **must** equal the EXEC-returned `seq` (shim
+/// `wait_cmd_syncobj` uses `seq` as the timeline point). Pure pack only;
+/// product wait defaults to WAIT_CMD (research wire env-gated separately).
+#[must_use]
+pub fn pack_syncobj_timeline_wait_args(
+    syncobj_handle: u32,
+    seq: u64,
+    timeout_ms: u32,
+) -> Option<SyncobjTimelineWaitArgs> {
+    if !should_wait_via_syncobj(syncobj_handle) {
+        return None;
+    }
+    Some(SyncobjTimelineWaitArgs {
+        handle: syncobj_handle,
+        timepoint: seq,
+        timeout_ms,
+    })
+}
+
+/// Soft note for wait-path decision — always honesty; parity alone ≠ Pass.
+///
+/// Pure XRT-parity selection only. Product default remains WAIT_CMD
+/// (`default_wait_cmd=1`); env-gated research wire exists offline
+/// (`research_wire_offline=1`) but is **not** live proven. invent_pass=0.
+#[must_use]
+pub fn format_syncobj_wait_path_decision_note(
+    syncobj_handle: u32,
+    seq: u64,
+    timeout_ms: u32,
+) -> String {
+    let path = select_wait_completion_path(syncobj_handle);
+    let via = u8::from(should_wait_via_syncobj(syncobj_handle));
+    let packed = pack_syncobj_timeline_wait_args(syncobj_handle, seq, timeout_ms);
+    let timepoint_tok = packed.map_or_else(
+        || "timepoint=absent".into(),
+        |a| format!("timepoint={}", a.timepoint),
+    );
+    let parts = [
+        SYNCOBJ_WAIT_PATH_DECISION_NOTE.into(),
+        format!("syncobj_handle={syncobj_handle}"),
+        format!("should_wait_via_syncobj={via}"),
+        format!("path={}", path.as_str()),
+        format!("seq={seq}"),
+        format!("timeout_ms={timeout_ms}"),
+        timepoint_tok,
+        // Default product wait is WAIT_CMD; research wire exists under env (W4c).
+        "default_wait_cmd=1".into(),
+        "research_wire_offline=1".into(),
+        // P1-B soft bag: wait-path research observability only (≠ Pass ≠ unlock).
+        "wait_path_syncobj_research=1".into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "syncobj_wait_parity_alone_not_pass=1".into(),
+        "hypothesis_not_proven_root=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "not_live_proven=1".into(),
+        "l8_not_minted=1".into(),
+    ];
+    parts.join(" ")
+}
+
+/// Soft wait-path / syncobj research summary from last_apply status+detail.
+///
+/// Combines greppable `syncobj=` / `wait_path=` (rich tokens) with the pure
+/// XRT-parity decision note. Always `invent_pass=0 not_c_ready=1
+/// not_ran_on_npu=1 wait_path_syncobj_research=1`. Offline observability only
+/// — **not** residual root proof, **not** unlock mint, **not** Pass.
+#[must_use]
+pub fn format_wait_path_syncobj_research_soft(
+    status: Option<&str>,
+    detail: Option<&str>,
+) -> String {
+    let rich = parse_last_apply_rich_tokens(status, detail);
+    let axes = parse_wait_cmd_einval_axes(status, detail);
+    let syncobj = rich.syncobj.unwrap_or(0);
+    let seq = u64::from(axes.seq.unwrap_or(0));
+    let timeout_ms = axes.timeout_ms.unwrap_or(0);
+    let decision = format_syncobj_wait_path_decision_note(syncobj, seq, timeout_ms);
+    let rich_note = format_last_apply_rich_tokens_note(&rich);
+    let mut parts = vec![
+        "wait_path_syncobj_research".into(),
+        "wait_path_syncobj_research=1".into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "research_alone_not_pass=1".into(),
+        "research_alone_not_unlock=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "default_wait_cmd=1".into(),
+        format!(
+            "detail_syncobj_present={}",
+            u8::from(rich.syncobj.is_some())
+        ),
+        format!(
+            "detail_wait_path_present={}",
+            u8::from(rich.wait_path.is_some())
+        ),
+    ];
+    if let Some(n) = rich.syncobj {
+        parts.push(format!("syncobj={n}"));
+    } else {
+        parts.push("syncobj=absent".into());
+    }
+    if let Some(ref p) = rich.wait_path {
+        parts.push(format!("wait_path={}", sanitize_soft_note_field_value(p)));
+    } else {
+        parts.push("wait_path=absent".into());
+    }
+    parts.push(format!("rich={rich_note}"));
+    parts.push(format!("decision={decision}"));
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// O1 P5 — post-fail ERT / Cmd BO dump observability (offline + greppable detail)
+//
+// After WAIT_CMD EINVAL (`wait_cmd_einval`) the product may still read the Cmd
+// BO ERT header (before GEM_CLOSE). Historical Err-path last_apply omitted the
+// token, so soft classify could not split R1 (fence never published / state
+// still New or unread) vs R4 (FW reject → ERT Error) vs expected-absent
+// (fail before EXEC). Pure parse/format only; invent_pass=0 always.
+// Research alone ≠ Pass ≠ unlock ≠ residual root.
+// ---------------------------------------------------------------------------
+
+/// Soft bag name for post-fail ERT research (O1 P5).
+pub const POST_FAIL_ERT_RESEARCH_NOTE: &str = "post_fail_ert_research";
+
+/// Whether Cmd BO ERT state was available after submit/wait failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostFailErtPresence {
+    /// Numeric `ert_state=N` present (Cmd BO header readable).
+    Present,
+    /// Product wrote `ert_state=unread` / `ert_post_fail=unread`.
+    Unread,
+    /// Explicit `ert_post_fail=absent` (read not done; BO may still exist).
+    Absent,
+    /// Explicit `ert_post_fail=expected_absent` (fail before EXEC / no Cmd BO).
+    ExpectedAbsent,
+    /// No greppable ERT post-fail token (historical last_apply before P5 wire).
+    #[default]
+    MissingFromDetail,
+}
+
+impl PostFailErtPresence {
+    /// Stable soft-note token (value for `ert_post_fail=`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Unread => "unread",
+            Self::Absent => "absent",
+            Self::ExpectedAbsent => "expected_absent",
+            Self::MissingFromDetail => "missing_from_detail",
+        }
+    }
+}
+
+/// Parsed post-fail ERT observability from last_apply status + detail.
+///
+/// Soft / research only. Does **not** invent Pass / C-ready / `ran_on_npu`.
+/// `split_hint` is a **hypothesis label**, not a proven root cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostFailErtResearch {
+    /// Status or detail indicates submit/wait fail class.
+    pub status_is_submit_wait_fail: bool,
+    /// How ERT was recorded (or missing).
+    pub presence: PostFailErtPresence,
+    /// First numeric `ert_state=` when present.
+    pub ert_state: Option<u32>,
+    /// First-token ERT Error (name or numeric 5).
+    pub ert_error: bool,
+    /// First-token ERT Completed (numeric 4).
+    pub ert_completed: bool,
+    /// Soft hypothesis split (not proven root).
+    pub split_hint: &'static str,
+    /// Short research detail token.
+    pub detail: String,
+}
+
+impl Default for PostFailErtResearch {
+    fn default() -> Self {
+        Self {
+            status_is_submit_wait_fail: false,
+            presence: PostFailErtPresence::MissingFromDetail,
+            ert_state: None,
+            ert_error: false,
+            ert_completed: false,
+            split_hint: "historical_no_ert_token",
+            detail: String::new(),
+        }
+    }
+}
+
+impl PostFailErtResearch {
+    /// Soft note — always honesty; research alone ≠ Pass / unlock / `ran_on_npu`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_post_fail_ert_research_note(self)
+    }
+}
+
+/// Minimal ERT state name for greppable product detail (matches public ERT enum).
+///
+/// Kept local so silicon_contract stays pure and does not depend on `direct`.
+#[must_use]
+pub fn post_fail_ert_state_name(state: u32) -> &'static str {
+    match state {
+        1 => "New",
+        2 => "Queued",
+        3 => "Running",
+        4 => "Completed",
+        5 => "Error",
+        6 => "Abort",
+        7 => "Submitted",
+        8 => "Timeout",
+        9 => "NoResponse",
+        _ => "Unknown",
+    }
+}
+
+/// Format greppable post-fail ERT tokens for product last_apply detail.
+///
+/// Pure. Intended for the timed-matmul **Err** path after WAIT fail when the
+/// Cmd BO was still valid long enough for a best-effort header read.
+///
+/// | Inputs | Tokens |
+/// |--------|--------|
+/// | `cmd_bo_valid=false` | `ert_post_fail=expected_absent` |
+/// | `Some(state)` | `ert_state=N(Name) ert_post_fail=present` |
+/// | read attempted, no state | `ert_state=unread ert_post_fail=unread` |
+/// | no read, BO valid | `ert_post_fail=absent` |
+///
+/// Does **not** invent Pass / unlock / residual root.
+#[must_use]
+pub fn format_post_fail_ert_detail_tokens(
+    ert_state: Option<u32>,
+    read_attempted: bool,
+    cmd_bo_valid: bool,
+) -> String {
+    if !cmd_bo_valid {
+        return "ert_post_fail=expected_absent".into();
+    }
+    match ert_state {
+        Some(s) => {
+            let name = post_fail_ert_state_name(s);
+            format!("ert_state={s}({name}) ert_post_fail=present")
+        }
+        None if read_attempted => "ert_state=unread ert_post_fail=unread".into(),
+        None => "ert_post_fail=absent".into(),
+    }
+}
+
+/// Parse post-fail ERT research from status + detail (pure).
+///
+/// Recognizes `ert_state=N(Name)`, `ert_state=unread`, and
+/// `ert_post_fail={present|unread|absent|expected_absent}`. Historical
+/// wait_cmd_einval detail without tokens → [`PostFailErtPresence::MissingFromDetail`].
+/// Does **not** invent Pass or proven root cause.
+#[must_use]
+pub fn parse_post_fail_ert_research(
+    status: Option<&str>,
+    detail: Option<&str>,
+) -> PostFailErtResearch {
+    let status_trim = status.map(str::trim).filter(|s| !s.is_empty());
+    let detail_s = detail.unwrap_or("");
+    let status_l = status_trim.unwrap_or("").to_ascii_lowercase();
+    let detail_l = detail_s.to_ascii_lowercase();
+
+    let status_is_submit_wait_fail = matches!(
+        status_l.as_str(),
+        "wait_cmd_einval"
+            | "submit_wait_failed"
+            | "wait_timeout"
+            | "exec_cmd_perm"
+            | "exec_eio"
+            | "ert_cmd_error"
+    ) || detail_l.contains("(wait_cmd_einval)")
+        || detail_l.contains("submit_and_wait failed")
+        || detail_l.contains("status=wait_cmd_einval");
+
+    let sig = if detail_s.trim().is_empty() {
+        LastApplyDetailSignals::default()
+    } else {
+        parse_last_apply_detail_signals(detail_s)
+    };
+
+    // Presence precedence: explicit ert_post_fail= > unread token > numeric state > missing.
+    let presence = if detail_l.contains("ert_post_fail=expected_absent") {
+        PostFailErtPresence::ExpectedAbsent
+    } else if detail_l.contains("ert_post_fail=absent") {
+        // Do not match expected_absent again (already handled).
+        PostFailErtPresence::Absent
+    } else if detail_l.contains("ert_state=unread") || detail_l.contains("ert_post_fail=unread") {
+        PostFailErtPresence::Unread
+    } else if detail_l.contains("ert_post_fail=present") || sig.ert_state.is_some() {
+        PostFailErtPresence::Present
+    } else if detail_s.contains("ert_state=") {
+        // Non-numeric ert_state= value without unread keyword.
+        PostFailErtPresence::Unread
+    } else {
+        PostFailErtPresence::MissingFromDetail
+    };
+
+    let ert_completed = sig.ert_state == Some(4);
+    let split_hint = match presence {
+        PostFailErtPresence::Present if sig.ert_error => "r4_fw_reject_hint",
+        PostFailErtPresence::Present if ert_completed => "ert_completed_after_wait_fail",
+        PostFailErtPresence::Present => "r1_fence_or_state_present",
+        PostFailErtPresence::Unread => "r1_fence_maybe_unread",
+        PostFailErtPresence::ExpectedAbsent => "pre_exec_ert_expected_absent",
+        PostFailErtPresence::Absent => "ert_post_fail_absent",
+        PostFailErtPresence::MissingFromDetail => "historical_no_ert_token",
+    };
+
+    let detail_tok = if detail_s.trim().is_empty() {
+        "empty".into()
+    } else if status_is_submit_wait_fail {
+        "submit_wait_fail".into()
+    } else {
+        "detail_present".into()
+    };
+
+    PostFailErtResearch {
+        status_is_submit_wait_fail,
+        presence,
+        ert_state: sig.ert_state,
+        ert_error: sig.ert_error,
+        ert_completed,
+        split_hint,
+        detail: detail_tok,
+    }
+}
+
+/// Soft note from a parsed [`PostFailErtResearch`] bag.
+///
+/// **Always** hard-codes `invent_pass=0 not_c_ready=1 not_ran_on_npu=1
+/// research_alone_not_pass=1 research_alone_not_unlock=1`.
+#[must_use]
+pub fn format_post_fail_ert_research_note(r: &PostFailErtResearch) -> String {
+    let mut parts = vec![
+        "post_fail_ert_research".into(),
+        "post_fail_ert_research=1".into(),
+        // Honesty hard-coded (not from mutable fields).
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "research_alone_not_pass=1".into(),
+        "research_alone_not_unlock=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "hypothesis_not_proven_root=1".into(),
+        format!(
+            "status_is_submit_wait_fail={}",
+            u8::from(r.status_is_submit_wait_fail)
+        ),
+        format!("ert_post_fail={}", r.presence.as_str()),
+        format!("ert_error={}", u8::from(r.ert_error)),
+        format!("ert_completed={}", u8::from(r.ert_completed)),
+        format!("split_hint={}", r.split_hint),
+        format!("detail={}", sanitize_soft_note_field_value(&r.detail)),
+    ];
+    if let Some(e) = r.ert_state {
+        parts.push(format!("ert_state={e}"));
+    } else {
+        parts.push("ert_state=absent".into());
+    }
+    parts.join(" ")
+}
+
+/// Soft post-fail ERT research from last_apply status + detail.
+///
+/// Combines parse + greppable honesty bag. Always `invent_pass=0`. Offline
+/// observability only — **not** Pass, **not** unlock mint, **not** residual root.
+#[must_use]
+pub fn format_post_fail_ert_research_soft(status: Option<&str>, detail: Option<&str>) -> String {
+    let r = parse_post_fail_ert_research(status, detail);
+    format_post_fail_ert_research_note(&r)
+}
+
+// ---------------------------------------------------------------------------
+// S3 — WAIT fence diagnostic (offline ranked hypotheses)
+//
+// Ranked residual story after EXEC returned a seq and WAIT_CMD returned EINVAL:
+//   1. OutFenceLookupFail — staged `aie2_cmd_wait` (`aie2_ctx.c`) returns
+//      `-EINVAL` when `aie2_cmd_get_out_fence` is NULL ("Invalid syncobj or
+//      sequence number"), or `amdxdna_cmd_wait` when `xa_load` misses hwctx.
+//   2. UnpublishedJob — firmware / scheduler never published a waitable fence
+//      (`drm_syncobj_add_point` in `aie2_cmd_submit` never happened or was
+//      torn down). Compatible with (1). Split later via post-fail ERT.
+//   3. SyncobjParityUnproven — XRT `hwq.cpp` prefers `wait_cmd_syncobj` when
+//      CREATE_HWCTX syncobj ≠ 0; product default remains WAIT_CMD. Parity
+//      gap, not a proven root.
+// Timeout, seq=0, and ioctl size `0xc0106449` are already ruled out.
+// Reuses WaitCmdEinvalAxes / driver axes / post-fail ERT. invent_pass=0.
+// Diagnostic ≠ live_justified ≠ unlock ≠ Pass.
+// ---------------------------------------------------------------------------
+
+/// Soft bag name for ranked WAIT fence diagnostic (plan S3 offline).
+pub const WAIT_FENCE_DIAGNOSTIC_NOTE: &str = "wait_fence_diagnostic";
+
+/// Ranked WAIT fence residual hypothesis (offline research).
+///
+/// Not a proven root. Product live `wait_cmd_einval` after EXEC returned a seq
+/// is still driver/FW completion, not a userspace pack bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitFenceHypothesis {
+    /// Driver cannot resolve out-fence for `(hwctx, seq)` (`aie2_cmd_get_out_fence`
+    /// NULL or `xa_load` miss). Best staged-driver match for immediate EINVAL.
+    OutFenceLookupFail,
+    /// Firmware never published a waitable fence (job never scheduled / aborted
+    /// before `drm_syncobj_add_point`). Compatible with lookup fail.
+    UnpublishedJob,
+    /// Product uses WAIT_CMD while XRT prefers drm_syncobj timeline when
+    /// CREATE_HWCTX returned a non-zero handle. Parity gap, not proven root.
+    SyncobjParityUnproven,
+    /// Not a `wait_cmd_einval` residual (timeout or other class).
+    NotWaitFenceClass,
+}
+
+impl WaitFenceHypothesis {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutFenceLookupFail => "out_fence_lookup_fail",
+            Self::UnpublishedJob => "unpublished_job",
+            Self::SyncobjParityUnproven => "syncobj_parity_unproven",
+            Self::NotWaitFenceClass => "not_wait_fence_class",
+        }
+    }
+
+    /// Rank in the S3 write-up (1/2/3). `NotWaitFenceClass` is rank 0.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::OutFenceLookupFail => 1,
+            Self::UnpublishedJob => 2,
+            Self::SyncobjParityUnproven => 3,
+            Self::NotWaitFenceClass => 0,
+        }
+    }
+}
+
+/// Ranked WAIT fence diagnostic bag (offline). Reuses existing wait axes + ERT.
+///
+/// Soft research only. Always `invent_pass=0` / `live_justified=0` on format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct WaitFenceDiagnostic {
+    /// Best current hypothesis among the ranked set (never proven root).
+    pub primary: WaitFenceHypothesis,
+    /// Rank-1 open: driver out-fence / hwctx lookup EINVAL class.
+    pub out_fence_lookup_open: bool,
+    /// Rank-2 open: FW may never have published a waitable fence.
+    pub unpublished_job_open: bool,
+    /// Rank-3 open: product WAIT_CMD vs XRT syncobj when handle ≠ 0.
+    pub syncobj_parity_unproven: bool,
+    /// True timeout / ETIME already ruled out as this residual class.
+    pub timeout_ruled_out: bool,
+    /// `seq=0` already ruled out as illegal (first job is 0).
+    pub seq_zero_ruled_out: bool,
+    /// WAIT ioctl / struct size already ruled out (`0xc0106449` IOWR).
+    pub ioctl_size_ruled_out: bool,
+    /// Product/status token is `wait_cmd_einval`.
+    pub status_is_wait_cmd_einval: bool,
+    /// Driver axis from existing map (reused; not re-implemented).
+    pub driver_axis: WaitCmdDriverAxis,
+    /// Post-fail ERT presence (reused).
+    pub post_fail_ert_presence: PostFailErtPresence,
+    /// Post-fail ERT split hint (hypothesis label only).
+    pub post_fail_split_hint: &'static str,
+    /// First `syncobj=` from rich tokens when present.
+    pub detail_syncobj: Option<u32>,
+    /// First `wait_path=` from rich tokens when present.
+    pub detail_wait_path: Option<String>,
+    /// Short research detail token (not proven root).
+    pub detail: String,
+}
+
+impl WaitFenceDiagnostic {
+    /// Soft note — always honesty; diagnostic alone ≠ Pass / unlock / live.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_wait_fence_diagnostic_note(self)
+    }
+}
+
+/// Parse ranked WAIT fence diagnostic from status + detail + optional journal.
+///
+/// Reuses [`parse_wait_cmd_einval_axes`], [`map_wait_cmd_einval_driver_axes`],
+/// [`parse_post_fail_ert_research`], and [`parse_last_apply_rich_tokens`].
+/// Does **not** invent Pass, unlock, or proven root. `live_justified` is never
+/// true from this parser (format hard-codes `live_justified=0`).
+#[must_use]
+pub fn parse_wait_fence_diagnostic(
+    status: Option<&str>,
+    detail: Option<&str>,
+    journal_hint: Option<&str>,
+) -> WaitFenceDiagnostic {
+    let axes = parse_wait_cmd_einval_axes(status, detail);
+    let driver = map_wait_cmd_einval_driver_axes(status, detail, journal_hint);
+    let ert = parse_post_fail_ert_research(status, detail);
+    let rich = parse_last_apply_rich_tokens(status, detail);
+
+    let status_is_wait_cmd_einval = axes.status_is_wait_cmd_einval;
+    let timeout_ruled_out = status_is_wait_cmd_einval;
+    // First EXEC seq is 0 (`ctx->submitted++`); historical EXEC+WAIT seq=0 accepted.
+    let seq_zero_ruled_out = status_is_wait_cmd_einval;
+    // Product pack is IOWR size 16 → `0xc0106449`; historical WAIT accepted.
+    let ioctl_size_ruled_out = status_is_wait_cmd_einval
+        && (axes.wait_cmd_request.is_none() || axes.wait_cmd_request == Some(0xc010_6449));
+
+    let out_fence_lookup_open = status_is_wait_cmd_einval && driver.driver_axis.is_product_einval();
+    // Unpublished stays open unless ERT shows the job existed (Error or Completed).
+    let unpublished_job_open = status_is_wait_cmd_einval && !ert.ert_error && !ert.ert_completed;
+    let syncobj_nonzero = rich
+        .syncobj
+        .is_some_and(|n| n != AMDXDNA_INVALID_FENCE_HANDLE);
+    let wait_path_is_wait_cmd = rich
+        .wait_path
+        .as_deref()
+        .is_none_or(|p| p == "wait_cmd" || p == WaitCompletionPath::WaitCmd.as_str());
+    let syncobj_parity_unproven =
+        status_is_wait_cmd_einval && syncobj_nonzero && wait_path_is_wait_cmd;
+
+    let primary = if status_is_wait_cmd_einval {
+        WaitFenceHypothesis::OutFenceLookupFail
+    } else {
+        WaitFenceHypothesis::NotWaitFenceClass
+    };
+
+    let detail_tok = if !status_is_wait_cmd_einval {
+        "not_wait_fence_class"
+    } else if driver.journal_syncobj_seq_hint {
+        "wait_einval_out_fence_lookup"
+    } else if ert.ert_error {
+        "wait_einval_fw_reject_hint"
+    } else if syncobj_parity_unproven && unpublished_job_open {
+        "wait_einval_fence_lookup_or_unpublished"
+    } else {
+        "wait_einval_out_fence_open"
+    };
+
+    WaitFenceDiagnostic {
+        primary,
+        out_fence_lookup_open,
+        unpublished_job_open,
+        syncobj_parity_unproven,
+        timeout_ruled_out,
+        seq_zero_ruled_out,
+        ioctl_size_ruled_out,
+        status_is_wait_cmd_einval,
+        driver_axis: driver.driver_axis,
+        post_fail_ert_presence: ert.presence,
+        post_fail_split_hint: ert.split_hint,
+        detail_syncobj: rich.syncobj,
+        detail_wait_path: rich.wait_path,
+        detail: detail_tok.into(),
+    }
+}
+
+/// Soft WAIT fence diagnostic note — honesty tokens are **hard-coded**.
+///
+/// Always includes `invent_pass=0 not_c_ready=1 not_ran_on_npu=1
+/// axes_alone_not_pass=1 live_justified=0`. Diagnostic ≠ unlock.
+#[must_use]
+pub fn format_wait_fence_diagnostic_note(r: &WaitFenceDiagnostic) -> String {
+    let mut parts = vec![
+        WAIT_FENCE_DIAGNOSTIC_NOTE.into(),
+        format!("primary={}", r.primary.as_str()),
+        format!("rank={}", r.primary.rank()),
+        format!(
+            "out_fence_lookup_open={}",
+            u8::from(r.out_fence_lookup_open)
+        ),
+        format!("unpublished_job_open={}", u8::from(r.unpublished_job_open)),
+        format!(
+            "syncobj_parity_unproven={}",
+            u8::from(r.syncobj_parity_unproven)
+        ),
+        format!("timeout_ruled_out={}", u8::from(r.timeout_ruled_out)),
+        format!("seq_zero_ruled_out={}", u8::from(r.seq_zero_ruled_out)),
+        format!("ioctl_size_ruled_out={}", u8::from(r.ioctl_size_ruled_out)),
+        format!(
+            "status_is_wait_cmd_einval={}",
+            u8::from(r.status_is_wait_cmd_einval)
+        ),
+        format!("driver_axis={}", r.driver_axis.as_str()),
+        format!("ert_post_fail={}", r.post_fail_ert_presence.as_str()),
+        format!(
+            "split_hint={}",
+            sanitize_soft_note_field_value(r.post_fail_split_hint)
+        ),
+        format!("detail={}", sanitize_soft_note_field_value(&r.detail)),
+        // Honesty hard-coded (not from mutable fields).
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "axes_alone_not_pass=1".into(),
+        "live_justified=0".into(),
+        "hypothesis_not_proven_root=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "diagnostic_alone_not_unlock=1".into(),
+    ];
+    if let Some(n) = r.detail_syncobj {
+        parts.push(format!("syncobj={n}"));
+    } else {
+        parts.push("syncobj=absent".into());
+    }
+    if let Some(ref p) = r.detail_wait_path {
+        parts.push(format!("wait_path={}", sanitize_soft_note_field_value(p)));
+    } else {
+        parts.push("wait_path=absent".into());
+    }
+    parts.join(" ")
+}
+
+/// Soft WAIT fence diagnostic from last_apply status + detail (no journal).
+///
+/// Always `invent_pass=0 live_justified=0`. Offline only.
+#[must_use]
+pub fn format_wait_fence_diagnostic_soft(status: Option<&str>, detail: Option<&str>) -> String {
+    let r = parse_wait_fence_diagnostic(status, detail, None);
+    format_wait_fence_diagnostic_note(&r)
+}
+
+// ---------------------------------------------------------------------------
+// W4a T5 — Syncobj timeline-wait *pack* / timeout / error classify (offline)
+//
+// Builds on W3 O13 decision helpers. Pack helpers pure; research ioctl wire is
+// env-gated in direct (W4c). Soft notes: research_wire_offline=1 not_live_proven=1.
+// No L3/ALLOW, no unlock mint. Product wait_command default remains WAIT_CMD.
+//
+// XRT parity (staged `platform.cpp` wait_syncobj + timeout_ms2abs_ns):
+//   timeout_ms == 0 → INT64_MAX (forever)
+//   else abs_nsec = now_mono_nsec + timeout_ms * 1_000_000 (CLOCK_MONOTONIC)
+//   flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+// invent_pass=0 always; L8 not minted this slice.
+// ---------------------------------------------------------------------------
+
+/// Soft bag name for offline syncobj pack / timeout / errno classify.
+pub const SYNCOBJ_TIMELINE_WAIT_PACK_NOTE: &str = "syncobj_timeline_wait_pack";
+
+/// Research-only env name for a *future* live wait-via-syncobj path (L8).
+///
+/// Product may read this for the research wait path (default **off**):
+/// `XDNA2_LAB_WAIT_VIA_SYNCOBJ=1` + non-zero CREATE syncobj → timeline wait.
+/// Setting the env alone ≠ unlock ≠ Pass ≠ L8 mint. invent_pass=0.
+pub const ENV_LAB_WAIT_VIA_SYNCOBJ: &str = "XDNA2_LAB_WAIT_VIA_SYNCOBJ";
+
+// DRM uAPI flags from `<drm/drm.h>` (timeline wait uses the same flag bits).
+// See public kernel headers: DRM_SYNCOBJ_WAIT_FLAGS_* (accessed offline 2026-08-11).
+
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL` — wait for all handles (1 << 0).
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT` — keep waiting if not submitted (1 << 1).
+///
+/// XRT `wait_syncobj` sets this on `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE` — wait for timepoint available (1 << 2).
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE` — set fence deadline (1 << 3).
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE: u32 = 1 << 3;
+
+/// XRT default flags for CREATE_HWCTX timeline wait (WAIT_FOR_SUBMIT only).
+pub const SYNCOBJ_TIMELINE_WAIT_FLAGS_XRT_DEFAULT: u32 = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+
+/// Nanoseconds per millisecond (budget → absolute delta).
+pub const SYNCOBJ_NSEC_PER_MS: i64 = 1_000_000;
+
+/// Linux `EINVAL` (22) — bad handle / args on timeline wait.
+pub const SYNCOBJ_ERRNO_EINVAL: i32 = 22;
+/// Linux `ETIME` (62) — true wait budget expiry on fence wait.
+pub const SYNCOBJ_ERRNO_ETIME: i32 = 62;
+/// Linux `ETIMEDOUT` (110) — alternate timeout errno some stacks surface.
+pub const SYNCOBJ_ERRNO_ETIMEDOUT: i32 = 110;
+
+/// Pure classify of syncobj timeline-wait failure (errno or message).
+///
+/// Maps to product residual honesty later: ETIME → `wait_timeout`, EINVAL →
+/// `wait_cmd_einval`-class (or syncobj-specific residual). **Not** product
+/// Pass. invent_pass=0 surface only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncobjWaitErrorClass {
+    /// True timeout (`ETIME` / `ETIMEDOUT` / timeout-looking message).
+    Etime,
+    /// Bad args / handle (`EINVAL` / Invalid argument).
+    Einval,
+    /// Anything else (EIO, EPERM, unknown string).
+    Other,
+}
+
+impl SyncobjWaitErrorClass {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Etime => "etime",
+            Self::Einval => "einval",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Pure ioctl-arg sketch for `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` (no ioctl).
+///
+/// Fields mirror XRT `wait_syncobj` packing: one handle, one timepoint (EXEC
+/// seq), absolute `timeout_nsec`, flags = WAIT_FOR_SUBMIT, count = 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncobjTimelineWaitIoctlPack {
+    /// DRM syncobj handle (`CREATE_HWCTX.syncobj_handle`).
+    pub handle: u32,
+    /// Timeline point = EXEC sequence.
+    pub timepoint: u64,
+    /// Absolute CLOCK_MONOTONIC timeout in nanoseconds (`i64::MAX` = forever).
+    pub timeout_nsec: i64,
+    /// DRM wait flags (XRT default: [`DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT`]).
+    pub flags: u32,
+    /// Handle count (always 1 for single-hwctx wait).
+    pub count_handles: u32,
+}
+
+/// Convert wait budget ms + monotonic now into absolute `timeout_nsec`.
+///
+/// XRT parity (`timeout_ms2abs_ns`):
+/// - `timeout_ms == 0` → [`i64::MAX`] (wait forever)
+/// - else → `now_mono_nsec + timeout_ms * 1_000_000`, **saturating** (overflow-safe)
+///
+/// Negative `now_mono_nsec` is clamped to 0 (CLOCK_MONOTONIC is non-negative;
+/// refuse inventing a past absolute deadline from a bad clock sample).
+///
+/// Pure only — does not call `clock_gettime`. Callers that later live-wire pass
+/// a real mono sample; unit tests inject fixed `now`.
+#[must_use]
+pub fn syncobj_timeout_ms_to_abs_nsec(timeout_ms: u32, now_mono_nsec: i64) -> i64 {
+    if timeout_ms == 0 {
+        return i64::MAX;
+    }
+    let now = now_mono_nsec.max(0);
+    // u32::MAX * 1_000_000 fits in i64 (≈4.29e15 < 9e18).
+    let delta = i64::from(timeout_ms).saturating_mul(SYNCOBJ_NSEC_PER_MS);
+    now.saturating_add(delta)
+}
+
+/// Classify raw Linux errno from a timeline-wait ioctl (positive or negative).
+///
+/// | errno | Class |
+/// |-------|-------|
+/// | 62 (`ETIME`) / 110 (`ETIMEDOUT`) | [`SyncobjWaitErrorClass::Etime`] |
+/// | 22 (`EINVAL`) | [`SyncobjWaitErrorClass::Einval`] |
+/// | other | [`SyncobjWaitErrorClass::Other`] |
+#[must_use]
+pub fn classify_syncobj_wait_errno(errno: i32) -> SyncobjWaitErrorClass {
+    let e = errno.unsigned_abs();
+    if e == SYNCOBJ_ERRNO_ETIME.unsigned_abs() || e == SYNCOBJ_ERRNO_ETIMEDOUT.unsigned_abs() {
+        SyncobjWaitErrorClass::Etime
+    } else if e == SYNCOBJ_ERRNO_EINVAL.unsigned_abs() {
+        SyncobjWaitErrorClass::Einval
+    } else {
+        SyncobjWaitErrorClass::Other
+    }
+}
+
+/// Classify syncobj wait failure from error message text (no errno available).
+///
+/// Prefer true-timeout tokens over EINVAL when both appear (timeout residual
+/// honesty). Reuses WAIT_CMD message helpers for consistent residual class.
+#[must_use]
+pub fn classify_syncobj_wait_error_message(s: &str) -> SyncobjWaitErrorClass {
+    if wait_message_looks_like_true_timeout(s) {
+        SyncobjWaitErrorClass::Etime
+    } else if wait_message_looks_like_os_einval(s) {
+        SyncobjWaitErrorClass::Einval
+    } else {
+        SyncobjWaitErrorClass::Other
+    }
+}
+
+/// Pure: research env string enables *intent* for later L8 wire only.
+///
+/// Accepts `1` / `true` / `yes` (case-insensitive, trim). Empty / unset / `0` /
+/// garbage → false. **Does not** open live ioctl or change product wait path.
+#[must_use]
+pub fn lab_wait_via_syncobj_research_env_enabled(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            let l = s.to_ascii_lowercase();
+            matches!(l.as_str(), "1" | "true" | "yes")
+        }
+        _ => false,
+    }
+}
+
+/// Pack full timeline-wait ioctl args when handle is valid; else `None`.
+///
+/// Fail-closed: [`AMDXDNA_INVALID_FENCE_HANDLE`] (0) → `None` (do not claim
+/// syncobj wait path). When `Some`, fields match XRT `wait_syncobj` packing
+/// with absolute timeout from [`syncobj_timeout_ms_to_abs_nsec`].
+///
+/// Pack helper only. Live research wire is env-gated in `direct` (default WAIT_CMD).
+#[must_use]
+pub fn pack_syncobj_timeline_wait_ioctl(
+    syncobj_handle: u32,
+    seq: u64,
+    timeout_ms: u32,
+    now_mono_nsec: i64,
+) -> Option<SyncobjTimelineWaitIoctlPack> {
+    if !should_wait_via_syncobj(syncobj_handle) {
+        return None;
+    }
+    Some(SyncobjTimelineWaitIoctlPack {
+        handle: syncobj_handle,
+        timepoint: seq,
+        timeout_nsec: syncobj_timeout_ms_to_abs_nsec(timeout_ms, now_mono_nsec),
+        flags: SYNCOBJ_TIMELINE_WAIT_FLAGS_XRT_DEFAULT,
+        count_handles: 1,
+    })
+}
+
+/// Soft note for offline syncobj pack / timeout / classify — always honesty.
+///
+/// After W4c the research wait path is **code-wired** under
+/// `XDNA2_LAB_WAIT_VIA_SYNCOBJ=1` (default off → WAIT_CMD). Soft tokens:
+/// `default_wait_cmd=1 research_wire_offline=1 not_live_proven=1 l8_not_minted=1`
+/// invent_pass=0. **Never** emit `not_live_wired=1` (stale after wire).
+/// Pack / wire alone ≠ unlock ≠ Pass ≠ live proven.
+#[must_use]
+pub fn format_syncobj_timeline_wait_pack_note(
+    syncobj_handle: u32,
+    seq: u64,
+    timeout_ms: u32,
+    now_mono_nsec: i64,
+) -> String {
+    let packed = pack_syncobj_timeline_wait_ioctl(syncobj_handle, seq, timeout_ms, now_mono_nsec);
+    let via = u8::from(should_wait_via_syncobj(syncobj_handle));
+    let (timeout_tok, flags_tok, pack_tok) = packed.map_or_else(
+        || {
+            (
+                "timeout_nsec=absent".into(),
+                "flags=absent".into(),
+                "pack_ok=0".into(),
+            )
+        },
+        |p| {
+            (
+                format!("timeout_nsec={}", p.timeout_nsec),
+                format!("flags=0x{:x}", p.flags),
+                "pack_ok=1".into(),
+            )
+        },
+    );
+    let parts = [
+        SYNCOBJ_TIMELINE_WAIT_PACK_NOTE.into(),
+        format!("syncobj_handle={syncobj_handle}"),
+        format!("should_wait_via_syncobj={via}"),
+        format!("seq={seq}"),
+        format!("timeout_ms={timeout_ms}"),
+        timeout_tok,
+        flags_tok,
+        pack_tok,
+        format!("flags_xrt_default=0x{SYNCOBJ_TIMELINE_WAIT_FLAGS_XRT_DEFAULT:x}"),
+        format!("env_name={ENV_LAB_WAIT_VIA_SYNCOBJ}"),
+        // W4c: env-gated research wire is present offline; default product wait
+        // remains WAIT_CMD. Wire ≠ live proven ≠ Pass ≠ L8 mint.
+        "default_wait_cmd=1".into(),
+        "research_wire_offline=1".into(),
+        "wait_path_syncobj_research=1".into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "not_live_proven=1".into(),
+        "l8_not_minted=1".into(),
+        "syncobj_pack_alone_not_pass=1".into(),
+        "syncobj_pack_alone_not_unlock=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    parts.join(" ")
+}
+
+/// Residual-matched material kind inventory (offline research labels only).
+///
+/// **Load-accepted / residual-matched** means program material that can reach
+/// product Pass only after live ERT Completed + non-zero OFM allclose via
+/// `decide_ran_on_npu`. Offline classify of public AOT never claims that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialResidualMatchKind {
+    /// Checklist-only: criteria for load-accepted residual match (not a present file claim).
+    LoadAcceptedCriteria,
+    /// Public mlir-aie / IRON npu2 minimal AOT — research only, not residual identity.
+    PublicNpu2SmallResearchOnly,
+    /// Lab staged classic mladf ctrltext oracle (1688 B) — residual path, not known-good Pass.
+    LabClassicMladfOracle,
+    /// Spent flexml STX research PDI class — re-live alone is not progress.
+    FlexmlSpentResearch,
+    /// Public small peel is the right *kind* for [`JobResidualIdentity::IronNpu2VectorAdd`].
+    /// Not classic 1688. Not load-accepted. Not product Pass.
+    IronNpu2VectorAddKindMatch,
+    /// Insufficient or unknown signals.
+    Unknown,
+}
+
+impl MaterialResidualMatchKind {
+    /// Stable token for soft notes / tests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadAcceptedCriteria => "load_accepted_criteria",
+            Self::PublicNpu2SmallResearchOnly => "public_npu2_small_research_only",
+            Self::LabClassicMladfOracle => "lab_classic_mladf_oracle",
+            Self::FlexmlSpentResearch => "flexml_spent_research",
+            Self::IronNpu2VectorAddKindMatch => "iron_npu2_vector_add_kind_match",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of residual-matched vs research-only material inventory (pure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research honesty flags; always invent_pass=0 surface
+pub struct MaterialResidualMatchInventory {
+    /// Primary material kind.
+    pub kind: MaterialResidualMatchKind,
+    /// Size-class label when length known; else empty class.
+    pub size_class: CtrltextSizeClass,
+    /// Always false offline from public AOT / size alone.
+    pub residual_matched_claim: bool,
+    /// Research-only surface (public AOT / spent flexml / checklist).
+    pub research_only: bool,
+    /// Public / spent material is never unlock justification alone.
+    pub unlock_justification_alone: bool,
+    /// Always false on this inventory surface.
+    pub product_known_good: bool,
+    /// Research detail token.
+    pub detail: String,
+}
+
+impl Default for MaterialResidualMatchInventory {
+    fn default() -> Self {
+        Self {
+            kind: MaterialResidualMatchKind::Unknown,
+            size_class: CtrltextSizeClass::Empty,
+            residual_matched_claim: false,
+            research_only: true,
+            unlock_justification_alone: false,
+            product_known_good: false,
+            detail: "default_unknown".into(),
+        }
+    }
+}
+
+impl MaterialResidualMatchInventory {
+    /// Soft note — always honesty; inventory alone ≠ Pass / unlock / residual close.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_material_residual_match_note(self)
+    }
+}
+
+/// Classify material residual-match inventory from length and/or tag hint (pure).
+///
+/// Tag hints (case-insensitive, hyphen/underscore tolerant):
+/// - `public-npu2-small` / `public_npu2_small` → research only
+/// - `mladf-classic-1688` / `lab_classic` → lab classic oracle
+/// - `flexml-2x4x4-class` / `flexml_spent` → spent flexml research
+/// - `load-accepted` / `residual-matched` → criteria checklist kind only
+///   (**never** claims residual_matched_claim from offline alone)
+///
+/// Length alone: 0 empty; 1688 lab classic; `1..=CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES`
+/// (1024; covers 300 + 660 research peels) → public-npu2-small research only;
+/// else unknown. **Never** invents Pass, residual match claim, or unlock from
+/// public AOT (`residual_matched_claim` always false offline).
+#[must_use]
+pub fn classify_material_residual_match(
+    ctrltext_len: Option<usize>,
+    tag_hint: Option<&str>,
+) -> MaterialResidualMatchInventory {
+    let len = ctrltext_len.unwrap_or(0);
+    let size_class = classify_ctrltext_size_class(len, None);
+    let tag_norm: String = tag_hint
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .collect();
+
+    let mk = |kind: MaterialResidualMatchKind,
+              size_class: CtrltextSizeClass,
+              detail: &str|
+     -> MaterialResidualMatchInventory {
+        MaterialResidualMatchInventory {
+            kind,
+            size_class,
+            residual_matched_claim: false,
+            research_only: true,
+            unlock_justification_alone: false,
+            product_known_good: false,
+            detail: detail.into(),
+        }
+    };
+
+    if tag_norm.contains("load_accepted")
+        || tag_norm.contains("residual_matched")
+        || tag_norm == "load_accepted_criteria"
+    {
+        return mk(
+            MaterialResidualMatchKind::LoadAcceptedCriteria,
+            size_class,
+            "criteria_only_requires_live_ert_ofm",
+        );
+    }
+    if tag_norm.contains("flexml")
+        || tag_norm.contains("spent_flexml")
+        || tag_norm.contains("2x4x4_class")
+    {
+        return mk(
+            MaterialResidualMatchKind::FlexmlSpentResearch,
+            size_class,
+            "flexml_spent_research_not_residual_match",
+        );
+    }
+    if tag_norm.contains("public_npu2")
+        || tag_norm.contains("mlir_aie")
+        || tag_norm.contains("iron_aot")
+    {
+        let sc = if len == 0 {
+            CtrltextSizeClass::SmallPublicNpu2
+        } else {
+            size_class
+        };
+        return mk(
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly,
+            sc,
+            "public_npu2_small_research_only",
+        );
+    }
+    if tag_norm.contains("mladf_classic")
+        || tag_norm.contains("lab_classic")
+        || tag_norm.contains("classic_1688")
+    {
+        return mk(
+            MaterialResidualMatchKind::LabClassicMladfOracle,
+            CtrltextSizeClass::MladfClassic1688,
+            "lab_classic_oracle_not_product_known_good",
+        );
+    }
+
+    match size_class {
+        CtrltextSizeClass::Empty => mk(
+            MaterialResidualMatchKind::Unknown,
+            size_class,
+            "empty_or_absent_material",
+        ),
+        CtrltextSizeClass::MladfClassic1688 => mk(
+            MaterialResidualMatchKind::LabClassicMladfOracle,
+            size_class,
+            "lab_classic_1688_length",
+        ),
+        CtrltextSizeClass::SmallPublicNpu2 => mk(
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly,
+            size_class,
+            "public_npu2_small_length",
+        ),
+        CtrltextSizeClass::Other => mk(
+            MaterialResidualMatchKind::Unknown,
+            size_class,
+            "other_size_not_residual_match_claim",
+        ),
+    }
+}
+
+/// Soft material residual-match inventory note — always honesty.
+#[must_use]
+pub fn format_material_residual_match_note(r: &MaterialResidualMatchInventory) -> String {
+    let mut parts = vec![
+        MATERIAL_RESIDUAL_MATCH_NOTE.into(),
+        format!("kind={}", r.kind.as_str()),
+        format!("size_class={}", r.size_class.as_str()),
+        format!(
+            "residual_matched_claim={}",
+            u8::from(r.residual_matched_claim)
+        ),
+        format!("research_only={}", u8::from(r.research_only)),
+        format!(
+            "unlock_justification_alone={}",
+            u8::from(r.unlock_justification_alone)
+        ),
+        format!("product_known_good={}", u8::from(r.product_known_good)),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "inventory_alone_not_pass=1".into(),
+        "public_aot_neq_residual_identity=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// SSoT checklist: what counts as load-accepted / residual-matched vs research-only.
+///
+/// Always research/offline honesty. Present public-npu2-small files under
+/// `testdata/xdna2_cmd/external_known_good/` remain research-only.
+#[must_use]
+pub fn format_material_residual_match_checklist() -> String {
+    [
+        "material_residual_match_checklist=1",
+        "load_accepted_requires_live_ert_completed=1",
+        "load_accepted_requires_ofm_nonzero_allclose=1",
+        "load_accepted_requires_real_ioctl=1",
+        "load_accepted_requires_decide_ran_on_npu=1",
+        "public_npu2_small_research_only=1",
+        "public_aot_neq_residual_identity=1",
+        "public_aot_neq_unlock_alone=1",
+        "public_aot_neq_product_pass=1",
+        "lab_classic_1688_oracle_neq_product_known_good=1",
+        "flexml_spent_relive_neq_progress=1",
+        "size_class_alone_neq_residual_match=1",
+        "iron_npu2_vector_add_neq_classic_1688=1",
+        "public_300_kind_match_neq_1688_load_accepted=1",
+        "invent_pass=0",
+        "not_c_ready=1",
+        "not_ran_on_npu=1",
+        "product_known_good=0",
+        "product_pass_requires_live_decide=1",
+        "offline_inventory_only=1",
+    ]
+    .join(" ")
+}
+
+/// Named Pass-identity job. Classic 1688 stays frozen and separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobResidualIdentity {
+    /// IRON npu2 `vector_scalar_add` wrap job. Not classic 1688. Not product Pass.
+    IronNpu2VectorAdd,
+    /// Lab staged classic mladf 1688. Frozen residual identity for the lab matmul job.
+    MladfClassic1688,
+    /// Unspecified / other job.
+    Unknown,
+}
+
+impl JobResidualIdentity {
+    /// Stable token for soft notes / tests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IronNpu2VectorAdd => "iron_npu2_vector_add",
+            Self::MladfClassic1688 => "mladf_classic_1688",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Soft note header for job-scoped residual match.
+pub const JOB_RESIDUAL_MATCH_NOTE: &str = "job_residual_match_inventory";
+
+/// Classify a job name into a residual identity (pure).
+#[must_use]
+pub fn classify_job_residual_identity(job: &str) -> JobResidualIdentity {
+    let t = job.trim();
+    if crate::backends::iron_kernel::is_iron_npu2_vector_add_job_name(t) {
+        return JobResidualIdentity::IronNpu2VectorAdd;
+    }
+    if t.eq_ignore_ascii_case(crate::backends::iron_kernel::MLADF_CLASSIC_1688_JOB)
+        || t.eq_ignore_ascii_case("mladf-classic-1688")
+        || t.eq_ignore_ascii_case("lab_classic")
+    {
+        return JobResidualIdentity::MladfClassic1688;
+    }
+    JobResidualIdentity::Unknown
+}
+
+/// Job-scoped residual-match inventory. Offline `residual_matched_claim` is always false.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research honesty flags; always invent_pass=0
+pub struct JobResidualMatchInventory {
+    /// Named job identity.
+    pub identity: JobResidualIdentity,
+    /// Length/tag material classify (may be remapped for the IRON job).
+    pub material: MaterialResidualMatchInventory,
+    /// True when public-npu2-small bytes are the right *kind* for this job.
+    pub kind_match_for_job: bool,
+    /// True when this job must never claim classic 1688 residual match.
+    pub classic_1688_claim_refused: bool,
+}
+
+/// Classify residual match in the context of a named job (pure).
+///
+/// `iron_npu2_vector_add` + public small peel (300 B band) is a kind-match for
+/// **that** job only. It is never classic 1688 load-accepted.
+/// Classic 1688 helpers stay the frozen oracle (`residual_matched_claim` still 0).
+#[must_use]
+pub fn classify_material_residual_match_for_job(
+    job: &str,
+    ctrltext_len: Option<usize>,
+    tag_hint: Option<&str>,
+) -> JobResidualMatchInventory {
+    let identity = classify_job_residual_identity(job);
+    let mut material = classify_material_residual_match(ctrltext_len, tag_hint);
+    material.residual_matched_claim = false;
+    match identity {
+        JobResidualIdentity::IronNpu2VectorAdd => {
+            let classic_len = material.size_class == CtrltextSizeClass::MladfClassic1688
+                || ctrltext_len == Some(1688);
+            // Kind-match is exact 300 B (public vector-add peel). 660 is another
+            // public-small size and must not kind-match this job.
+            if ctrltext_len == Some(300) && !classic_len {
+                material.kind = MaterialResidualMatchKind::IronNpu2VectorAddKindMatch;
+                material.detail = "iron_npu2_vector_add_kind_match".into();
+                JobResidualMatchInventory {
+                    identity,
+                    material,
+                    kind_match_for_job: true,
+                    classic_1688_claim_refused: true,
+                }
+            } else {
+                // 1688 (or other) bytes under the IRON job are not a classic match.
+                if classic_len {
+                    material.kind = MaterialResidualMatchKind::Unknown;
+                    material.detail = "iron_job_neq_classic_1688_length".into();
+                }
+                JobResidualMatchInventory {
+                    identity,
+                    material,
+                    kind_match_for_job: false,
+                    classic_1688_claim_refused: true,
+                }
+            }
+        }
+        JobResidualIdentity::MladfClassic1688 | JobResidualIdentity::Unknown => {
+            JobResidualMatchInventory {
+                identity,
+                material,
+                kind_match_for_job: false,
+                classic_1688_claim_refused: false,
+            }
+        }
+    }
+}
+
+/// Soft job residual-match note. Honesty tokens are hard-coded (never invent Pass).
+#[must_use]
+pub fn format_job_residual_match_note(r: &JobResidualMatchInventory) -> String {
+    let _ = r.material.residual_matched_claim;
+    let mut parts = vec![
+        JOB_RESIDUAL_MATCH_NOTE.to_string(),
+        format!("job={}", r.identity.as_str()),
+        format!("identity={}", r.identity.as_str()),
+        format!("kind={}", r.material.kind.as_str()),
+        format!("size_class={}", r.material.size_class.as_str()),
+        format!("kind_match_for_job={}", u8::from(r.kind_match_for_job)),
+        format!(
+            "classic_1688_claim_refused={}",
+            u8::from(r.classic_1688_claim_refused)
+        ),
+        "residual_matched_claim=0".into(),
+        "invent_pass=0".into(),
+        "not_ran_on_npu=1".into(),
+        "not_c_ready=1".into(),
+    ];
+    if r.identity == JobResidualIdentity::IronNpu2VectorAdd {
+        parts.push("iron_job_neq_classic_1688=1".into());
+        parts.push("public_aot_neq_1688_load_accepted=1".into());
+    }
+    parts.push("product_known_good=0".into());
+    parts.push("research_only=1".into());
+    parts.push("inventory_alone_not_pass=1".into());
+    parts.push("product_pass_requires_live_decide=1".into());
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// W4a T3 — last_apply richer tokens (wait_path / syncobj / ert / debug_bo)
+// ---------------------------------------------------------------------------
+//
+// Pure offline parsers for structured detail tokens present on recent live
+// last_apply shapes (skip-CU, L5/L5b debug-BO, CREATE_HWCTX syncobj). Soft
+// notes always invent_pass=0 not_c_ready=1 not_ran_on_npu=1. Does **not** invent
+// live status when tokens are absent.
+
+/// Soft bag name for [`LastApplyRichTokens::format_soft_note`].
+pub const LAST_APPLY_RICH_TOKENS_NOTE: &str = "last_apply_rich_tokens";
+
+/// Structured last_apply richness tokens (research / offline classify only).
+///
+/// Surfaces `wait_path=`, `syncobj=`, `ert_state=`, and debug-BO fields when
+/// present in detail. **Never** invents Pass / C-ready / `ran_on_npu`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct LastApplyRichTokens {
+    /// `wait_path=wait_cmd|syncobj_timeline|…` when present (not inferred).
+    pub wait_path: Option<String>,
+    /// First `syncobj=` / `syncobj_handle=` when present.
+    pub syncobj: Option<u32>,
+    /// First `ert_state=N` when present.
+    pub ert_state: Option<u32>,
+    /// ERT Error signal (name or numeric 5) from first `ert_state=`.
+    pub ert_error: bool,
+    /// True when any debug-BO research token is present.
+    pub debug_bo_present: bool,
+    /// `attempt_ok=0|1` near `debug_bo_config` when present.
+    pub debug_bo_attempt_ok: Option<bool>,
+    /// `debug_bo_size=N` when present.
+    pub debug_bo_size: Option<u32>,
+    /// `debug_bo_ty=` token when present (`dev` / `shmem` / …).
+    pub debug_bo_ty: Option<String>,
+    /// `op=` on the `debug_bo_config` region (`assign` / `remove`) when present.
+    pub debug_bo_op: Option<String>,
+    /// `bo_handle=` near debug-BO region when present.
+    pub debug_bo_handle: Option<u32>,
+    /// `gate_open=0|1` near debug-BO region when present.
+    pub debug_bo_gate_open: Option<bool>,
+    /// `path=` on the `debug_bo_config` region (`lab` / …) when present.
+    pub debug_bo_path: Option<String>,
+    /// Optional top-level status echo (not invented).
+    pub status: Option<String>,
+    /// Short research detail token.
+    pub detail: String,
+}
+
+impl LastApplyRichTokens {
+    /// Soft note — always honesty; rich tokens alone ≠ Pass / C-ready / `ran_on_npu`.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_last_apply_rich_tokens_note(self)
+    }
+}
+
+/// Parse optional `0|1` bool token (exact leading digit only).
+#[must_use]
+fn parse_detail_bool01_token(tok: &str) -> Option<bool> {
+    match tok.as_bytes() {
+        [b'1', rest @ ..] if rest.first().is_none_or(|b| !b.is_ascii_digit()) => Some(true),
+        [b'0', rest @ ..] if rest.first().is_none_or(|b| !b.is_ascii_digit()) => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse optional decimal `u32` from a delimited detail token.
+#[must_use]
+fn parse_detail_u32_token(tok: &str) -> Option<u32> {
+    let t = tok.trim();
+    let num_end = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    if num_end == 0 {
+        return None;
+    }
+    t[..num_end].parse::<u32>().ok()
+}
+
+/// Region starting at `debug_bo_config` when present; else empty.
+#[must_use]
+fn detail_debug_bo_region(detail: &str) -> &str {
+    detail.find("debug_bo_config").map_or("", |i| &detail[i..])
+}
+
+/// Filter short identifier-ish tokens (alpha-numeric + `_` / optional `-`).
+#[must_use]
+fn rich_token_ident(tok: &str, max_len: usize, allow_hyphen: bool) -> Option<String> {
+    if tok.is_empty() || tok.len() > max_len {
+        return None;
+    }
+    if tok
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || (allow_hyphen && b == b'-'))
+    {
+        Some(tok.to_string())
+    } else {
+        None
+    }
+}
+
+/// Debug-BO field bag extracted from a last_apply detail string (pure).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DebugBoRichFields {
+    present: bool,
+    attempt_ok: Option<bool>,
+    size: Option<u32>,
+    ty: Option<String>,
+    op: Option<String>,
+    handle: Option<u32>,
+    gate_open: Option<bool>,
+    path: Option<String>,
+}
+
+/// Parse debug-BO research tokens from detail (pure).
+#[must_use]
+fn parse_debug_bo_rich_fields(detail_s: &str) -> DebugBoRichFields {
+    let dbg_region = detail_debug_bo_region(detail_s);
+    let present = !dbg_region.is_empty()
+        || detail_s.contains("debug_bo_size=")
+        || detail_s.contains("debug_bo_ty=")
+        || detail_s.contains("lab_debug_bo_attach=");
+    if !present {
+        return DebugBoRichFields::default();
+    }
+    let dbg_src = if dbg_region.is_empty() {
+        detail_s
+    } else {
+        dbg_region
+    };
+    let attempt_ok = detail_first_token_after(dbg_src, "attempt_ok=")
+        .or_else(|| detail_first_token_after(detail_s, "attempt_ok="))
+        .and_then(parse_detail_bool01_token);
+    let size = detail_first_token_after(detail_s, "debug_bo_size=")
+        .and_then(parse_detail_size_bytes_token);
+    let ty = detail_first_token_after(detail_s, "debug_bo_ty=")
+        .and_then(|t| rich_token_ident(t, 16, false));
+    let op = detail_first_token_after(dbg_src, "op=").and_then(|t| rich_token_ident(t, 16, false));
+    let handle = detail_first_token_after(dbg_src, "bo_handle=")
+        .or_else(|| detail_first_token_after(detail_s, "bo_handle="))
+        .and_then(parse_detail_u32_token);
+    let gate_open = detail_first_token_after(dbg_src, "gate_open=")
+        .or_else(|| detail_first_token_after(detail_s, "gate_open="))
+        .and_then(parse_detail_bool01_token);
+    let path = if dbg_region.is_empty() {
+        None
+    } else {
+        detail_first_token_after(dbg_region, "path=").and_then(|t| rich_token_ident(t, 32, true))
+    };
+    DebugBoRichFields {
+        present: true,
+        attempt_ok,
+        size,
+        ty,
+        op,
+        handle,
+        gate_open,
+        path,
+    }
+}
+
+/// Saturating usize→u32 for soft distance fields (research lengths only).
+#[must_use]
+fn usize_to_u32_sat(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Distance of payload length to lab classic 1688 (saturating u32).
+#[must_use]
+fn distance_to_lab_classic_1688(len: usize) -> u32 {
+    usize_to_u32_sat(len.abs_diff(MATERIAL_EXEC_LAB_CLASSIC_BYTES))
+}
+
+/// Parse last_apply richness tokens from status + detail (pure).
+///
+/// Only surfaces tokens literally present. Empty detail → default with
+/// `detail=no_detail`. Does **not** invent wait path or debug-BO success.
+#[must_use]
+pub fn parse_last_apply_rich_tokens(
+    status: Option<&str>,
+    detail: Option<&str>,
+) -> LastApplyRichTokens {
+    let status_trim = status.map(str::trim).filter(|s| !s.is_empty());
+    let detail_s = detail.unwrap_or("").trim();
+    if detail_s.is_empty() && status_trim.is_none() {
+        return LastApplyRichTokens {
+            detail: "no_detail".into(),
+            ..LastApplyRichTokens::default()
+        };
+    }
+
+    // Reuse ERT parse from existing signals (first ert_state= only).
+    let sig = if detail_s.is_empty() {
+        LastApplyDetailSignals::default()
+    } else {
+        parse_last_apply_detail_signals(detail_s)
+    };
+
+    let wait_path = detail_first_token_after(detail_s, "wait_path=")
+        .map(str::to_string)
+        .filter(|t| !t.is_empty() && t != "absent" && t != "na");
+
+    let syncobj = detail_first_token_after(detail_s, "syncobj=")
+        .or_else(|| detail_first_token_after(detail_s, "syncobj_handle="))
+        .and_then(parse_detail_u32_token);
+
+    let dbg = parse_debug_bo_rich_fields(detail_s);
+
+    let detail_tok = if dbg.present && wait_path.is_some() {
+        "rich_wait_path_and_debug_bo"
+    } else if dbg.present {
+        "rich_debug_bo"
+    } else if wait_path.is_some() || syncobj.is_some() {
+        "rich_wait_or_syncobj"
+    } else if sig.ert_state.is_some() {
+        "rich_ert_only"
+    } else {
+        "rich_partial_or_absent"
+    };
+
+    LastApplyRichTokens {
+        wait_path,
+        syncobj,
+        ert_state: sig.ert_state,
+        ert_error: sig.ert_error,
+        debug_bo_present: dbg.present,
+        debug_bo_attempt_ok: dbg.attempt_ok,
+        debug_bo_size: dbg.size,
+        debug_bo_ty: dbg.ty,
+        debug_bo_op: dbg.op,
+        debug_bo_handle: dbg.handle,
+        debug_bo_gate_open: dbg.gate_open,
+        debug_bo_path: dbg.path,
+        status: status_trim.map(str::to_string),
+        detail: detail_tok.into(),
+    }
+}
+
+/// Soft last_apply rich-tokens note — always honesty; tokens alone ≠ Pass.
+#[must_use]
+pub fn format_last_apply_rich_tokens_note(r: &LastApplyRichTokens) -> String {
+    let mut parts = vec![
+        LAST_APPLY_RICH_TOKENS_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "rich_tokens_alone_not_pass=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+        format!("debug_bo_present={}", u8::from(r.debug_bo_present)),
+        format!("ert_error={}", u8::from(r.ert_error)),
+    ];
+    if let Some(ref s) = r.status {
+        parts.push(format!("status={}", sanitize_soft_note_field_value(s)));
+    } else {
+        parts.push("status=absent".into());
+    }
+    if let Some(ref p) = r.wait_path {
+        parts.push(format!("wait_path={}", sanitize_soft_note_field_value(p)));
+    } else {
+        parts.push("wait_path=absent".into());
+    }
+    if let Some(n) = r.syncobj {
+        parts.push(format!("syncobj={n}"));
+    } else {
+        parts.push("syncobj=absent".into());
+    }
+    if let Some(e) = r.ert_state {
+        parts.push(format!("ert_state={e}"));
+    } else {
+        parts.push("ert_state=absent".into());
+    }
+    if let Some(ok) = r.debug_bo_attempt_ok {
+        parts.push(format!("debug_bo_attempt_ok={}", u8::from(ok)));
+    } else {
+        parts.push("debug_bo_attempt_ok=absent".into());
+    }
+    if let Some(n) = r.debug_bo_size {
+        parts.push(format!("debug_bo_size={n}"));
+    } else {
+        parts.push("debug_bo_size=absent".into());
+    }
+    if let Some(ref ty) = r.debug_bo_ty {
+        parts.push(format!(
+            "debug_bo_ty={}",
+            sanitize_soft_note_field_value(ty)
+        ));
+    } else {
+        parts.push("debug_bo_ty=absent".into());
+    }
+    if let Some(ref op) = r.debug_bo_op {
+        parts.push(format!(
+            "debug_bo_op={}",
+            sanitize_soft_note_field_value(op)
+        ));
+    } else {
+        parts.push("debug_bo_op=absent".into());
+    }
+    if let Some(h) = r.debug_bo_handle {
+        parts.push(format!("debug_bo_handle={h}"));
+    } else {
+        parts.push("debug_bo_handle=absent".into());
+    }
+    if let Some(g) = r.debug_bo_gate_open {
+        parts.push(format!("debug_bo_gate_open={}", u8::from(g)));
+    } else {
+        parts.push("debug_bo_gate_open=absent".into());
+    }
+    if let Some(ref p) = r.debug_bo_path {
+        parts.push(format!(
+            "debug_bo_path={}",
+            sanitize_soft_note_field_value(p)
+        ));
+    } else {
+        parts.push("debug_bo_path=absent".into());
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// W4a T6 — Material EXEC readiness scorecard (pure offline)
+// ---------------------------------------------------------------------------
+//
+// Scores present instruction material for classic walk / size class / distance
+// to lab classic 1688. Always residual_matched_claim=0 invent_pass=0.
+// Scorecard alone ≠ Pass / unlock / residual identity.
+
+/// Soft bag name for [`MaterialExecReadinessScorecard::format_soft_note`].
+pub const MATERIAL_EXEC_READINESS_NOTE: &str = "material_exec_readiness_scorecard";
+
+/// Lab classic START_NPU ctrltext length (staged mladf 1688 B oracle).
+pub const MATERIAL_EXEC_LAB_CLASSIC_BYTES: usize = super::txn::STAGED_MLADF_CLASSIC_INSTR_BYTES;
+
+/// Pure material EXEC readiness scorecard (research only).
+///
+/// **Always** `residual_matched_claim=false` — offline size/walk never claims
+/// residual match or product Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct MaterialExecReadinessScorecard {
+    /// Payload byte length after ELF peel (or raw input).
+    pub blob_len: usize,
+    /// Classic txn v0.1 walk OK on payload.
+    pub classic_walk_ok: bool,
+    /// Header `num_ops` when classic or header-only; else None.
+    pub op_count: Option<u32>,
+    /// Absolute distance of payload length to lab classic 1688.
+    pub distance_to_1688: u32,
+    /// Size class label ([`classify_ctrltext_size_class`]).
+    pub size_class: CtrltextSizeClass,
+    /// `.rela.dyn` count when input was aiebu ELF and parse succeeded.
+    pub rela_count: Option<usize>,
+    /// **Always false** from this scorecard (locked).
+    pub residual_matched_claim: bool,
+    /// True when empty input refused (no scoreable material).
+    pub empty_refused: bool,
+    /// True when a path was refused (confinement / missing).
+    pub path_refused: bool,
+    /// Input was aiebu ELF (rela may be known).
+    pub input_was_elf: bool,
+    /// Blob kind token from payload profile.
+    pub blob_kind: String,
+    /// Research detail token.
+    pub detail: String,
+}
+
+impl MaterialExecReadinessScorecard {
+    /// Soft note — always honesty + locked residual_matched_claim=0.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_material_exec_readiness_note(self)
+    }
+}
+
+/// Empty / refused material scorecard scaffold (residual_matched_claim locked 0).
+#[must_use]
+fn material_exec_empty_scaffold(
+    detail: &str,
+    blob_kind: &str,
+    path_refused: bool,
+) -> MaterialExecReadinessScorecard {
+    MaterialExecReadinessScorecard {
+        blob_len: 0,
+        classic_walk_ok: false,
+        op_count: None,
+        distance_to_1688: usize_to_u32_sat(MATERIAL_EXEC_LAB_CLASSIC_BYTES),
+        size_class: CtrltextSizeClass::Empty,
+        rela_count: None,
+        residual_matched_claim: false,
+        empty_refused: true,
+        path_refused,
+        input_was_elf: false,
+        blob_kind: blob_kind.into(),
+        detail: detail.into(),
+    }
+}
+
+/// Score raw instruction / ctrltext / aiebu-ELF bytes for EXEC readiness (pure).
+///
+/// - Empty → `empty_refused=true`, distance_to_1688=1688, residual_matched_claim=0
+/// - aiebu ELF → peel `.ctrltext`, optional rela_count
+/// - Always residual_matched_claim=0 invent_pass=0 (soft note)
+#[must_use]
+pub fn score_material_exec_readiness(bytes: &[u8]) -> MaterialExecReadinessScorecard {
+    if bytes.is_empty() {
+        return material_exec_empty_scaffold("empty_refused", "empty", false);
+    }
+
+    let input_was_elf = is_aiebu_elf_ctrltext(bytes);
+    let rela_count = if input_was_elf {
+        parse_elf32_rela_dyn(bytes).ok().map(|r| r.len())
+    } else {
+        None
+    };
+
+    let payload: Vec<u8> = if input_was_elf {
+        match super::txn::instruction_payload_bytes(bytes) {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => {
+                let mut sc = material_exec_empty_scaffold(
+                    "elf_peel_empty_refused",
+                    "elf_empty_ctrltext",
+                    false,
+                );
+                sc.rela_count = rela_count;
+                sc.input_was_elf = true;
+                return sc;
+            }
+            Err(_) => {
+                return MaterialExecReadinessScorecard {
+                    blob_len: bytes.len(),
+                    classic_walk_ok: false,
+                    op_count: None,
+                    distance_to_1688: distance_to_lab_classic_1688(bytes.len()),
+                    size_class: classify_ctrltext_size_class(bytes.len(), None),
+                    rela_count,
+                    residual_matched_claim: false,
+                    empty_refused: false,
+                    path_refused: false,
+                    input_was_elf: true,
+                    blob_kind: "elf_peel_failed".into(),
+                    detail: "elf_peel_failed".into(),
+                };
+            }
+        }
+    } else {
+        bytes.to_vec()
+    };
+
+    let profile = profile_instr_payload_bytes(&payload);
+    let size_class = classify_ctrltext_size_class(payload.len(), Some(&profile));
+    let distance_to_1688 = distance_to_lab_classic_1688(payload.len());
+
+    let detail = if profile.staged_mladf_classic_profile && profile.classic_walk_ok {
+        "lab_classic_1688_shaped"
+    } else if size_class == CtrltextSizeClass::Other && profile.classic_walk_ok {
+        "other_size_classic_walk_ok"
+    } else if size_class == CtrltextSizeClass::SmallPublicNpu2 {
+        "small_public_npu2_research"
+    } else if profile.classic_walk_ok {
+        "classic_walk_ok_not_lab_oracle"
+    } else if size_class == CtrltextSizeClass::Other {
+        "other_size_walk_fail_or_nonclassic"
+    } else {
+        "material_scored_partial"
+    };
+
+    MaterialExecReadinessScorecard {
+        blob_len: payload.len(),
+        classic_walk_ok: profile.classic_walk_ok,
+        op_count: profile.txn_num_ops,
+        distance_to_1688,
+        size_class,
+        rela_count,
+        residual_matched_claim: false,
+        empty_refused: false,
+        path_refused: false,
+        input_was_elf,
+        blob_kind: profile.blob_kind,
+        detail: detail.into(),
+    }
+}
+
+/// Whether a path is allowed for material EXEC readiness load (confined).
+///
+/// Allowed under [`external_known_good_lab_root`] / IRON roots via
+/// [`iron_artifact_path_is_allowed`], or under `testdata/xdna2_cmd/` lab fixtures
+/// (for classic 1688 offline score). Refuse `..` / empty / local post-patch oracle.
+#[must_use]
+pub fn material_exec_readiness_path_is_allowed(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if is_refused_local_post_patch_as_known_good(path) {
+        return false;
+    }
+    if iron_artifact_path_is_allowed(path) {
+        return true;
+    }
+    if external_known_good_path_is_allowed(path) {
+        return true;
+    }
+    // Lab fixture root: testdata/xdna2_cmd/{lab_instr.bin,.elf,...}
+    let lab_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd");
+    let Ok(canon_lab) = std::fs::canonicalize(&lab_root) else {
+        return false;
+    };
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent
+        && let Ok(cp) = std::fs::canonicalize(parent)
+    {
+        let candidate = cp.join(path.file_name().unwrap_or_default());
+        if is_refused_local_post_patch_as_known_good(&candidate) {
+            return false;
+        }
+        return candidate.starts_with(&canon_lab) || cp.starts_with(&canon_lab);
+    }
+    // Relative path under lab root when parent not yet materialised.
+    path.starts_with("testdata/xdna2_cmd") || path.starts_with(&lab_root)
+}
+
+/// Score material at a confined path (pure I/O + classify; no NPU).
+///
+/// Path refuse → `path_refused=true` residual_matched_claim=0. Missing file →
+/// empty_refused. Never invents residual match.
+#[must_use]
+pub fn score_material_exec_readiness_from_path(
+    path: &std::path::Path,
+) -> MaterialExecReadinessScorecard {
+    if !material_exec_readiness_path_is_allowed(path) {
+        return material_exec_empty_scaffold("path_not_allowed", "path_refused", true);
+    }
+    let Ok(data) = std::fs::read(path) else {
+        return material_exec_empty_scaffold("path_read_failed_or_missing", "missing", false);
+    };
+    score_material_exec_readiness(&data)
+}
+
+/// Soft material EXEC readiness note — always honesty; scorecard alone ≠ Pass.
+#[must_use]
+pub fn format_material_exec_readiness_note(r: &MaterialExecReadinessScorecard) -> String {
+    let mut parts = vec![
+        MATERIAL_EXEC_READINESS_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "product_known_good=0".into(),
+        "scorecard_alone_not_pass=1".into(),
+        // Locked residual_matched_claim=0 — never emit =1 from this surface.
+        "residual_matched_claim=0".into(),
+        "product_pass_requires_live_decide=1".into(),
+        format!("classic_walk_ok={}", u8::from(r.classic_walk_ok)),
+        format!("distance_to_1688={}", r.distance_to_1688),
+        format!("size_class={}", r.size_class.as_str()),
+        format!("blob_len={}", r.blob_len),
+        format!("empty_refused={}", u8::from(r.empty_refused)),
+        format!("path_refused={}", u8::from(r.path_refused)),
+        format!("input_was_elf={}", u8::from(r.input_was_elf)),
+    ];
+    // Struct field is always false from constructors; assert soft lock without
+    // depending on a mutable claim bit.
+    let _ = r.residual_matched_claim;
+    if let Some(n) = r.op_count {
+        parts.push(format!("op_count={n}"));
+    } else {
+        parts.push("op_count=absent".into());
+    }
+    if let Some(n) = r.rela_count {
+        parts.push(format!("rela_count={n}"));
+    } else {
+        parts.push("rela_count=absent".into());
+    }
+    if !r.blob_kind.is_empty() {
+        parts.push(format!(
+            "blob_kind={}",
+            sanitize_soft_note_field_value(&r.blob_kind)
+        ));
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// Soft one-liner per scoreable bin under the external known-good capture dir.
+///
+/// Scans `*.ctrltext.bin`, `working_stack_ctrltext.bin`, and `*.insts.bin`.
+/// Empty bag → single blocked line. Always invent_pass=0 per line.
+#[must_use]
+pub fn format_material_exec_readiness_bag_soft_lines() -> String {
+    let root = external_known_good_lab_root();
+    let mut lines: Vec<String> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return format!(
+            "{MATERIAL_EXEC_READINESS_NOTE} bag_scan=1 blocked_on_external_bytes=1 invent_pass=0 not_c_ready=1 not_ran_on_npu=1 residual_matched_claim=0 detail=bag_root_unreadable"
+        );
+    };
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".ctrltext.bin")
+            || lower == "working_stack_ctrltext.bin"
+            || lower.ends_with(".insts.bin")
+        {
+            if is_refused_local_post_patch_as_known_good(&p) {
+                continue;
+            }
+            paths.push(p);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return format!(
+            "{MATERIAL_EXEC_READINESS_NOTE} bag_scan=1 blocked_on_external_bytes=1 invent_pass=0 not_c_ready=1 not_ran_on_npu=1 residual_matched_claim=0 detail=bag_empty_no_ctrltext_bins"
+        );
+    }
+    for p in paths {
+        let name = p
+            .file_name()
+            .map_or_else(|| "unknown".into(), |n| n.to_string_lossy().to_string());
+        let sc = score_material_exec_readiness_from_path(&p);
+        let core = format_material_exec_readiness_note(&sc);
+        lines.push(format!(
+            "{core} bag_file={}",
+            sanitize_soft_note_field_value(&name)
+        ));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Pass-unblock offline P1: C4 IRON ingest + C5 PDI geometry vs spent flexml
+// ---------------------------------------------------------------------------
+//
+// Pure research only. Soft notes always invent_pass=0 not_c_ready=1 not_ran_on_npu=1.
+// Empty capture still blocked. Spent flexml re-match ≠ new unlock alone.
+// Plan: pass-unblock sequence P1 (C4+C5). Never invent Pass / capture bytes.
+
+/// Soft bag name for C4 IRON / public artifact ingest classify.
+pub const C4_IRON_INGEST_NOTE: &str = "c4_iron_artifact_ingest";
+
+/// Soft bag name for C5 PDI geometry vs spent flexml compare.
+pub const C5_PDI_GEOMETRY_NOTE: &str = "c5_pdi_geometry_vs_spent_flexml";
+
+/// Soft bag name for C6 debug-BO uAPI prep (research/offline; never Pass).
+pub const C6_DEBUG_BO_PREP_NOTE: &str = "c6_debug_bo_uapi_prep";
+
+/// Spent flexml STX `unified-2x4x4` PDI size (live under `2ae69036`, CONSUMED).
+///
+/// Re-match of this geometry alone is **not** a new unlock reason.
+pub const SPENT_FLEXML_UNIFIED_2X4X4_BYTES: u64 = 27_200;
+
+/// Spent flexml STX `unified-2x4x4` sha256 prefix16 (live under `2ae69036`).
+pub const SPENT_FLEXML_UNIFIED_2X4X4_SHA16: &str = "0eeeb70c84df056e";
+
+/// Allowed IRON / public research artifact extensions (case-insensitive).
+///
+/// Broader than external-known-good **compare** bag (`.bin`/`.ctrltext` only):
+/// IRON/mlir-aie dumps may land as `.elf` / `.pdi` under the same roots.
+const IRON_ARTIFACT_EXTENSIONS: &[&str] = &["bin", "ctrltext", "elf", "pdi"];
+
+/// Research kind guess for C4 IRON ingest (not product known-good).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IronArtifactKind {
+    /// No bytes (empty capture / absent drop).
+    #[default]
+    Absent,
+    /// Raw ctrltext / classic txn-ish `.bin`/`.ctrltext`.
+    CtrltextBin,
+    /// ELF magic (`0x7fELF`) — often aiebu ctrltext container.
+    AiebuElf,
+    /// Opaque PDI-ish blob (size class or `.pdi` extension).
+    PdiOpaque,
+    /// Bytes present but no strong kind signal.
+    UnknownOpaque,
+    /// Local post-patch oracle basename refused as known-good.
+    RefusedLocalOracle,
+    /// Path fails confinement / extension allowlist.
+    PathNotAllowed,
+}
+
+impl IronArtifactKind {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::CtrltextBin => "ctrltext_bin",
+            Self::AiebuElf => "aiebu_elf",
+            Self::PdiOpaque => "pdi_opaque",
+            Self::UnknownOpaque => "unknown_opaque",
+            Self::RefusedLocalOracle => "refused_local_oracle",
+            Self::PathNotAllowed => "path_not_allowed",
+        }
+    }
+}
+
+/// C4 pure IRON / public artifact ingest classify result.
+///
+/// Empty still blocked. Present file classifies with honesty. **Never** product
+/// known-good / Pass / C-ready from ingest alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // research flag bag; honesty-first
+pub struct IronArtifactIngestClassify {
+    /// Path under allowed roots + IRON extension (when path supplied).
+    pub path_allowed: bool,
+    /// True when bytes empty/absent (capture still blocked).
+    pub blocked_on_empty: bool,
+    /// Non-empty payload present for classify.
+    pub bytes_present: bool,
+    /// Payload length when present.
+    pub len_bytes: Option<u64>,
+    /// sha256 prefix16 when bytes present; empty otherwise.
+    pub sha256_prefix16: String,
+    /// Kind guess (ELF magic / size class / extension / refuse).
+    pub kind: IronArtifactKind,
+    /// Always `false` — ingest ≠ product known-good.
+    pub product_known_good: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for IronArtifactIngestClassify {
+    fn default() -> Self {
+        Self {
+            path_allowed: false,
+            blocked_on_empty: true,
+            bytes_present: false,
+            len_bytes: None,
+            sha256_prefix16: String::new(),
+            kind: IronArtifactKind::Absent,
+            product_known_good: false,
+            detail: "blocked_empty".into(),
+        }
+    }
+}
+
+impl IronArtifactIngestClassify {
+    /// Soft note alias.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_c4_iron_ingest_note(self)
+    }
+}
+
+/// True when the final path component has an allowed IRON research extension.
+///
+/// Allowed: `.bin`, `.ctrltext`, `.elf`, `.pdi` (case-insensitive).
+#[must_use]
+pub fn iron_artifact_extension_ok(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        let e = ext.to_string_lossy();
+        IRON_ARTIFACT_EXTENSIONS
+            .iter()
+            .any(|a| e.eq_ignore_ascii_case(a))
+    })
+}
+
+/// Whether an IRON / public research artifact **path** is allowed.
+///
+/// **Confinement** (same roots as external known-good bag):
+/// - Under [`last_apply_temp_root`] **or** [`external_known_good_lab_root`]
+/// - Extension via [`iron_artifact_extension_ok`]
+/// - No `..` components
+/// - Refuse local post-patch oracle basenames
+/// - Resolve intermediate dir symlinks via `canonicalize(parent)` before root check
+///
+/// Does **not** open the file. Does **not** claim product known-good.
+#[must_use]
+pub fn iron_artifact_path_is_allowed(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if !iron_artifact_extension_ok(path) {
+        return false;
+    }
+    if is_refused_local_post_patch_as_known_good(path) {
+        return false;
+    }
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return path_under_external_known_good_roots(path);
+    };
+    if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+        let candidate = canon_parent.join(path.file_name().unwrap_or_default());
+        if is_refused_local_post_patch_as_known_good(&candidate) {
+            return false;
+        }
+        path_under_external_known_good_roots(&candidate)
+    } else if path.is_absolute() {
+        false
+    } else {
+        path_under_external_known_good_roots(path)
+    }
+}
+
+/// Guess research kind from optional path extension + payload bytes (pure).
+#[must_use]
+pub fn guess_iron_artifact_kind(
+    path: Option<&std::path::Path>,
+    data: Option<&[u8]>,
+) -> IronArtifactKind {
+    if path.is_some_and(is_refused_local_post_patch_as_known_good) {
+        return IronArtifactKind::RefusedLocalOracle;
+    }
+    let bytes = data.unwrap_or(&[]);
+    if bytes.is_empty() {
+        return IronArtifactKind::Absent;
+    }
+    // ELF magic → aiebu/ELF research image.
+    if bytes.len() >= 4 && bytes[0..4] == [0x7f, b'E', b'L', b'F'] {
+        return IronArtifactKind::AiebuElf;
+    }
+    let ext = path
+        .and_then(|p| p.extension())
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if ext.as_deref() == Some("pdi")
+        || bytes.len() as u64 == SPENT_FLEXML_UNIFIED_2X4X4_BYTES
+        || bytes.len() as u64 == RESEARCH_PDI_DEFAULT_DUMP_BYTES
+    {
+        return IronArtifactKind::PdiOpaque;
+    }
+    if matches!(ext.as_deref(), Some("ctrltext" | "bin")) {
+        // Classic txn header size is 24B; accept as ctrltext research class.
+        return IronArtifactKind::CtrltextBin;
+    }
+    if ext.as_deref() == Some("elf") {
+        // Extension says ELF but magic missing → unknown opaque (corrupt?).
+        return IronArtifactKind::UnknownOpaque;
+    }
+    IronArtifactKind::UnknownOpaque
+}
+
+/// Pure C4 classify: path allow + empty block + kind/size/sha when bytes present.
+///
+/// Soft only. Always `product_known_good=false`. Empty capture →
+/// `blocked_on_empty=true`. Never invents Pass / C-ready.
+#[must_use]
+pub fn classify_iron_artifact_ingest(
+    path: Option<&std::path::Path>,
+    data: Option<&[u8]>,
+) -> IronArtifactIngestClassify {
+    let path_allowed = path.is_some_and(iron_artifact_path_is_allowed);
+    let refused = path.is_some_and(is_refused_local_post_patch_as_known_good);
+    let bytes = data.unwrap_or(&[]);
+    let empty = bytes.is_empty();
+
+    if refused {
+        return IronArtifactIngestClassify {
+            path_allowed: false,
+            blocked_on_empty: empty,
+            bytes_present: !empty,
+            len_bytes: if empty {
+                None
+            } else {
+                Some(bytes.len() as u64)
+            },
+            sha256_prefix16: if empty {
+                String::new()
+            } else {
+                fingerprint_pdi_blob_bytes(bytes).sha256_prefix16
+            },
+            kind: IronArtifactKind::RefusedLocalOracle,
+            product_known_good: false,
+            detail: "refused_local_oracle".into(),
+        };
+    }
+
+    if let Some(p) = path {
+        if !path_allowed && !empty {
+            // Path present but not allowed — still fingerprint bytes for research.
+            let fp = fingerprint_pdi_blob_bytes(bytes);
+            return IronArtifactIngestClassify {
+                path_allowed: false,
+                blocked_on_empty: false,
+                bytes_present: true,
+                len_bytes: Some(fp.len_bytes),
+                sha256_prefix16: fp.sha256_prefix16,
+                kind: IronArtifactKind::PathNotAllowed,
+                product_known_good: false,
+                detail: "path_not_allowed".into(),
+            };
+        }
+        if !path_allowed && empty {
+            return IronArtifactIngestClassify {
+                path_allowed: false,
+                blocked_on_empty: true,
+                bytes_present: false,
+                len_bytes: None,
+                sha256_prefix16: String::new(),
+                kind: if p.as_os_str().is_empty() {
+                    IronArtifactKind::Absent
+                } else {
+                    IronArtifactKind::PathNotAllowed
+                },
+                product_known_good: false,
+                detail: "path_not_allowed_empty".into(),
+            };
+        }
+    }
+
+    if empty {
+        return IronArtifactIngestClassify {
+            path_allowed: path.is_none_or(|_| path_allowed),
+            blocked_on_empty: true,
+            bytes_present: false,
+            len_bytes: None,
+            sha256_prefix16: String::new(),
+            kind: IronArtifactKind::Absent,
+            product_known_good: false,
+            detail: "blocked_empty".into(),
+        };
+    }
+
+    let fp = fingerprint_pdi_blob_bytes(bytes);
+    let kind = guess_iron_artifact_kind(path, Some(bytes));
+    IronArtifactIngestClassify {
+        path_allowed: path.is_none() || path_allowed,
+        blocked_on_empty: false,
+        bytes_present: true,
+        len_bytes: Some(fp.len_bytes),
+        sha256_prefix16: fp.sha256_prefix16,
+        kind,
+        product_known_good: false,
+        detail: format!("classified_{}", kind.as_str()),
+    }
+}
+
+/// Soft C4 IRON ingest note — always honesty; empty blocked; ingest alone ≠ Pass.
+#[must_use]
+pub fn format_c4_iron_ingest_note(c: &IronArtifactIngestClassify) -> String {
+    let mut parts = vec![
+        C4_IRON_INGEST_NOTE.into(),
+        format!("path_allowed={}", u8::from(c.path_allowed)),
+        format!("blocked_on_empty={}", u8::from(c.blocked_on_empty)),
+        format!("bytes_present={}", u8::from(c.bytes_present)),
+        format!("kind={}", c.kind.as_str()),
+        "product_known_good=0".into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "iron_ingest_alone_not_pass=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    match c.len_bytes {
+        Some(n) => parts.push(format!("len={n}")),
+        None => parts.push("len=absent".into()),
+    }
+    if c.sha256_prefix16.is_empty() {
+        parts.push("sha16=absent".into());
+    } else {
+        parts.push(format!(
+            "sha16={}",
+            sanitize_soft_note_field_value(&c.sha256_prefix16)
+        ));
+    }
+    if !c.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&c.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// C5 compare outcome vs spent flexml `unified-2x4x4` fingerprints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PdiGeometryVsSpent {
+    /// No bytes to compare.
+    #[default]
+    Empty,
+    /// Len + sha16 match spent flexml default (already measured under CONSUMED unlock).
+    MatchSpent,
+    /// Same size class as spent flexml, different sha16.
+    SizeMatchShaDiff,
+    /// Different size and/or sha vs spent.
+    Diff,
+    /// Incomplete fingerprint (e.g. size-only without sha).
+    Unknown,
+}
+
+impl PdiGeometryVsSpent {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::MatchSpent => "match_spent",
+            Self::SizeMatchShaDiff => "size_match_sha_diff",
+            Self::Diff => "diff",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Research size-class for opaque PDI geometry walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PdiGeometrySizeClass {
+    /// Empty / zero-length payload.
+    #[default]
+    Empty,
+    /// Spent flexml 2x4x4 class (`27200` B).
+    SpentFlexml2x4x4,
+    /// Default CVML/AIE2P research dump class (`283840` B).
+    ResearchCvmlDump,
+    /// Other non-empty size (not spent flexml / not research dump class).
+    Other,
+}
+
+impl PdiGeometrySizeClass {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::SpentFlexml2x4x4 => "spent_flexml_2x4x4",
+            Self::ResearchCvmlDump => "research_cvml_dump",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Pure offline PDI geometry fingerprint (header peeks + len/sha).
+///
+/// Opaque walk only — **not** a full public PDI decoder. Never invents Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PdiGeometryFingerprint {
+    /// Payload length in bytes.
+    pub len_bytes: u64,
+    /// sha256 hex prefix16 (empty when no bytes).
+    pub sha256_prefix16: String,
+    /// First LE u32 when ≥4 bytes present.
+    pub first_u32_le: Option<u32>,
+    /// Second LE u32 when ≥8 bytes present.
+    pub second_u32_le: Option<u32>,
+    /// Count of leading zero bytes (capped scan window).
+    pub leading_zero_bytes: u32,
+    /// Size class vs known spent / research dump constants.
+    pub size_class: PdiGeometrySizeClass,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl PdiGeometryFingerprint {
+    /// Compact geometry soft note (research only; not full C5 compare).
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        // Geometry alone is not a spent compare — callers use format_c5.
+        format!(
+            "pdi_geometry_fp len={} sha16={} size_class={} invent_pass=0 not_ran_on_npu=1",
+            self.len_bytes,
+            if self.sha256_prefix16.is_empty() {
+                "absent"
+            } else {
+                self.sha256_prefix16.as_str()
+            },
+            self.size_class.as_str(),
+        )
+    }
+}
+
+/// Result of comparing PDI geometry to spent flexml fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdiGeometryVsSpentResult {
+    /// Compare outcome vs spent flexml fingerprints.
+    pub compare: PdiGeometryVsSpent,
+    /// Geometry walk / size class / sha prefix.
+    pub geometry: PdiGeometryFingerprint,
+    /// Always `true` in soft notes: spent re-match ≠ new unlock alone.
+    pub spent_rematch_not_unlock_alone: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for PdiGeometryVsSpentResult {
+    fn default() -> Self {
+        Self {
+            compare: PdiGeometryVsSpent::Empty,
+            geometry: PdiGeometryFingerprint::default(),
+            spent_rematch_not_unlock_alone: true,
+            detail: "empty".into(),
+        }
+    }
+}
+
+/// Cap for leading-zero scan (research only; avoids O(n) on huge dumps).
+const PDI_GEOMETRY_LEADING_ZERO_SCAN_MAX: usize = 4096;
+
+/// Fingerprint opaque PDI-ish bytes: len, sha16, header peeks, size class.
+#[must_use]
+pub fn fingerprint_pdi_geometry_bytes(data: &[u8]) -> PdiGeometryFingerprint {
+    if data.is_empty() {
+        return PdiGeometryFingerprint {
+            len_bytes: 0,
+            sha256_prefix16: String::new(),
+            first_u32_le: None,
+            second_u32_le: None,
+            leading_zero_bytes: 0,
+            size_class: PdiGeometrySizeClass::Empty,
+            detail: "empty".into(),
+        };
+    }
+    let fp = fingerprint_pdi_blob_bytes(data);
+    let first_u32_le = data
+        .get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let second_u32_le = data
+        .get(4..8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let scan = data.len().min(PDI_GEOMETRY_LEADING_ZERO_SCAN_MAX);
+    let leading_zero_bytes =
+        u32::try_from(data[..scan].iter().take_while(|&&b| b == 0).count()).unwrap_or(u32::MAX);
+    let size_class = if fp.len_bytes == SPENT_FLEXML_UNIFIED_2X4X4_BYTES {
+        PdiGeometrySizeClass::SpentFlexml2x4x4
+    } else if fp.len_bytes == RESEARCH_PDI_DEFAULT_DUMP_BYTES {
+        PdiGeometrySizeClass::ResearchCvmlDump
+    } else {
+        PdiGeometrySizeClass::Other
+    };
+    PdiGeometryFingerprint {
+        len_bytes: fp.len_bytes,
+        sha256_prefix16: fp.sha256_prefix16,
+        first_u32_le,
+        second_u32_le,
+        leading_zero_bytes,
+        size_class,
+        detail: format!("size_class_{}", size_class.as_str()),
+    }
+}
+
+/// Compare PDI-ish bytes to spent flexml `unified-2x4x4` fingerprints.
+///
+/// **MatchSpent** = same len + sha16 as spent default. Soft note always
+/// `spent_rematch_not_unlock_alone=1` — re-match is **not** a new unlock reason
+/// alone. Never invents Pass.
+#[must_use]
+pub fn compare_pdi_geometry_to_spent_flexml(data: &[u8]) -> PdiGeometryVsSpentResult {
+    let geometry = fingerprint_pdi_geometry_bytes(data);
+    if data.is_empty() {
+        return PdiGeometryVsSpentResult {
+            compare: PdiGeometryVsSpent::Empty,
+            geometry,
+            spent_rematch_not_unlock_alone: true,
+            detail: "empty".into(),
+        };
+    }
+    let sha = geometry.sha256_prefix16.as_str();
+    let len = geometry.len_bytes;
+    let compare = if len == SPENT_FLEXML_UNIFIED_2X4X4_BYTES
+        && sha.eq_ignore_ascii_case(SPENT_FLEXML_UNIFIED_2X4X4_SHA16)
+    {
+        PdiGeometryVsSpent::MatchSpent
+    } else if len == SPENT_FLEXML_UNIFIED_2X4X4_BYTES {
+        PdiGeometryVsSpent::SizeMatchShaDiff
+    } else if sha.is_empty() {
+        PdiGeometryVsSpent::Unknown
+    } else {
+        PdiGeometryVsSpent::Diff
+    };
+    let detail = match compare {
+        PdiGeometryVsSpent::MatchSpent => "match_spent_flexml_2x4x4_not_unlock_alone",
+        PdiGeometryVsSpent::SizeMatchShaDiff => "spent_size_class_sha_diff",
+        PdiGeometryVsSpent::Diff => "diff_vs_spent_flexml",
+        PdiGeometryVsSpent::Empty => "empty",
+        PdiGeometryVsSpent::Unknown => "unknown_incomplete_fp",
+    };
+    PdiGeometryVsSpentResult {
+        compare,
+        geometry,
+        spent_rematch_not_unlock_alone: true,
+        detail: detail.into(),
+    }
+}
+
+/// Compare from an existing [`PdiBlobFingerprint`] (no re-hash of full body).
+///
+/// Header peeks unavailable without bytes → geometry peeks left empty.
+#[must_use]
+pub fn compare_pdi_fingerprint_to_spent_flexml(
+    fp: &PdiBlobFingerprint,
+) -> PdiGeometryVsSpentResult {
+    if fp.len_bytes == 0 && fp.sha256_prefix16.is_empty() {
+        return PdiGeometryVsSpentResult {
+            compare: PdiGeometryVsSpent::Empty,
+            geometry: PdiGeometryFingerprint {
+                detail: "empty_fp".into(),
+                ..PdiGeometryFingerprint::default()
+            },
+            spent_rematch_not_unlock_alone: true,
+            detail: "empty".into(),
+        };
+    }
+    let size_class = if fp.len_bytes == SPENT_FLEXML_UNIFIED_2X4X4_BYTES {
+        PdiGeometrySizeClass::SpentFlexml2x4x4
+    } else if fp.len_bytes == RESEARCH_PDI_DEFAULT_DUMP_BYTES {
+        PdiGeometrySizeClass::ResearchCvmlDump
+    } else if fp.len_bytes == 0 {
+        PdiGeometrySizeClass::Empty
+    } else {
+        PdiGeometrySizeClass::Other
+    };
+    let geometry = PdiGeometryFingerprint {
+        len_bytes: fp.len_bytes,
+        sha256_prefix16: fp.sha256_prefix16.clone(),
+        first_u32_le: None,
+        second_u32_le: None,
+        leading_zero_bytes: 0,
+        size_class,
+        detail: "from_pdi_blob_fingerprint".into(),
+    };
+    let sha = geometry.sha256_prefix16.as_str();
+    let compare = if geometry.len_bytes == 0 && sha.is_empty() {
+        PdiGeometryVsSpent::Empty
+    } else if geometry.len_bytes == SPENT_FLEXML_UNIFIED_2X4X4_BYTES
+        && sha.eq_ignore_ascii_case(SPENT_FLEXML_UNIFIED_2X4X4_SHA16)
+    {
+        PdiGeometryVsSpent::MatchSpent
+    } else if geometry.len_bytes == SPENT_FLEXML_UNIFIED_2X4X4_BYTES {
+        PdiGeometryVsSpent::SizeMatchShaDiff
+    } else if sha.is_empty() {
+        PdiGeometryVsSpent::Unknown
+    } else {
+        PdiGeometryVsSpent::Diff
+    };
+    let detail = match compare {
+        PdiGeometryVsSpent::MatchSpent => "match_spent_flexml_2x4x4_not_unlock_alone",
+        PdiGeometryVsSpent::SizeMatchShaDiff => "spent_size_class_sha_diff",
+        PdiGeometryVsSpent::Diff => "diff_vs_spent_flexml",
+        PdiGeometryVsSpent::Empty => "empty",
+        PdiGeometryVsSpent::Unknown => "unknown_incomplete_fp",
+    };
+    PdiGeometryVsSpentResult {
+        compare,
+        geometry,
+        spent_rematch_not_unlock_alone: true,
+        detail: detail.into(),
+    }
+}
+
+/// Soft C5 PDI geometry note — always honesty; spent re-match ≠ unlock alone.
+#[must_use]
+pub fn format_c5_pdi_geometry_note(r: &PdiGeometryVsSpentResult) -> String {
+    let g = &r.geometry;
+    let mut parts = vec![
+        C5_PDI_GEOMETRY_NOTE.into(),
+        format!("compare={}", r.compare.as_str()),
+        format!("size_class={}", g.size_class.as_str()),
+        format!("len={}", g.len_bytes),
+        "spent_rematch_not_unlock_alone=1".into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "geometry_alone_not_pass=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    if g.sha256_prefix16.is_empty() {
+        parts.push("sha16=absent".into());
+    } else {
+        parts.push(format!(
+            "sha16={}",
+            sanitize_soft_note_field_value(&g.sha256_prefix16)
+        ));
+    }
+    parts.push(format!("spent_len={SPENT_FLEXML_UNIFIED_2X4X4_BYTES}"));
+    parts.push(format!("spent_sha16={SPENT_FLEXML_UNIFIED_2X4X4_SHA16}"));
+    if let Some(w) = g.first_u32_le {
+        parts.push(format!("first_u32_le=0x{w:x}"));
+    } else {
+        parts.push("first_u32_le=absent".into());
+    }
+    if let Some(w) = g.second_u32_le {
+        parts.push(format!("second_u32_le=0x{w:x}"));
+    } else {
+        parts.push("second_u32_le=absent".into());
+    }
+    parts.push(format!("leading_zero_bytes={}", g.leading_zero_bytes));
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// C6 debug-BO uAPI prep record (pure; research only).
+///
+/// Captures AIE2 value-mode pack fields for assign/remove debug BO. **Never**
+/// claims live attach, Pass, or C-ready. Soft always
+/// `invent_pass=0 not_c_ready=1 not_ran_on_npu=1 debug_bo_prep_alone_not_pass=1 research_only=1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugBoUapiPrep {
+    /// `assign` or `remove`.
+    pub op: String,
+    /// Public param_type (1 assign / 2 remove).
+    pub param_type: u32,
+    /// Hardware context handle used in the pack.
+    pub hwctx: u32,
+    /// Debug BO GEM handle (value-mode param_val low 32).
+    pub bo_handle: u32,
+    /// AIE2: `param_val` is the BO handle as a value (not a user pointer).
+    pub param_val_is_bo_handle_value: bool,
+    /// AIE2 value-mode: always 0.
+    pub param_val_size: u32,
+    /// Pure layout validate result.
+    pub layout_ok: bool,
+    /// Always `false` in this offline prep — live CONFIG_HWCTX not issued here.
+    pub live_wired: bool,
+    /// Stable research detail token.
+    pub detail: String,
+}
+
+impl Default for DebugBoUapiPrep {
+    fn default() -> Self {
+        Self {
+            op: "absent".into(),
+            param_type: 0,
+            hwctx: 0,
+            bo_handle: 0,
+            param_val_is_bo_handle_value: true,
+            param_val_size: 0,
+            layout_ok: false,
+            live_wired: false,
+            detail: "absent".into(),
+        }
+    }
+}
+
+impl DebugBoUapiPrep {
+    /// Soft note alias.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_c6_debug_bo_prep_note(self)
+    }
+}
+
+/// Build C6 prep record by packing + validating AIE2 debug-BO CONFIG_HWCTX.
+///
+/// Pure — **no** ioctl, **no** EXEC_CMD. On pack/validate error returns
+/// `layout_ok=false` with reason in `detail` (still honesty trio on soft note).
+#[must_use]
+pub fn debug_bo_uapi_prep_aie2(hwctx: u32, op: HwctxDbgBufOp, bo_handle: u32) -> DebugBoUapiPrep {
+    match pack_config_hwctx_dbg_buf_aie2(hwctx, op, bo_handle) {
+        Ok(req) => match validate_config_hwctx_dbg_buf_aie2(&req) {
+            Ok(parsed) => DebugBoUapiPrep {
+                op: parsed.op.as_str().into(),
+                param_type: parsed.op.param_type(),
+                hwctx: parsed.hwctx,
+                bo_handle: parsed.bo_handle,
+                param_val_is_bo_handle_value: true,
+                param_val_size: 0,
+                layout_ok: true,
+                live_wired: false,
+                detail: format_debug_bo_aie2_pack_detail(&parsed),
+            },
+            Err(e) => DebugBoUapiPrep {
+                op: op.as_str().into(),
+                param_type: op.param_type(),
+                hwctx,
+                bo_handle,
+                param_val_is_bo_handle_value: true,
+                param_val_size: 0,
+                layout_ok: false,
+                live_wired: false,
+                detail: format!("validate_failed:{e}"),
+            },
+        },
+        Err(e) => DebugBoUapiPrep {
+            op: op.as_str().into(),
+            param_type: op.param_type(),
+            hwctx,
+            bo_handle,
+            param_val_is_bo_handle_value: true,
+            param_val_size: 0,
+            layout_ok: false,
+            live_wired: false,
+            detail: format!("pack_failed:{e}"),
+        },
+    }
+}
+
+/// Soft C6 debug-BO prep note — always honesty; prep alone ≠ Pass / C-ready / live.
+#[must_use]
+pub fn format_c6_debug_bo_prep_note(r: &DebugBoUapiPrep) -> String {
+    let mut parts = vec![
+        C6_DEBUG_BO_PREP_NOTE.into(),
+        format!("op={}", sanitize_soft_note_field_value(&r.op)),
+        format!("param_type={}", r.param_type),
+        format!("hwctx={}", r.hwctx),
+        format!("bo_handle={}", r.bo_handle),
+        format!(
+            "param_val_is_bo_handle_value={}",
+            u8::from(r.param_val_is_bo_handle_value)
+        ),
+        format!("param_val_size={}", r.param_val_size),
+        format!("layout_ok={}", u8::from(r.layout_ok)),
+        format!("live_wired={}", u8::from(r.live_wired)),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "debug_bo_prep_alone_not_pass=1".into(),
+        "research_only=1".into(),
+        "product_pass_requires_live_decide=1".into(),
+    ];
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
     }
     parts.join(" ")
 }
@@ -9955,18 +16142,17 @@ pub fn last_apply_load_path_is_allowed(path: &std::path::Path) -> bool {
     if !last_apply_path_is_allowed(path) {
         return false;
     }
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return false;
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return false;
     }
     // If file exists, resolve fully (intermediate + final) and re-check roots.
-    if path.exists() {
-        if let Ok(canon) = std::fs::canonicalize(path) {
-            if !path_under_allowed_roots(&canon) {
-                return false;
-            }
-        }
+    if path.exists()
+        && let Ok(canon) = std::fs::canonicalize(path)
+        && !path_under_allowed_roots(&canon)
+    {
+        return false;
     }
     true
 }
@@ -10260,6 +16446,1200 @@ pub fn vendor_paddrs_json_from_io(
     })
 }
 
+// ---------------------------------------------------------------------------
+// W8 Track Paddr — O3 live paddr extract + M3 live-mapped rela research
+// ---------------------------------------------------------------------------
+//
+// Bridge architecture: product lab may not need vendor post-patch if aiebu
+// rela×12 is applied with **real device paddrs** from a live map (io_paddrs /
+// bo_diag), not GT synthetic `0xa11f…`. Offline pure TDD only — never invent
+// Pass / residual_matched / ran_on_npu / unlock from paddrs alone.
+//
+// Lab aiebu rela path (existing pure-direct):
+//   `patch_aiebu_elf_ctrltext_with_bos` peels `.ctrltext`, applies `.rela.dyn`
+//   with bases sym1=ifm, sym2=wts, sym3=ofm, sym4=ctrl (overwrite u64 LE).
+//   Staged mladf uses ×12 relocs on classic 1688. GT dump uses synthetic
+//   paddrs → patched sha16 `ccab3960…`. Live paddrs yield a **different** body.
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`format_live_paddrs_research_note`].
+pub const LIVE_PADDRS_RESEARCH_NOTE: &str = "live_paddrs_research";
+
+/// Soft-note bag name for [`format_live_mapped_rela_research_note`].
+pub const LIVE_MAPPED_RELA_RESEARCH_NOTE: &str = "live_mapped_rela_research";
+
+/// Soft-note bag name for [`format_capture_patch_class_note`].
+pub const CAPTURE_PATCH_CLASS_NOTE: &str = "capture_patch_class";
+
+/// Full SHA-256 of GT synthetic pure-direct patched classic 1688
+/// (`gt_capture/instr_post_patch.bin` with `0xa11f…` paddrs).
+///
+/// **Not** load-accepted / residual-matched. Freeze: do not treat as product Pass.
+pub const GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA256: &str =
+    "ccab3960f6dd789b7cad9ea602dc2ee6a0ac4c3805324625ea8228156713dbf0";
+
+/// First 16 hex chars of [`GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA256`].
+pub const GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA16: &str = "ccab3960f6dd789b";
+
+/// Unpatched lab classic 1688 oracle sha16 (`instr_raw_txn.bin` / DD dump).
+pub const LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16: &str = "3c5ffca750922d3b";
+
+/// Synthetic IFM paddr used by `dump_mladf_gt_offline` (not a real device addr).
+pub const GT_SYNTHETIC_IFM_PADDR: u64 = 0x0000_A11F_0000_1000;
+/// Synthetic WTS paddr used by offline GT dump.
+pub const GT_SYNTHETIC_WTS_PADDR: u64 = 0x0000_A11F_0000_2000;
+/// Synthetic OFM paddr used by offline GT dump.
+pub const GT_SYNTHETIC_OFM_PADDR: u64 = 0x0000_A11F_0000_3000;
+/// Synthetic CTRL paddr used by offline GT dump.
+pub const GT_SYNTHETIC_CTRL_PADDR: u64 = 0x0000_A11F_0000_4000;
+
+/// W8 O3 — live device paddrs extracted from last_apply detail / JSON fixtures.
+///
+/// **Never** invents addresses. Invalid / missing → fields stay `None`.
+/// [`Self::live_paddrs_present`] is true only when ifm+wts+ofm are valid.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LivePaddrsExtract {
+    /// IFM buffer device/host paddr when known and valid.
+    pub ifm_paddr: Option<u64>,
+    /// WTS buffer paddr when known and valid.
+    pub wts_paddr: Option<u64>,
+    /// OFM buffer paddr when known and valid.
+    pub ofm_paddr: Option<u64>,
+    /// CTRL packet BO paddr when known and valid (optional for rela complete).
+    pub ctrl_paddr: Option<u64>,
+    /// Instruction BO `xdna_addr` when known and valid (optional; not in rela bases 1–3).
+    pub instr_paddr: Option<u64>,
+    /// True when ifm+wts+ofm are all valid device paddrs (ctrl/instr optional).
+    pub live_paddrs_present: bool,
+    /// Source label for soft notes (`detail` / `vendor_json` / `last_apply_json` / `absent`).
+    pub source: &'static str,
+}
+
+impl LivePaddrsExtract {
+    /// Tuple for rela patch when ifm/wts/ofm are valid; ctrl defaults to 0 if absent.
+    #[must_use]
+    pub fn as_io_tuple(&self) -> Option<(u64, u64, u64, u64)> {
+        let i = self.ifm_paddr.filter(|&a| is_valid_device_paddr(a))?;
+        let w = self.wts_paddr.filter(|&a| is_valid_device_paddr(a))?;
+        let o = self.ofm_paddr.filter(|&a| is_valid_device_paddr(a))?;
+        let c = self
+            .ctrl_paddr
+            .filter(|&a| is_valid_device_paddr(a))
+            .unwrap_or(0);
+        Some((i, w, o, c))
+    }
+}
+
+/// Extract live IFM/WTS/OFM/ctrl/instr paddrs from a timed `detail` string.
+///
+/// Pure offline. Prefer [`parse_io_paddrs_from_detail`]; when that token is
+/// absent, mine labeled `bo_diag` entries (`ifm` / `wts` / `ofm` / `ctrl` /
+/// `instr`). Also accepts `instr` / `xdna_addr` tokens via
+/// [`parse_last_apply_detail_signals`]. Never invents paddrs; zeros / `u64::MAX`
+/// stay absent.
+#[must_use]
+pub fn extract_live_paddrs_from_detail(detail: &str) -> LivePaddrsExtract {
+    let mut out = LivePaddrsExtract {
+        source: "detail",
+        ..LivePaddrsExtract::default()
+    };
+    if detail.is_empty() {
+        out.source = "absent";
+        return out;
+    }
+    if let Some((i, w, o, c)) = parse_io_paddrs_from_detail(detail) {
+        out.ifm_paddr = Some(i);
+        out.wts_paddr = Some(w);
+        out.ofm_paddr = Some(o);
+        if is_valid_device_paddr(c) {
+            out.ctrl_paddr = Some(c);
+        }
+        out.live_paddrs_present = true;
+    }
+    // Mine bo_diag labels (live last_apply often has bo_diag without `io_paddrs`).
+    let bo_entries = parse_bo_diag_from_detail(detail);
+    for e in &bo_entries {
+        let lab = e.label.to_ascii_lowercase();
+        let Some(a) = e.xdna_addr.filter(|&a| is_valid_device_paddr(a)) else {
+            continue;
+        };
+        match lab.as_str() {
+            "ifm" if out.ifm_paddr.is_none() => out.ifm_paddr = Some(a),
+            "wts" if out.wts_paddr.is_none() => out.wts_paddr = Some(a),
+            "ofm" if out.ofm_paddr.is_none() => out.ofm_paddr = Some(a),
+            "ctrl" if out.ctrl_paddr.is_none() => out.ctrl_paddr = Some(a),
+            "instr" | "instruction" if out.instr_paddr.is_none() => {
+                out.instr_paddr = Some(a);
+            }
+            _ => {}
+        }
+    }
+    // Promote to present when bo_diag supplied the IO triad.
+    if !out.live_paddrs_present
+        && out.ifm_paddr.is_some()
+        && out.wts_paddr.is_some()
+        && out.ofm_paddr.is_some()
+    {
+        out.live_paddrs_present = true;
+    }
+    if out.instr_paddr.is_none() {
+        let sig = parse_last_apply_detail_signals(detail);
+        if let Some(a) = sig.instr_xdna_addr.filter(|&a| is_valid_device_paddr(a)) {
+            out.instr_paddr = Some(a);
+        }
+    }
+    if !out.live_paddrs_present && out.instr_paddr.is_none() {
+        // Keep source=detail when any token region existed but no valid paddrs.
+        if !detail.contains("io_paddrs") && !detail.contains("bo_diag=") {
+            out.source = "absent";
+        }
+    }
+    out
+}
+
+/// Extract live paddrs from vendor_paddrs / extract_paddrs JSON text.
+///
+/// Pure offline. Uses [`parse_vendor_paddrs_json`]. Optional `instr_paddr` field
+/// when present. Never invents.
+#[must_use]
+pub fn extract_live_paddrs_from_vendor_json(text: &str) -> LivePaddrsExtract {
+    let Ok(v) = parse_vendor_paddrs_json(text) else {
+        return LivePaddrsExtract {
+            source: "absent",
+            ..LivePaddrsExtract::default()
+        };
+    };
+    let mut out = LivePaddrsExtract {
+        ifm_paddr: v.ifm_paddr,
+        wts_paddr: v.wts_paddr,
+        ofm_paddr: v.ofm_paddr,
+        ctrl_paddr: v.ctrl_paddr,
+        instr_paddr: None,
+        live_paddrs_present: v.paddrs_complete(),
+        source: "vendor_json",
+    };
+    // Optional instr field (not in VendorPaddrs schema core).
+    if let Ok(root) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(obj) = root.as_object()
+        && let Some(raw) = obj.get("instr_paddr")
+        && let Ok(Some(a)) = parse_paddr_json_value(raw)
+    {
+        out.instr_paddr = Some(a);
+    }
+    out
+}
+
+/// Extract live paddrs from last_apply schema-2 JSON (detail field preferred).
+///
+/// Pure offline. Parses `detail` via [`extract_live_paddrs_from_detail`]; if IO
+/// paddrs absent, does **not** invent from other fields. Never claims Pass.
+#[must_use]
+pub fn extract_live_paddrs_from_last_apply_json(text: &str) -> LivePaddrsExtract {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return LivePaddrsExtract {
+            source: "absent",
+            ..LivePaddrsExtract::default()
+        };
+    };
+    let Some(obj) = v.as_object() else {
+        return LivePaddrsExtract {
+            source: "absent",
+            ..LivePaddrsExtract::default()
+        };
+    };
+    let detail = obj.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+    let mut out = extract_live_paddrs_from_detail(detail);
+    if out.source == "detail" || out.live_paddrs_present {
+        out.source = "last_apply_json";
+    }
+    out
+}
+
+/// Soft research note for live paddr extract (O3).
+///
+/// Always `invent_pass=0 not_c_ready=1 not_ran_on_npu=1`; never residual_matched.
+#[must_use]
+pub fn format_live_paddrs_research_note(r: &LivePaddrsExtract) -> String {
+    let mut parts = vec![
+        LIVE_PADDRS_RESEARCH_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "residual_matched_claim=0".into(),
+        format!("live_paddrs_present={}", u8::from(r.live_paddrs_present)),
+        format!("source={}", sanitize_soft_note_field_value(r.source)),
+        format!("ifm_present={}", u8::from(r.ifm_paddr.is_some())),
+        format!("wts_present={}", u8::from(r.wts_paddr.is_some())),
+        format!("ofm_present={}", u8::from(r.ofm_paddr.is_some())),
+        format!("ctrl_present={}", u8::from(r.ctrl_paddr.is_some())),
+        format!("instr_present={}", u8::from(r.instr_paddr.is_some())),
+        "paddrs_alone_not_pass=1".into(),
+    ];
+    if let Some(a) = r.ifm_paddr {
+        parts.push(format!("ifm_paddr=0x{a:x}"));
+    }
+    if let Some(a) = r.wts_paddr {
+        parts.push(format!("wts_paddr=0x{a:x}"));
+    }
+    if let Some(a) = r.ofm_paddr {
+        parts.push(format!("ofm_paddr=0x{a:x}"));
+    }
+    if let Some(a) = r.ctrl_paddr {
+        parts.push(format!("ctrl_paddr=0x{a:x}"));
+    }
+    if let Some(a) = r.instr_paddr {
+        parts.push(format!("instr_paddr=0x{a:x}"));
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// W9-B — L1b readiness checklist (offline Bridge B prep)
+// ---------------------------------------------------------------------------
+//
+// Pure offline. Mines LivePaddrsExtract (O3) into a gate checklist for L1b
+// pure-direct rela. **Never** mints unlock. invent_pass always 0.
+// l1b_live_justified only when paddrs present **and** unlock_active (offline
+// default unlock_active=false → justified=0). When paddrs present:
+// paddr_evidence_ready=1 unlock_required=1 (mint still needs human unlock).
+// ---------------------------------------------------------------------------
+
+/// Soft-note bag name for [`format_l1b_readiness_checklist`].
+pub const L1B_READINESS_CHECKLIST_NOTE: &str = "l1b_readiness_checklist";
+
+/// Pure L1b readiness gates (Bridge B / offline prep).
+///
+/// Offline default: `unlock_active=false` → `l1b_live_justified=false` even
+/// when live paddrs are present on disk. Presence alone is **not** a mint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research gate bag; honesty-first
+pub struct L1bReadiness {
+    /// True when ifm+wts+ofm are valid non-zero paddrs (from extract).
+    pub live_paddrs_present: bool,
+    /// True only when caller reports an **active** (unconsumed) unlock.
+    /// Offline prep always passes `false`.
+    pub unlock_active: bool,
+    /// Residual match claim. Locked **false** on this offline surface.
+    pub residual_matched: bool,
+    /// `live_paddrs_present` alias for mint-prep English.
+    pub paddr_evidence_ready: bool,
+    /// Live L1b always needs a **new** unlock; always true on this checklist.
+    pub unlock_required: bool,
+    /// Offline wire ready when paddrs present (pure-direct rela can run offline).
+    /// **≠** live justified; **≠** unlock mint.
+    pub l1b_offline_ready: bool,
+    /// Live L1b shot justified only when paddrs present **and** unlock_active.
+    /// Offline prep with unlock=none → always false.
+    pub l1b_live_justified: bool,
+    /// Source label from extract (`vendor_json` / `last_apply_json` / `detail` / …).
+    pub source: &'static str,
+    /// Optional soft material score tokens (true_post_patch / oracle / INSTR_BO).
+    pub score_tokens: String,
+}
+
+impl L1bReadiness {
+    /// Soft checklist line — always invent_pass=0 not_ran_on_npu=1.
+    #[must_use]
+    pub fn format_checklist(&self) -> String {
+        format_l1b_readiness_checklist(self)
+    }
+}
+
+/// Evaluate L1b readiness from a live-paddr extract + unlock flag.
+///
+/// Pure offline. `unlock_active` must be supplied by the caller (never inferred
+/// from residual / capture). `residual_matched` is locked false here.
+/// Soft score tokens for classic material walls are appended when useful.
+#[must_use]
+pub fn evaluate_l1b_readiness(extract: &LivePaddrsExtract, unlock_active: bool) -> L1bReadiness {
+    let live = extract.live_paddrs_present
+        || (extract.ifm_paddr.is_some()
+            && extract.wts_paddr.is_some()
+            && extract.ofm_paddr.is_some());
+    // Offline surface never claims residual match.
+    let residual_matched = false;
+    let paddr_evidence_ready = live;
+    // Live always requires a new unlock; checklist documents that hard gate.
+    let unlock_required = true;
+    let l1b_offline_ready = live;
+    // Justified for live only with both evidence and active unlock.
+    let l1b_live_justified = live && unlock_active;
+    let score_tokens = format_l1b_soft_score_tokens(extract);
+    L1bReadiness {
+        live_paddrs_present: live,
+        unlock_active,
+        residual_matched,
+        paddr_evidence_ready,
+        unlock_required,
+        l1b_offline_ready,
+        l1b_live_justified,
+        source: extract.source,
+        score_tokens,
+    }
+}
+
+/// Soft material-wall tokens for L1b score line (cheap offline).
+///
+/// Documents that true post-patch classic is still missing, oracle unpatched
+/// sha16, and INSTR_BO_LIMIT architecture residual. Never invents Pass.
+#[must_use]
+pub fn format_l1b_soft_score_tokens(extract: &LivePaddrsExtract) -> String {
+    let mut parts = vec![
+        "true_post_patch_missing=1".into(),
+        format!("oracle_sha16={LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16}"),
+        "INSTR_BO_LIMIT=1".into(),
+        format!(
+            "live_paddrs_present={}",
+            u8::from(extract.live_paddrs_present)
+        ),
+    ];
+    if extract.instr_paddr.is_some() {
+        parts.push("instr_paddr_known=1".into());
+    } else {
+        parts.push("instr_paddr_known=0".into());
+    }
+    parts.join(" ")
+}
+
+/// Format L1b readiness checklist soft note.
+///
+/// Always:
+/// - `invent_pass=0`
+/// - `not_ran_on_npu=1`
+/// - `not_c_ready=1`
+/// - `residual_matched=0`
+/// - `unlock_required=1`
+///
+/// `l1b_live_justified=1` only when extract had paddrs **and** unlock was active.
+/// Offline prep (unlock_active=false) always emits `l1b_live_justified=0`.
+#[must_use]
+pub fn format_l1b_readiness_checklist(r: &L1bReadiness) -> String {
+    let mut parts = vec![
+        L1B_READINESS_CHECKLIST_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "residual_matched=0".into(),
+        "residual_matched_claim=0".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "checklist_alone_not_pass=1".into(),
+        "checklist_alone_not_unlock=1".into(),
+        format!("live_paddrs_present={}", u8::from(r.live_paddrs_present)),
+        format!("unlock_active={}", u8::from(r.unlock_active)),
+        format!("paddr_evidence_ready={}", u8::from(r.paddr_evidence_ready)),
+        format!("unlock_required={}", u8::from(r.unlock_required)),
+        format!("l1b_offline_ready={}", u8::from(r.l1b_offline_ready)),
+        format!("l1b_live_justified={}", u8::from(r.l1b_live_justified)),
+        format!("source={}", sanitize_soft_note_field_value(r.source)),
+    ];
+    // Defensive: never emit invent_pass/live justified without both gates.
+    debug_assert!(!r.residual_matched);
+    if !r.score_tokens.is_empty() {
+        parts.push(format!(
+            "score={}",
+            sanitize_soft_note_field_value(&r.score_tokens.replace(' ', ","))
+        ));
+        // Also emit individual cheap wall tokens as exact tokens (for soft greps).
+        parts.push("true_post_patch_missing=1".into());
+        parts.push(format!(
+            "oracle_sha16={LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16}"
+        ));
+        parts.push("INSTR_BO_LIMIT=1".into());
+    }
+    parts.join(" ")
+}
+
+/// Convenience: evaluate + format checklist from extract (offline unlock=false).
+#[must_use]
+pub fn format_l1b_readiness_checklist_from_extract(extract: &LivePaddrsExtract) -> String {
+    format_l1b_readiness_checklist(&evaluate_l1b_readiness(extract, false))
+}
+
+/// Capture body class vs lab unpatched oracle (O1 soft scorecard).
+///
+/// **Always** research-only: unpatched modes never claim residual_matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturePatchClass {
+    /// Classic 1688 unpatched (capture_mode unpatched and/or sha matches oracle).
+    ClassicUnpatched,
+    /// Body sha differs from unpatched oracle (candidate true post-patch; not proven Pass).
+    TruePostPatchCandidate,
+    /// Multi-txn wrong body (e.g. 32208) — refuse as classic residual.
+    MultiTxnWrongBody,
+    /// Insufficient tokens to classify.
+    Unknown,
+}
+
+impl CapturePatchClass {
+    /// Soft token for notes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassicUnpatched => "classic_unpatched",
+            Self::TruePostPatchCandidate => "true_post_patch_candidate",
+            Self::MultiTxnWrongBody => "multi_txn_wrong_body",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// True when residual_matched must stay 0 (unpatched / multi / unknown).
+    #[must_use]
+    pub const fn residual_matched_refused(self) -> bool {
+        !matches!(self, Self::TruePostPatchCandidate)
+    }
+}
+
+/// Classify capture patch class from mode / sha / size (O1 + O2 loud refuse).
+///
+/// Pure offline. `instr_sha256_hex` may be full or sha16 prefix. Never invents
+/// residual_matched=1. `txn_container_unpatched` / any unpatched mode →
+/// [`CapturePatchClass::ClassicUnpatched`] and residual refuse.
+#[must_use]
+pub fn classify_capture_patch_class(
+    capture_mode: Option<&str>,
+    instr_sha256_hex: Option<&str>,
+    instr_bytes: Option<usize>,
+) -> CapturePatchClass {
+    if let Some(n) = instr_bytes
+        && (n == 32208 || n > 4096)
+    {
+        return CapturePatchClass::MultiTxnWrongBody;
+    }
+    let mode = capture_mode.unwrap_or("").to_ascii_lowercase();
+    let unpatched_mode = mode.contains("unpatched")
+        || mode.contains("txn_container_unpatched")
+        || mode.contains("txn_bin_fallback");
+    let sha = instr_sha256_hex.unwrap_or("").to_ascii_lowercase();
+    let sha_unpatched = !sha.is_empty()
+        && (sha.starts_with(LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16)
+            || sha == LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16);
+    if unpatched_mode || sha_unpatched {
+        return CapturePatchClass::ClassicUnpatched;
+    }
+    if !sha.is_empty()
+        && !sha.starts_with(LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16)
+        && (instr_bytes == Some(1688) || instr_bytes.is_none())
+    {
+        return CapturePatchClass::TruePostPatchCandidate;
+    }
+    CapturePatchClass::Unknown
+}
+
+/// Soft note for capture patch class (O1/O2). Always invent_pass=0; residual refuse for unpatched.
+#[must_use]
+pub fn format_capture_patch_class_note(
+    class: CapturePatchClass,
+    capture_mode: Option<&str>,
+) -> String {
+    // residual_matched_claim locked 0 offline — even true_post_patch_candidate
+    // needs full evidence stack (never claim from capture_mode/sha alone).
+    let mut parts = vec![
+        CAPTURE_PATCH_CLASS_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        format!("patch_class={}", class.as_str()),
+        "residual_matched_claim=0".into(),
+        format!(
+            "residual_matched_refused={}",
+            u8::from(class.residual_matched_refused())
+        ),
+    ];
+    if matches!(class, CapturePatchClass::ClassicUnpatched) {
+        parts.push("classic_unpatched=1".into());
+        parts.push("true_post_patch=0".into());
+        parts.push("loud_refuse_residual_matched_unpatched=1".into());
+    }
+    if matches!(class, CapturePatchClass::TruePostPatchCandidate) {
+        parts.push("classic_unpatched=0".into());
+        parts.push("true_post_patch_candidate=1".into());
+        // Still not residual_matched without full evidence stack.
+        parts.push("true_post_patch_alone_not_residual_matched=1".into());
+    }
+    if matches!(class, CapturePatchClass::MultiTxnWrongBody) {
+        parts.push("multi_txn_refused=1".into());
+        parts.push("loud_refuse_residual_matched_multi=1".into());
+    }
+    if let Some(m) = capture_mode
+        && !m.is_empty()
+    {
+        parts.push(format!(
+            "capture_mode={}",
+            sanitize_soft_note_field_value(m)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// W8 M3 — pure-direct rela applied with live (or research) paddrs vs GT synthetic.
+///
+/// Offline research only. Documents that live paddrs produce a patched body
+/// that **differs** from GT synthetic `ccab3960…` when paddrs differ.
+/// **Never** C-ready / ran_on_npu / invent Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveMappedRelaResearch {
+    /// True when caller supplied valid ifm+wts+ofm paddrs.
+    pub live_paddrs_present: bool,
+    /// `.rela.dyn` count when ELF parseable.
+    pub rela_count: Option<usize>,
+    /// Patched ctrltext length when patch produced bytes.
+    pub patched_len: Option<usize>,
+    /// Classic v0.1 walk OK after rela overwrite.
+    pub classic_walk_ok: bool,
+    /// SHA-256 of patched ctrltext (empty if no patch).
+    pub patched_sha256_hex: String,
+    /// SHA-256 of unpatched peel (empty if no aiebu peel).
+    pub unpatched_sha256_hex: String,
+    /// `Some(true)` when patched sha differs from GT synthetic oracle.
+    pub differs_from_gt_synthetic: Option<bool>,
+    /// Soft detail token.
+    pub detail: String,
+}
+
+impl LiveMappedRelaResearch {
+    /// Soft research note — always honesty trio + bag name.
+    #[must_use]
+    pub fn format_soft_note(&self) -> String {
+        format_live_mapped_rela_research_note(self)
+    }
+}
+
+/// Soft research note for live-mapped rela (M3). Always invent_pass=0.
+#[must_use]
+pub fn format_live_mapped_rela_research_note(r: &LiveMappedRelaResearch) -> String {
+    let mut parts = vec![
+        LIVE_MAPPED_RELA_RESEARCH_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "residual_matched_claim=0".into(),
+        "product_pass_requires_live_decide=1".into(),
+        format!("live_paddrs_present={}", u8::from(r.live_paddrs_present)),
+        format!("classic_walk_ok={}", u8::from(r.classic_walk_ok)),
+        format!("gt_synthetic_sha16={}", GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA16),
+        "live_mapped_rela_alone_not_pass=1".into(),
+        "l1b_offline_ready=0".into(),
+    ];
+    if let Some(n) = r.rela_count {
+        parts.push(format!("rela_count={n}"));
+    }
+    if let Some(n) = r.patched_len {
+        parts.push(format!("patched_len={n}"));
+    }
+    if r.patched_sha256_hex.is_empty() {
+        parts.push("patched_sha=absent".into());
+    } else {
+        let sha16 = r
+            .patched_sha256_hex
+            .get(..16)
+            .unwrap_or(&r.patched_sha256_hex);
+        parts.push(format!(
+            "patched_sha16={}",
+            sanitize_soft_note_field_value(sha16)
+        ));
+        parts.push(format!(
+            "patched_sha256={}",
+            sanitize_soft_note_field_value(&r.patched_sha256_hex)
+        ));
+    }
+    if !r.unpatched_sha256_hex.is_empty() {
+        let u16 = r
+            .unpatched_sha256_hex
+            .get(..16)
+            .unwrap_or(&r.unpatched_sha256_hex);
+        parts.push(format!(
+            "unpatched_sha16={}",
+            sanitize_soft_note_field_value(u16)
+        ));
+    }
+    match r.differs_from_gt_synthetic {
+        Some(true) => parts.push("differs_from_gt_synthetic=1".into()),
+        Some(false) => parts.push("differs_from_gt_synthetic=0".into()),
+        None => parts.push("differs_from_gt_synthetic=na".into()),
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// Pure-direct rela with supplied paddrs; compare patched body to GT synthetic oracle.
+///
+/// Offline only. Invalid ifm/wts/ofm → refuse patch (`invalid_live_paddr`). Empty ELF
+/// soft-skips. Does **not** invent paddrs. Live paddrs that differ from
+/// `0xa11f…` should set `differs_from_gt_synthetic=true` when staged ELF patches.
+///
+/// Ctrl may be 0 (optional for staged mladf rela×12 which uses sym 1–3 only); when
+/// absent/invalid the audit path uses `ofm` as a non-zero base so
+/// [`audit_aiebu_rela_with_live_paddrs`] does not refuse (sym4 unused offline).
+#[must_use]
+pub fn research_live_mapped_rela(
+    elf: &[u8],
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    ctrl: u64,
+) -> LiveMappedRelaResearch {
+    let live_ok =
+        is_valid_device_paddr(ifm) && is_valid_device_paddr(wts) && is_valid_device_paddr(ofm);
+    if elf.is_empty() {
+        return LiveMappedRelaResearch {
+            live_paddrs_present: live_ok,
+            detail: "elf_empty_skip".into(),
+            ..LiveMappedRelaResearch::default()
+        };
+    }
+    if !live_ok {
+        let rela_count = if is_aiebu_elf_ctrltext(elf) {
+            parse_elf32_rela_dyn(elf).ok().map(|r| r.len())
+        } else {
+            None
+        };
+        return LiveMappedRelaResearch {
+            live_paddrs_present: false,
+            rela_count,
+            detail: "invalid_live_paddr".into(),
+            ..LiveMappedRelaResearch::default()
+        };
+    }
+    // Ctrl optional: audit requires non-zero; staged mladf has no sym4 ctrl reloc.
+    let ctrl_for_patch = if is_valid_device_paddr(ctrl) {
+        ctrl
+    } else {
+        ofm
+    };
+    // Reuse Track H audit for patch + classic walk.
+    let audit = audit_aiebu_rela_with_live_paddrs(elf, ifm, wts, ofm, ctrl_for_patch);
+    let unpatched_sha = if is_aiebu_elf_ctrltext(elf) {
+        super::txn::instruction_payload_bytes(elf)
+            .ok()
+            .map(|p| sha256_hex_lower(&p))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let patched_sha = audit
+        .patched_ctrltext
+        .as_ref()
+        .map(|b| sha256_hex_lower(b))
+        .unwrap_or_default();
+    let differs = if patched_sha.is_empty() {
+        None
+    } else {
+        Some(patched_sha != GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA256)
+    };
+    LiveMappedRelaResearch {
+        live_paddrs_present: true,
+        rela_count: audit.rela_count,
+        patched_len: audit.patched_ctrltext_len,
+        classic_walk_ok: audit.patched_ctrltext_walk_ok,
+        patched_sha256_hex: patched_sha,
+        unpatched_sha256_hex: unpatched_sha,
+        differs_from_gt_synthetic: differs,
+        detail: audit.detail,
+    }
+}
+
+/// Convenience: live-mapped rela from [`LivePaddrsExtract`] (soft-skip if incomplete).
+#[must_use]
+pub fn research_live_mapped_rela_from_extract(
+    elf: &[u8],
+    paddrs: &LivePaddrsExtract,
+) -> LiveMappedRelaResearch {
+    let Some((i, w, o, c)) = paddrs.as_io_tuple() else {
+        return LiveMappedRelaResearch {
+            live_paddrs_present: false,
+            detail: "live_paddrs_incomplete".into(),
+            ..LiveMappedRelaResearch::default()
+        };
+    };
+    research_live_mapped_rela(elf, i, w, o, c)
+}
+
+// ---------------------------------------------------------------------------
+// W10-B T1 — same-shot rela plan (Bridge B product offline wire)
+// ---------------------------------------------------------------------------
+//
+// W9 gap: disk last_apply / vendor UVAs **age out** across processes. Product
+// lab must patch aiebu rela×12 with **in-process** BO `xdna_addr` after
+// create/map — never default to stale /tmp last_apply paddrs.
+//
+// Pure helpers + optional env gate `XDNA2_LAB_SAME_SHOT_RELA=1` for the timed
+// lab hook. invent_pass=0 always; ≠ Pass ≠ unlock ≠ ran_on_npu. Live still
+// needs a **new** host-minted unlock (not minted here).
+// ---------------------------------------------------------------------------
+
+/// Research/lab env for same-shot rela path (`XDNA2_LAB_SAME_SHOT_RELA`).
+///
+/// Default **off** — product timed path keeps existing direct patch behavior
+/// when unset. Set `1` / `true` / `yes` to route aiebu rela through
+/// [`plan_same_shot_rela_from_io_paddrs`] (in-process BO paddrs only).
+/// Env alone ≠ unlock ≠ Pass ≠ `ran_on_npu`.
+pub const ENV_LAB_SAME_SHOT_RELA: &str = "XDNA2_LAB_SAME_SHOT_RELA";
+
+/// Soft-note bag name for [`format_same_shot_rela_plan_note`].
+pub const SAME_SHOT_RELA_PLAN_NOTE: &str = "same_shot_rela_plan";
+
+/// Soft-note bag name for [`format_same_shot_rela_apply_note`].
+pub const SAME_SHOT_RELA_APPLY_NOTE: &str = "same_shot_rela_apply";
+
+/// Where IO paddrs for rela came from (product vs research honesty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SameShotPaddrSource {
+    /// Current-process BO map after create/pin (product correct path).
+    InProcessBoMap,
+    /// Disk last_apply / bo_diag extract — **research only**; refuse product apply.
+    DiskLastApply,
+    /// Vendor / extract_paddrs JSON — **research only**; refuse product apply.
+    DiskVendorJson,
+    /// Missing / invalid / unknown.
+    #[default]
+    Absent,
+}
+
+impl SameShotPaddrSource {
+    /// Stable soft-note token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcessBoMap => "in_process_bo_map",
+            Self::DiskLastApply => "disk_last_apply",
+            Self::DiskVendorJson => "disk_vendor_json",
+            Self::Absent => "absent",
+        }
+    }
+
+    /// True when this source is **same-shot** product-eligible (in-process only).
+    #[must_use]
+    pub const fn is_same_shot(self) -> bool {
+        matches!(self, Self::InProcessBoMap)
+    }
+
+    /// True when product lab must **not** use these paddrs for live rela apply.
+    #[must_use]
+    pub const fn refuse_product_apply(self) -> bool {
+        !self.is_same_shot()
+    }
+}
+
+/// Pure plan for same-shot aiebu rela before EXEC.
+///
+/// Always honesty-first: `invent_pass=0`, never claims Pass / residual match /
+/// `ran_on_npu`. Product apply is ready only when source is in-process and
+/// ifm+wts+ofm are valid (ctrl optional).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // research plan bag; honesty-first
+pub struct SameShotRelaPlan {
+    /// True when env gate requested same-shot path (caller may force).
+    pub env_requested: bool,
+    /// True when same-run product map **succeeded**: in-process BO map **and**
+    /// valid ifm+wts+ofm paddrs. False for disk sources and for invalid
+    /// in-process paddrs (`paddrs_valid=0`) so `same_shot=1` greps mean map OK.
+    pub same_shot: bool,
+    /// True when ifm+wts+ofm pass [`is_valid_device_paddr`].
+    pub paddrs_valid: bool,
+    /// IFM `xdna_addr` when valid.
+    pub ifm_paddr: Option<u64>,
+    /// WTS `xdna_addr` when valid.
+    pub wts_paddr: Option<u64>,
+    /// OFM `xdna_addr` when valid.
+    pub ofm_paddr: Option<u64>,
+    /// CTRL `xdna_addr` when valid (optional for staged mladf).
+    pub ctrl_paddr: Option<u64>,
+    /// Provenance of paddrs.
+    pub source: SameShotPaddrSource,
+    /// Product offline wire ready: same_shot + paddrs_valid.
+    /// **≠** live justified; **≠** unlock; **≠** Pass.
+    pub apply_ready: bool,
+    /// Always true on product surface: never load aged disk UVAs as default.
+    pub refuse_stale_disk: bool,
+    /// Soft detail token (`ok` / `invalid_paddr` / `disk_refuse` / …).
+    pub detail: String,
+}
+
+impl SameShotRelaPlan {
+    /// `(ifm, wts, ofm, ctrl)` for rela when [`Self::apply_ready`]; ctrl defaults 0.
+    #[must_use]
+    pub fn as_io_tuple(&self) -> Option<(u64, u64, u64, u64)> {
+        if !self.apply_ready {
+            return None;
+        }
+        let i = self.ifm_paddr.filter(|&a| is_valid_device_paddr(a))?;
+        let w = self.wts_paddr.filter(|&a| is_valid_device_paddr(a))?;
+        let o = self.ofm_paddr.filter(|&a| is_valid_device_paddr(a))?;
+        let c = self
+            .ctrl_paddr
+            .filter(|&a| is_valid_device_paddr(a))
+            .unwrap_or(0);
+        Some((i, w, o, c))
+    }
+
+    /// Soft plan note — always invent_pass=0 not_ran_on_npu=1 same_shot=0|1.
+    #[must_use]
+    pub fn format_note(&self) -> String {
+        format_same_shot_rela_plan_note(self)
+    }
+}
+
+/// Pure apply research result for same-shot rela (offline TDD / lab hook).
+///
+/// Does **not** invent Pass. `patched_ctrltext` may be present for research
+/// write-back; never claims residual match or live success.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SameShotRelaApplyResult {
+    /// Echo of plan.same_shot.
+    pub same_shot: bool,
+    /// Echo of plan.apply_ready before patch attempt.
+    pub apply_ready: bool,
+    /// True when pure-direct patch + classic walk succeeded.
+    pub patch_ok: bool,
+    /// Classic v0.1 walk after patch.
+    pub classic_walk_ok: bool,
+    /// `.rela.dyn` count when known.
+    pub rela_count: Option<usize>,
+    /// Patched ctrltext length when patch produced bytes.
+    pub patched_len: Option<usize>,
+    /// Patched ctrltext bytes when patch succeeded (research write-back).
+    pub patched_ctrltext: Option<Vec<u8>>,
+    /// Soft detail (`ok` / `plan_not_ready` / `patch_failed` / …).
+    pub detail: String,
+}
+
+impl SameShotRelaApplyResult {
+    /// Soft apply note — always invent_pass=0 not_ran_on_npu=1.
+    #[must_use]
+    pub fn format_note(&self) -> String {
+        format_same_shot_rela_apply_note(self)
+    }
+}
+
+/// Pure token table for `XDNA2_LAB_SAME_SHOT_RELA` (no process env).
+///
+/// Accepts `1` / `true` / `yes` / `on` (case-insensitive). Empty / unset /
+/// other → false (default product path unchanged).
+#[must_use]
+pub fn lab_same_shot_rela_env_token_is_enabled(raw: Option<&str>) -> bool {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Read process env [`ENV_LAB_SAME_SHOT_RELA`]. Default false.
+///
+/// Env alone ≠ unlock ≠ Pass. Used by timed lab hook only.
+#[must_use]
+pub fn lab_same_shot_rela_env_requested() -> bool {
+    lab_same_shot_rela_env_token_is_enabled(std::env::var(ENV_LAB_SAME_SHOT_RELA).ok().as_deref())
+}
+
+/// Plan same-shot rela from **in-process** BO `xdna_addr` values.
+///
+/// Pure offline. Refuses zeros / `u64::MAX` (never invents). Source is always
+/// `InProcessBoMap`. `same_shot` and `apply_ready` are true only when
+/// ifm+wts+ofm paddrs are valid (`same_shot = paddrs_valid`) so last_apply
+/// greps for `same_shot=1` mean map succeeded, not merely "source in-process".
+/// Ctrl optional (absent → 0 at apply). `env_requested` is caller-supplied
+/// (from env or force for tests).
+#[must_use]
+pub fn plan_same_shot_rela_from_io_paddrs(
+    ifm: u64,
+    wts: u64,
+    ofm: u64,
+    ctrl: u64,
+    env_requested: bool,
+) -> SameShotRelaPlan {
+    let ifm_paddr = some_valid_device_paddr(ifm);
+    let wts_paddr = some_valid_device_paddr(wts);
+    let ofm_paddr = some_valid_device_paddr(ofm);
+    let ctrl_paddr = some_valid_device_paddr(ctrl);
+    let paddrs_valid = ifm_paddr.is_some() && wts_paddr.is_some() && ofm_paddr.is_some();
+    // same_shot=1 only with a real valid in-process map (not source-only).
+    let same_shot = paddrs_valid;
+    let apply_ready = paddrs_valid;
+    let detail = if paddrs_valid {
+        "ok".into()
+    } else {
+        "invalid_paddr".into()
+    };
+    SameShotRelaPlan {
+        env_requested,
+        same_shot,
+        paddrs_valid,
+        ifm_paddr,
+        wts_paddr,
+        ofm_paddr,
+        ctrl_paddr,
+        source: SameShotPaddrSource::InProcessBoMap,
+        apply_ready,
+        refuse_stale_disk: true,
+        detail,
+    }
+}
+
+/// Plan from a disk extract — **always** refuse product apply (`same_shot=0`).
+///
+/// Closes the W9 gap in product code: last_apply / vendor JSON UVAs age out and
+/// must not become the default live rela bases. Research offline patch may still
+/// use [`research_live_mapped_rela_from_extract`]; this plan only documents refuse.
+#[must_use]
+pub fn plan_same_shot_rela_from_disk_extract(
+    extract: &LivePaddrsExtract,
+    env_requested: bool,
+) -> SameShotRelaPlan {
+    let source = match extract.source {
+        "vendor_json" => SameShotPaddrSource::DiskVendorJson,
+        "last_apply_json" | "detail" => SameShotPaddrSource::DiskLastApply,
+        _ if extract.live_paddrs_present => SameShotPaddrSource::DiskLastApply,
+        _ => SameShotPaddrSource::Absent,
+    };
+    let paddrs_valid = extract.live_paddrs_present
+        || (extract.ifm_paddr.is_some()
+            && extract.wts_paddr.is_some()
+            && extract.ofm_paddr.is_some());
+    // Product apply always refused for disk sources.
+    let apply_ready = false;
+    let detail = if source == SameShotPaddrSource::Absent {
+        "absent".into()
+    } else {
+        "disk_refuse_stale_uva".into()
+    };
+    SameShotRelaPlan {
+        env_requested,
+        same_shot: false,
+        paddrs_valid,
+        ifm_paddr: extract.ifm_paddr.filter(|&a| is_valid_device_paddr(a)),
+        wts_paddr: extract.wts_paddr.filter(|&a| is_valid_device_paddr(a)),
+        ofm_paddr: extract.ofm_paddr.filter(|&a| is_valid_device_paddr(a)),
+        ctrl_paddr: extract.ctrl_paddr.filter(|&a| is_valid_device_paddr(a)),
+        source,
+        apply_ready,
+        refuse_stale_disk: true,
+        detail,
+    }
+}
+
+/// Soft plan note. Always:
+/// - `same_shot=0|1`
+/// - `invent_pass=0`
+/// - `not_ran_on_npu=1`
+/// - `not_c_ready=1`
+/// - `refuse_stale_disk=1`
+/// - never Pass / residual_matched
+#[must_use]
+pub fn format_same_shot_rela_plan_note(p: &SameShotRelaPlan) -> String {
+    let mut parts = vec![
+        SAME_SHOT_RELA_PLAN_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "residual_matched_claim=0".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "same_shot_alone_not_pass=1".into(),
+        "same_shot_alone_not_unlock=1".into(),
+        format!("same_shot={}", u8::from(p.same_shot)),
+        format!("env_requested={}", u8::from(p.env_requested)),
+        format!("paddrs_valid={}", u8::from(p.paddrs_valid)),
+        format!("apply_ready={}", u8::from(p.apply_ready)),
+        format!("refuse_stale_disk={}", u8::from(p.refuse_stale_disk)),
+        format!("source={}", p.source.as_str()),
+        format!("env_name={ENV_LAB_SAME_SHOT_RELA}"),
+    ];
+    if let Some(a) = p.ifm_paddr {
+        parts.push(format!("ifm_paddr=0x{a:x}"));
+    }
+    if let Some(a) = p.wts_paddr {
+        parts.push(format!("wts_paddr=0x{a:x}"));
+    }
+    if let Some(a) = p.ofm_paddr {
+        parts.push(format!("ofm_paddr=0x{a:x}"));
+    }
+    if let Some(a) = p.ctrl_paddr {
+        parts.push(format!("ctrl_paddr=0x{a:x}"));
+    }
+    if !p.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&p.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// Soft apply note. Always invent_pass=0 not_ran_on_npu=1 same_shot=0|1.
+#[must_use]
+pub fn format_same_shot_rela_apply_note(r: &SameShotRelaApplyResult) -> String {
+    let mut parts = vec![
+        SAME_SHOT_RELA_APPLY_NOTE.into(),
+        "invent_pass=0".into(),
+        "not_c_ready=1".into(),
+        "not_ran_on_npu=1".into(),
+        "residual_matched_claim=0".into(),
+        "product_pass_requires_live_decide=1".into(),
+        "same_shot_apply_alone_not_pass=1".into(),
+        format!("same_shot={}", u8::from(r.same_shot)),
+        format!("apply_ready={}", u8::from(r.apply_ready)),
+        format!("patch_ok={}", u8::from(r.patch_ok)),
+        format!("classic_walk_ok={}", u8::from(r.classic_walk_ok)),
+    ];
+    if let Some(n) = r.rela_count {
+        parts.push(format!("rela_count={n}"));
+    }
+    if let Some(n) = r.patched_len {
+        parts.push(format!("patched_len={n}"));
+    }
+    if !r.detail.is_empty() {
+        parts.push(format!(
+            "detail={}",
+            sanitize_soft_note_field_value(&r.detail)
+        ));
+    }
+    parts.join(" ")
+}
+
+/// Soft bag name for compact last_apply tokens when same-shot gate is on.
+pub const SAME_SHOT_LAST_APPLY_GATE_NOTE: &str = "same_shot_last_apply_gate";
+
+/// Compact **loud** last_apply tokens when `XDNA2_LAB_SAME_SHOT_RELA` is on.
+///
+/// Live-shot-effective S2: result JSON / detail must be scannable for
+/// `same_shot_gate=1` and `same_shot=0|1` without decoding the full plan note.
+/// Always honesty: invent_pass=0 not_ran_on_npu=1 not_c_ready=1.
+/// Gate tokens alone ≠ Pass ≠ unlock ≠ residual match.
+#[must_use]
+pub fn format_same_shot_last_apply_gate_tokens(plan: &SameShotRelaPlan) -> String {
+    [
+        SAME_SHOT_LAST_APPLY_GATE_NOTE,
+        "same_shot_gate=1",
+        &format!("same_shot={}", u8::from(plan.same_shot)),
+        &format!("env_requested={}", u8::from(plan.env_requested)),
+        &format!("apply_ready={}", u8::from(plan.apply_ready)),
+        &format!("paddrs_valid={}", u8::from(plan.paddrs_valid)),
+        &format!("source={}", plan.source.as_str()),
+        &format!("refuse_stale_disk={}", u8::from(plan.refuse_stale_disk)),
+        "invent_pass=0",
+        "not_c_ready=1",
+        "not_ran_on_npu=1",
+        "residual_matched_claim=0",
+        "same_shot_alone_not_pass=1",
+        "same_shot_alone_not_unlock=1",
+        "product_pass_requires_live_decide=1",
+        &format!("env_name={ENV_LAB_SAME_SHOT_RELA}"),
+    ]
+    .join(" ")
+}
+
+/// Join compact gate tokens + full plan note for last_apply `detail` (gate on).
+///
+/// Leading short tokens stay easy to `rg same_shot_gate=` after a shot.
+#[must_use]
+pub fn format_same_shot_last_apply_detail(plan: &SameShotRelaPlan) -> String {
+    format!(
+        "{}; {}",
+        format_same_shot_last_apply_gate_tokens(plan),
+        format_same_shot_rela_plan_note(plan)
+    )
+}
+
+/// Pure-direct same-shot rela apply research (offline).
+///
+/// When `plan.apply_ready` and ELF is aiebu, peels/patches with plan paddrs via
+/// [`patch_aiebu_elf_ctrltext_with_bos_ex`] + classic walk. Never invents paddrs
+/// or Pass. Disk plans (`apply_ready=false`) soft-refuse without patching.
+#[must_use]
+pub fn apply_same_shot_rela_research(
+    elf: &[u8],
+    plan: &SameShotRelaPlan,
+    mode: LabRelaMode,
+) -> SameShotRelaApplyResult {
+    if !plan.apply_ready {
+        return SameShotRelaApplyResult {
+            same_shot: plan.same_shot,
+            apply_ready: false,
+            patch_ok: false,
+            classic_walk_ok: false,
+            detail: if plan.detail.is_empty() {
+                "plan_not_ready".into()
+            } else {
+                plan.detail.clone()
+            },
+            ..SameShotRelaApplyResult::default()
+        };
+    }
+    let Some((ifm, wts, ofm, ctrl)) = plan.as_io_tuple() else {
+        return SameShotRelaApplyResult {
+            same_shot: plan.same_shot,
+            apply_ready: false,
+            detail: "io_tuple_missing".into(),
+            ..SameShotRelaApplyResult::default()
+        };
+    };
+    if elf.is_empty() {
+        return SameShotRelaApplyResult {
+            same_shot: plan.same_shot,
+            apply_ready: true,
+            detail: "elf_empty_skip".into(),
+            ..SameShotRelaApplyResult::default()
+        };
+    }
+    if !is_aiebu_elf_ctrltext(elf) {
+        return SameShotRelaApplyResult {
+            same_shot: plan.same_shot,
+            apply_ready: true,
+            detail: "not_aiebu_elf".into(),
+            ..SameShotRelaApplyResult::default()
+        };
+    }
+    let rela_count = parse_elf32_rela_dyn(elf).ok().map(|r| r.len());
+    // Ctrl optional offline: when 0, audit path needs a non-zero base for sym4.
+    let ctrl_for_patch = if is_valid_device_paddr(ctrl) {
+        ctrl
+    } else {
+        ofm
+    };
+    let patched =
+        match patch_aiebu_elf_ctrltext_with_bos_ex(elf, ifm, wts, ofm, ctrl_for_patch, mode) {
+            Ok(p) => p,
+            Err(e) => {
+                return SameShotRelaApplyResult {
+                    same_shot: plan.same_shot,
+                    apply_ready: true,
+                    rela_count,
+                    detail: format!("patch_failed:{e}"),
+                    ..SameShotRelaApplyResult::default()
+                };
+            }
+        };
+    let body_len = patched.len();
+    let expect_staged = body_len == 1688;
+    match validate_patched_ctrltext_classic(&patched, expect_staged) {
+        Ok(_kind) => SameShotRelaApplyResult {
+            same_shot: plan.same_shot,
+            apply_ready: true,
+            patch_ok: true,
+            classic_walk_ok: true,
+            rela_count,
+            patched_len: Some(body_len),
+            patched_ctrltext: Some(patched),
+            detail: "ok".into(),
+        },
+        Err(e) => SameShotRelaApplyResult {
+            same_shot: plan.same_shot,
+            apply_ready: true,
+            patch_ok: false,
+            classic_walk_ok: false,
+            rela_count,
+            patched_len: Some(body_len),
+            patched_ctrltext: Some(patched),
+            detail: format!("classic_walk_failed:{e}"),
+        },
+    }
+}
+
 /// Best-effort write of last apply snapshot. Never panics; ignores I/O errors.
 pub fn write_last_apply_best_effort(
     result: &TimedOpResult,
@@ -10286,10 +17666,10 @@ pub fn write_last_apply_to_path(
         return;
     }
     // Refuse if path is a symlink (TOCTOU residual accepted for lab tool).
-    if let Ok(meta) = std::fs::symlink_metadata(&owned) {
-        if meta.file_type().is_symlink() {
-            return;
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(&owned)
+        && meta.file_type().is_symlink()
+    {
+        return;
     }
     let layout_bare = layout.strip_prefix("layout=").unwrap_or(layout);
     let body = serde_json::json!({
@@ -10318,13 +17698,12 @@ pub fn write_last_apply_to_path(
     });
     // Only create parent if it is the known lab or temp dir (not arbitrary depth).
     // Use clamped temp root so TMPDIR=/ does not allow create_dir_all everywhere.
-    if let Some(parent) = owned.parent() {
-        if parent.is_dir()
+    if let Some(parent) = owned.parent()
+        && (parent.is_dir()
             || parent.ends_with("xdna2_cmd")
-            || parent.starts_with(last_apply_temp_root())
-        {
-            let _ = std::fs::create_dir_all(parent);
-        }
+            || parent.starts_with(last_apply_temp_root()))
+    {
+        let _ = std::fs::create_dir_all(parent);
     }
     let Ok(s) = serde_json::to_string_pretty(&body) else {
         return;
@@ -10424,7 +17803,7 @@ fn write_shdr(out: &mut Vec<u8>, name: u32, sh_type: u32, offset: u32, size: u32
 mod tests {
     use super::*;
     use crate::backends::amd_xdna2::txn::{
-        build_strix_research_noop_txn, patch_aiebu_elf_ctrltext_with_bos,
+        build_minimal_noop_txn, build_strix_research_noop_txn, patch_aiebu_elf_ctrltext_with_bos,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -10434,7 +17813,7 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// RAII restore of `TMPDIR` after test mutation (panic-safe).
@@ -10446,13 +17825,13 @@ mod tests {
     impl TmpdirEnvGuard {
         #[allow(unsafe_code)] // test-only env isolation
         fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let _lock = tmpdir_env_lock();
+            let lock = tmpdir_env_lock();
             let prev = std::env::var_os("TMPDIR");
             // SAFETY: exclusive under tmpdir_env_lock; Drop restores.
             unsafe {
                 std::env::set_var("TMPDIR", value);
             }
-            Self { prev, _lock }
+            Self { prev, _lock: lock }
         }
     }
 
@@ -10604,7 +17983,10 @@ mod tests {
         // Legacy treats all as props → prop_count at 20 is non-zero.
         let legacy = build_ert_start_npu_cmd_bo(0x1000, 1688, &kargs, 0x1).expect("legacy");
         let leg_pc = prop_count_from_start_npu_cmd_bo(&legacy).expect("leg");
-        assert_eq!(leg_pc, kargs.len() as u32);
+        assert_eq!(
+            leg_pc,
+            u32::try_from(kargs.len()).expect("value fits in u32")
+        );
         assert_ne!(leg_pc, 0);
         // Wrong-offset check would still see 0 on legacy (n_bos hi) — prove the trap.
         let legacy_at_28 = u32::from_le_bytes(legacy[28..32].try_into().unwrap());
@@ -10986,6 +18368,7 @@ mod tests {
 
     /// C3: coarse fingerprint equality + locked baseline shape (no new research matrix).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn last_apply_fixture_fingerprint_and_locked_baseline() {
         let detail = "EXEC_CMD+WAIT seq=0 ert_state=5(Error) accepted but OFM verify refused \
             (Some(SubmitWaitNotOk)); inst_blob content=1688B bo_size=4096B ty=Dev \
@@ -11184,39 +18567,49 @@ mod tests {
         ));
         assert!(journal_line_has_app_load_hint("APP_LOAD_PDI_FAIL residual"));
         assert!(!journal_line_has_app_load_hint("amdxdna: CREATE_HWCTX ok"));
-        // Fixture on disk (when present) is locked baseline — C3 skip target.
+        // Gitignored operator-private last_apply.json. Hard-check the locked
+        // APP_LOAD baseline only when that file has the shape. A hwctx_ok
+        // snapshot (EXEC_CMD not attempted) is not that baseline.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd/last_apply.json");
         if path.is_file() {
             let text = std::fs::read_to_string(&path).expect("read last_apply");
             let v: serde_json::Value = serde_json::from_str(&text).expect("json");
             let detail = v.get("detail").and_then(|x| x.as_str());
             let status = v.get("status").and_then(|x| x.as_str());
-            let aiebu = v.get("aiebu_elf").and_then(|x| x.as_bool());
-            let ert_error = v.get("ert_error").and_then(|x| x.as_bool());
-            let ran = v.get("ran_on_npu").and_then(|x| x.as_bool());
+            let aiebu = v.get("aiebu_elf").and_then(serde_json::Value::as_bool);
+            let ert_error = v.get("ert_error").and_then(serde_json::Value::as_bool);
+            let ran = v.get("ran_on_npu").and_then(serde_json::Value::as_bool);
             let rela = v
                 .get("rela_count")
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok());
-            assert!(
-                last_apply_matches_locked_app_load_baseline(
-                    status, aiebu, ert_error, ran, detail, rela
-                ),
-                "repo fixture must match locked APP_LOAD baseline for C3_SKIP"
-            );
-            let fp_fix =
-                last_apply_evidence_fingerprint(status, aiebu, ert_error, ran, detail, rela);
-            assert!(last_apply_is_same_fixture_fingerprint(&fp_fix, &fp_fix));
-            assert_eq!(fp_fix.ran_on_npu, Some(false));
-            assert!(
-                !fp_fix.config_cu_present,
-                "repo fixture last_apply must have config_cu_present=false (pre-P4 sandwich)"
-            );
-            if let Some(d) = detail {
-                let sig = parse_last_apply_detail_signals(d);
-                assert!(!last_apply_config_cu_present(&sig));
-                assert!(!sig.config_cu_failed);
-                assert_eq!(sig.config_cu, None);
+            if last_apply_matches_locked_app_load_baseline(
+                status, aiebu, ert_error, ran, detail, rela,
+            ) {
+                assert!(
+                    last_apply_matches_locked_app_load_baseline(
+                        status, aiebu, ert_error, ran, detail, rela
+                    ),
+                    "repo fixture must match locked APP_LOAD baseline for C3_SKIP"
+                );
+                let fp_fix =
+                    last_apply_evidence_fingerprint(status, aiebu, ert_error, ran, detail, rela);
+                assert!(last_apply_is_same_fixture_fingerprint(&fp_fix, &fp_fix));
+                assert_eq!(fp_fix.ran_on_npu, Some(false));
+                assert!(
+                    !fp_fix.config_cu_present,
+                    "repo fixture last_apply must have config_cu_present=false (pre-P4 sandwich)"
+                );
+                if let Some(d) = detail {
+                    let sig = parse_last_apply_detail_signals(d);
+                    assert!(!last_apply_config_cu_present(&sig));
+                    assert!(!sig.config_cu_failed);
+                    assert_eq!(sig.config_cu, None);
+                }
+            } else {
+                eprintln!(
+                    "OFFLINE_ASSET_SKIP: last_apply.json present but not locked APP_LOAD baseline"
+                );
             }
         }
     }
@@ -11319,9 +18712,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).expect("json");
         let detail = v.get("detail").and_then(|x| x.as_str());
         let status = v.get("status").and_then(|x| x.as_str());
-        let aiebu = v.get("aiebu_elf").and_then(|x| x.as_bool());
-        let ert_error = v.get("ert_error").and_then(|x| x.as_bool());
-        assert_eq!(v.get("ran_on_npu").and_then(|x| x.as_bool()), Some(false));
+        let aiebu = v.get("aiebu_elf").and_then(serde_json::Value::as_bool);
+        let ert_error = v.get("ert_error").and_then(serde_json::Value::as_bool);
+        let ran = v.get("ran_on_npu").and_then(serde_json::Value::as_bool);
+        assert_eq!(ran, Some(false));
+        let rela = v
+            .get("rela_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        if !last_apply_matches_locked_app_load_baseline(status, aiebu, ert_error, ran, detail, rela)
+        {
+            eprintln!(
+                "skip: last_apply.json present but not locked APP_LOAD baseline (operator-private)"
+            );
+            return;
+        }
         let class = classify_last_apply_residual(status, detail, aiebu, ert_error);
         assert_eq!(
             class,
@@ -11630,12 +19035,11 @@ mod tests {
         // Plant outside allowed roots: prefer /var/tmp, else $HOME/.cache.
         let mut real_outside = PathBuf::from(format!("/var/tmp/dragon_npu_la_out_{pid}"));
         if std::fs::create_dir_all(&real_outside).is_err() {
-            let home = match std::env::var_os("HOME") {
-                Some(h) => PathBuf::from(h).join(format!(".cache/dragon_npu_la_out_{pid}")),
-                None => {
-                    eprintln!("skip: no outside dir for mid-path symlink test");
-                    return;
-                }
+            let home = if let Some(h) = std::env::var_os("HOME") {
+                PathBuf::from(h).join(format!(".cache/dragon_npu_la_out_{pid}"))
+            } else {
+                eprintln!("skip: no outside dir for mid-path symlink test");
+                return;
             };
             if std::fs::create_dir_all(&home).is_err() {
                 eprintln!("skip: cannot create outside dir");
@@ -11643,12 +19047,9 @@ mod tests {
             }
             real_outside = home;
         }
-        let real_canon = match std::fs::canonicalize(&real_outside) {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = std::fs::remove_dir_all(&real_outside);
-                return;
-            }
+        let Ok(real_canon) = std::fs::canonicalize(&real_outside) else {
+            let _ = std::fs::remove_dir_all(&real_outside);
+            return;
         };
         if real_canon.starts_with(&temp_root) || real_canon.starts_with(&lab_root) {
             let _ = std::fs::remove_dir_all(&real_outside);
@@ -11892,6 +19293,445 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Progressive last_apply mid-path stamp: partial status + honesty trio.
+    ///
+    /// Contract: outer kill after a progressive write must leave JSON with
+    /// `lab_partial_*` status, `ran_on_npu: false`, and honesty tokens in detail.
+    /// Never product Pass. Pure offline (no /dev/accel).
+    #[test]
+    fn progressive_last_apply_partial_status_honesty() {
+        assert!(is_lab_partial_progressive_status(
+            LAB_PARTIAL_STATUS_HWCTX_OK
+        ));
+        assert!(is_lab_partial_progressive_status(
+            LAB_PARTIAL_STATUS_CONFIG_CU
+        ));
+        assert!(is_lab_partial_progressive_status(
+            LAB_PARTIAL_STATUS_PRE_SUBMIT
+        ));
+        assert!(!is_lab_partial_progressive_status("ert_cmd_error"));
+        assert!(!is_lab_partial_progressive_status("ok_npu_verified"));
+
+        let detail = format_lab_partial_detail("CREATE_HWCTX handle=1");
+        assert!(detail.contains(lab_partial_honesty_tokens()), "{detail}");
+        assert!(detail.contains("kill mid-ioctl"), "{detail}");
+        assert!(detail.contains("CREATE_HWCTX"), "{detail}");
+
+        let dir = last_apply_temp_root().join(format!(
+            "dragon_npu_last_apply_partial_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("last_apply.json");
+        let r = TimedOpResult {
+            op: "matmul".into(),
+            m: 1,
+            n: 1,
+            k: 1,
+            size_bytes: None,
+            dtype: "f32".into(),
+            total_s: 0.02,
+            host_prep_s: 0.01,
+            hwctx_s: Some(0.01),
+            fill_s: None,
+            submit_wait_s: None,
+            device_s: None,
+            host_ref_s: None,
+            host_ref_ok: false,
+            host_ref_detail: String::new(),
+            ran_on_npu: false,
+            ran_on_device_path: false,
+            real_ioctl: false,
+            status: LAB_PARTIAL_STATUS_PRE_SUBMIT.into(),
+            detail: format_lab_partial_detail(
+                "config_cu=1 pdi_bytes=283840 pre_submit invent_pass=0 not_ran_on_npu=1",
+            ),
+        };
+        write_last_apply_to_path(
+            &r,
+            LabBatchDiag {
+                tiles: 32,
+                qos_gops: 100,
+                qos_fps: 30,
+                rela_count: None,
+                aiebu_elf: None,
+                ert_error: false,
+                layout: "na",
+                instr_size_mode: "na",
+                rela_mode: "na",
+            },
+            "na",
+            0,
+            Some(&path),
+        );
+        let text = std::fs::read_to_string(&path).expect("partial written");
+        assert!(
+            text.contains(&format!("\"status\": \"{LAB_PARTIAL_STATUS_PRE_SUBMIT}\"")),
+            "{text}"
+        );
+        assert!(text.contains("\"ran_on_npu\": false"), "{text}");
+        assert!(text.contains("invent_pass=0"), "{text}");
+        assert!(text.contains("not_ran_on_npu=1"), "{text}");
+        assert!(text.contains("not_c_ready=1"), "{text}");
+        // Progressive ≠ locked APP_LOAD class invent.
+        let class = classify_last_apply_residual(
+            Some(LAB_PARTIAL_STATUS_PRE_SUBMIT),
+            Some(&r.detail),
+            None,
+            Some(false),
+        );
+        assert_ne!(class, SiliconResidualClass::AppLoadPdiFailAfterAiebu);
+        assert!(!class.is_locked_app_load_after_aiebu());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Journal soft taxonomy: timeout kill + IO_PAGE_FAULT + aie2_set_cmd_timeout.
+    /// Never invents Pass / C-ready / locked APP_LOAD from journal alone.
+    #[test]
+    fn journal_soft_taxonomy_timeout_and_page_fault() {
+        let empty = classify_journal_soft_signals("");
+        assert!(!empty.has_any());
+        assert_eq!(
+            empty.soft_residual_class_token(),
+            SiliconResidualClass::Unclassified.as_str()
+        );
+        let note_empty = empty.format_soft_note();
+        assert!(note_empty.contains("invent_pass=0"), "{note_empty}");
+        assert!(note_empty.contains("not_c_ready=1"), "{note_empty}");
+        assert!(note_empty.contains("not_ran_on_npu=1"), "{note_empty}");
+
+        // Live 2026-08-09 style paste (synthetic offline).
+        let liveish = "\
+npu_direct_bench killed by timeout; outer timeout 30s rc=124 lab exit 4\n\
+amdxdna: IO_PAGE_FAULT on cmd buffer\n\
+aie2_set_cmd_timeout: DPU PC 0xffffffff TXN OP ID 0xd ctx 15\n";
+        let tax = classify_journal_soft_signals(liveish);
+        assert!(tax.incomplete_outer_kill, "{tax:?}");
+        assert!(tax.io_page_fault, "{tax:?}");
+        assert!(tax.aie2_set_cmd_timeout, "{tax:?}");
+        assert_eq!(
+            tax.soft_residual_class_token(),
+            JOURNAL_SOFT_INCOMPLETE_CLASS
+        );
+        let note = tax.format_soft_note();
+        assert!(note.contains("incomplete_outer_kill=1"), "{note}");
+        assert!(note.contains("io_page_fault=1"), "{note}");
+        assert!(note.contains("aie2_set_cmd_timeout=1"), "{note}");
+        assert!(note.contains("invent_pass=0"), "{note}");
+        assert!(note.contains("not_c_ready=1"), "{note}");
+        assert!(note.contains("not_ran_on_npu=1"), "{note}");
+        assert!(
+            note.contains("product_pass_requires_live_decide=1"),
+            "{note}"
+        );
+        // Never confuse journal soft with locked APP_LOAD class token.
+        assert_ne!(
+            tax.soft_residual_class_token(),
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu.as_str()
+        );
+
+        let only_fault = classify_journal_soft_signals("kernel: IO_PAGE_FAULT at addr");
+        assert!(!only_fault.incomplete_outer_kill);
+        assert!(only_fault.io_page_fault);
+        assert!(!only_fault.aie2_set_cmd_timeout);
+
+        let benign = classify_journal_soft_signals("amdxdna: CREATE_HWCTX ok tiles=32");
+        assert!(!benign.has_any());
+    }
+
+    /// T3b: parse `bo_diag=[...]` live shape (DevHeap/instr/ifm xdna_addr).
+    #[test]
+    fn parse_bo_diag_from_detail_live_shaped() {
+        let detail = "submit_and_wait failed (wait_cmd_einval): os error 22; \
+bo_diag=[DevHeap: handle=1 ty=DevHeap map_offset=0x100000000 xdna_addr=0x4000000 \
+vaddr=0x7f0000000000 valid_addr=true; instr: handle=2 ty=Dev map_offset=0x200000000 \
+xdna_addr=0x4068000 vaddr=0x0 valid_addr=true; ifm: handle=3 ty=Shmem \
+map_offset=0xffffffffffffffff xdna_addr=0x7f6b0d000000 vaddr=0x7f6b0d000000 \
+valid_addr=true; wts: handle=4 ty=Shmem map_offset=0xffffffffffffffff \
+xdna_addr=0x7f6b0e000000 vaddr=0x7f6b0e000000 valid_addr=true; ofm: handle=5 \
+ty=Shmem map_offset=0xffffffffffffffff xdna_addr=0x7f6b0f000000 \
+vaddr=0x7f6b0f000000 valid_addr=true]";
+        let entries = parse_bo_diag_from_detail(detail);
+        assert_eq!(entries.len(), 5, "{entries:?}");
+        assert_eq!(entries[0].label, "DevHeap");
+        assert_eq!(entries[0].xdna_addr, Some(0x400_0000));
+        assert_eq!(entries[0].ty.as_deref(), Some("DevHeap"));
+        assert_eq!(entries[1].label, "instr");
+        assert_eq!(entries[1].xdna_addr, Some(0x406_8000));
+        assert_eq!(entries[2].label, "ifm");
+        assert_eq!(entries[2].xdna_addr, Some(0x7f6b_0d00_0000));
+        assert_eq!(entries[3].label, "wts");
+        assert_eq!(entries[3].xdna_addr, Some(0x7f6b_0e00_0000));
+        assert_eq!(entries[4].label, "ofm");
+        assert_eq!(entries[4].xdna_addr, Some(0x7f6b_0f00_0000));
+        assert_eq!(
+            parse_bo_diag_from_detail("no bo diag here"),
+            [] as [crate::backends::amd_xdna2::silicon_contract::BoDiagEntry; 0]
+        );
+    }
+
+    /// T3b: journal IO_PAGE_FAULT lines yield hex fault addresses (AMD-Vi style).
+    #[test]
+    fn parse_journal_io_page_fault_addrs_extracts_hex() {
+        assert_eq!(parse_journal_io_page_fault_addrs(""), [] as [u64; 0]);
+        assert_eq!(
+            parse_journal_io_page_fault_addrs("amdxdna: CREATE_HWCTX ok"),
+            [] as [u64; 0]
+        );
+        let j = "AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0000 address=0x2fff80007f40 \
+flags=0x0020]\namdxdna: aie2_set_cmd_timeout DPU PC 0xffffffff\n";
+        let addrs = parse_journal_io_page_fault_addrs(j);
+        assert!(
+            addrs.contains(&0x2fff_8000_7f40),
+            "expected live fault addr, got {addrs:?}"
+        );
+        // Domain/flags hex on the same line are not the fault address preference;
+        // address= token must be present.
+        assert_eq!(
+            addrs.iter().filter(|&&a| a == 0x2fff_8000_7f40).count(),
+            1,
+            "{addrs:?}"
+        );
+    }
+
+    /// T3b: fault vs BO spans — live 0x2fff… is orphan; in-span and near-base work.
+    #[test]
+    fn classify_fault_orphan_vs_in_span() {
+        let spans = [
+            BoSpan::new("DevHeap", 0x400_0000, BO_DIAG_DEFAULT_DEVHEAP_SIZE),
+            BoSpan::new("instr", 0x406_8000, BO_DIAG_DEFAULT_INSTR_SIZE),
+            BoSpan::new("ifm", 0x7f6b_0d00_0000, 2304),
+        ];
+        assert_eq!(
+            classify_fault_addr(0x2fff_8000_7f40, &spans, &[]),
+            FaultMapClass::Orphan
+        );
+        assert_eq!(
+            classify_fault_addr(0x7f6b_0d00_0010, &spans, &[]),
+            FaultMapClass::InBoSpan {
+                label: "ifm".into()
+            }
+        );
+        assert_eq!(
+            classify_fault_addr(0x406_8000, &spans, &[]),
+            FaultMapClass::InBoSpan {
+                label: "instr".into()
+            }
+        );
+        // Just past IFM size (2304) but still within near window of base.
+        let past = 0x7f6b_0d00_0000 + 2304 + 16;
+        assert_eq!(
+            classify_fault_addr(past, &spans, &[]),
+            FaultMapClass::NearBoBase {
+                label: "ifm".into()
+            }
+        );
+        // Rela target exact match wins when list present.
+        let rela = [(1_u32, 0x40_u32, 0x2fff_8000_7f40_u64)];
+        assert_eq!(
+            classify_fault_addr(0x2fff_8000_7f40, &spans, &rela),
+            FaultMapClass::MatchesRelaTarget {
+                sym: 1,
+                offset: 0x40
+            }
+        );
+    }
+
+    /// T3b: list overwrite rela targets from synthetic multi-sym ELF (asset-free).
+    #[test]
+    fn list_rela_patch_targets_synthetic_multi_sym() {
+        let ctrl = vec![0_u8; 64];
+        // info = (sym << 8) | type5; overwrite value = base[sym] + addend
+        let elf = build_minimal_test_elf32(
+            &ctrl,
+            &[
+                (0, (1 << 8) | 5, 0x10),
+                (8, (2 << 8) | 5, 0x20),
+                (16, (3 << 8) | 5, -4),
+                (24, (4 << 8) | 5, 0),
+            ],
+        );
+        let targets =
+            list_rela_patch_targets_overwrite(&elf, 0x1000, 0x2000, 0x3000, 0x4000).expect("list");
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[0], (1, 0, 0x1000 + 0x10));
+        assert_eq!(targets[1], (2, 8, 0x2000 + 0x20));
+        // Negative addend keeps the two's-complement bit pattern. try_from would reject it.
+        #[allow(clippy::cast_sign_loss)]
+        let neg_addend = (-4_i32) as u64;
+        assert_eq!(targets[2], (3, 16, 0x3000_u64.wrapping_add(neg_addend)));
+        assert_eq!(targets[3], (4, 24, 0x4000));
+    }
+
+    /// T3b composite: 11bc9016-shaped bo_diag + fault 0x2fff… → orphan; honesty trio.
+    #[test]
+    fn audit_io_page_fault_vs_lab_map_11bc9016_shaped_orphan() {
+        let detail = "real_ioctl=true aiebu_elf=1 rela_count=12 config_cu=1 pdi_bytes=283840; \
+submit_and_wait failed (wait_cmd_einval): Invalid argument (os error 22) timeout_ms=5000; \
+bo_diag=[DevHeap: handle=1 ty=DevHeap map_offset=0x100000000 xdna_addr=0x4000000 \
+vaddr=0x7f0000000000 valid_addr=true; instr: handle=2 ty=Dev map_offset=0x200000000 \
+xdna_addr=0x4068000 vaddr=0x0 valid_addr=true; ifm: handle=3 ty=Shmem \
+map_offset=0xffffffffffffffff xdna_addr=0x7f6b0d000000 vaddr=0x7f6b0d000000 \
+valid_addr=true; wts: handle=4 ty=Shmem map_offset=0xffffffffffffffff \
+xdna_addr=0x7f6b0e000000 vaddr=0x7f6b0e000000 valid_addr=true; ofm: handle=5 \
+ty=Shmem map_offset=0xffffffffffffffff xdna_addr=0x7f6b0f000000 \
+vaddr=0x7f6b0f000000 valid_addr=true; ctrl: handle=6 ty=Shmem \
+map_offset=0xffffffffffffffff xdna_addr=0x7f6b10000000 vaddr=0x7f6b10000000 \
+valid_addr=true]";
+        let journal = "AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0000 \
+address=0x2fff80007f40 flags=0x0020]\naie2_set_cmd_timeout: DPU PC 0xffffffff\n";
+        let audit = audit_io_page_fault_vs_lab_map(detail, Some(journal), None);
+        assert_eq!(audit.bo_entries.len(), 6, "{:?}", audit.bo_entries);
+        assert!(
+            audit.fault_addrs.contains(&0x2fff_8000_7f40),
+            "{:?}",
+            audit.fault_addrs
+        );
+        assert_eq!(audit.orphan_count, 1, "{audit:?}");
+        assert_eq!(audit.in_span_count, 0);
+        assert!(
+            audit
+                .classes
+                .iter()
+                .any(|c| c.fault == 0x2fff_8000_7f40 && c.class == FaultMapClass::Orphan),
+            "{:?}",
+            audit.classes
+        );
+        let note = audit.format_soft_note();
+        assert!(note.contains("invent_pass=0"), "{note}");
+        assert!(note.contains("not_c_ready=1"), "{note}");
+        assert!(note.contains("not_ran_on_npu=1"), "{note}");
+        assert!(
+            note.contains("product_pass_requires_live_decide=1"),
+            "{note}"
+        );
+        assert!(
+            note.contains("audit_alone_not_pass=1") || note.contains("io_page_fault_map_audit"),
+            "{note}"
+        );
+        // Never invent locked APP_LOAD or Pass from this audit alone.
+        // Note: honesty token is `not_ran_on_npu=1` (substring `ran_on_npu=1` is expected there).
+        assert!(
+            note.contains("not_ran_on_npu=1"),
+            "must keep honesty not_ran_on_npu: {note}"
+        );
+        assert!(
+            !note.contains("ran_on_npu=true") && !note.contains("detail_ran_on_npu=true"),
+            "must not claim product ran_on_npu: {note}"
+        );
+        assert_ne!(
+            audit.soft_residual_class_token(),
+            SiliconResidualClass::AppLoadPdiFailAfterAiebu.as_str()
+        );
+    }
+
+    /// T3c: fingerprint is len + sha256 prefix16; empty → len 0 / empty sha.
+    #[test]
+    fn fingerprint_pdi_blob_bytes_len_and_sha_prefix() {
+        assert_eq!(fingerprint_pdi_blob_bytes(&[]).len_bytes, 0);
+        assert_eq!(fingerprint_pdi_blob_bytes(&[]).sha256_prefix16, "");
+        let data = b"research-pdi-opaque-not-product";
+        let fp = fingerprint_pdi_blob_bytes(data);
+        assert_eq!(fp.len_bytes, data.len() as u64);
+        assert_eq!(fp.sha256_prefix16.len(), PDI_FINGERPRINT_SHA_PREFIX_HEX);
+        assert_eq!(fp.sha256_hex.len(), 64);
+        assert!(fp.sha256_hex.starts_with(&fp.sha256_prefix16));
+        let tok = fp.format_token();
+        assert!(tok.contains("pdi_fp len="), "{tok}");
+        assert!(tok.contains("sha16="), "{tok}");
+        // Stable digest for fixed input (offline lock).
+        let again = fingerprint_pdi_blob_bytes(data);
+        assert_eq!(fp.sha256_hex, again.sha256_hex);
+    }
+
+    /// T3c: default dump / live size is research overlay, never product known-good.
+    #[test]
+    fn research_pdi_identity_not_product_known_good() {
+        let locked = research_pdi_identity_default_dump_locked();
+        assert!(!locked.product_known_good);
+        assert!(locked.matches_live_research_dump_size);
+        assert_eq!(
+            locked.source_kind,
+            ResearchPdiSourceKind::CvmlAie2pResearchOverlay
+        );
+        assert_eq!(locked.len_bytes, Some(RESEARCH_PDI_DEFAULT_DUMP_BYTES));
+        let note = locked.format_soft_note();
+        assert!(
+            note.contains("research_pdi_not_product_known_good=1"),
+            "{note}"
+        );
+        assert!(note.contains("invent_pass=0"), "{note}");
+        assert!(note.contains("not_ran_on_npu=1"), "{note}");
+        assert!(note.contains("attach_measured_not_pass=1"), "{note}");
+        assert!(
+            note.contains("wrong_overlay_may_fault_or_app_load=1"),
+            "{note}"
+        );
+        assert!(note.contains("product_known_good=0"), "{note}");
+        assert_eq!(
+            locked.soft_residual_class_token(),
+            RESEARCH_PDI_IDENTITY_CLASS
+        );
+
+        // Hint path classifies CVML/AIE2P dump as research overlay.
+        let bytes = vec![0xABu8; 64];
+        let id = research_pdi_identity_from_bytes(
+            Some(&bytes),
+            Some("/tmp/AMD_AIE2P_4x4_Overlay_research_pdi.bin"),
+        );
+        assert_eq!(
+            id.source_kind,
+            ResearchPdiSourceKind::CvmlAie2pResearchOverlay
+        );
+        assert!(!id.product_known_good);
+        assert!(!id.matches_live_research_dump_size);
+        assert!(id.fingerprint.is_some());
+
+        // 11bc9016-shaped last_apply size only (no blob).
+        let sig = LastApplyDetailSignals {
+            config_cu: Some(1),
+            pdi_bytes: Some(
+                u32::try_from(RESEARCH_PDI_DEFAULT_DUMP_BYTES).expect("value fits in u32"),
+            ),
+            ..Default::default()
+        };
+        let from_la = research_pdi_identity_from_last_apply_signals(&sig, None, None);
+        assert_eq!(
+            from_la.source_kind,
+            ResearchPdiSourceKind::CvmlAie2pResearchOverlay
+        );
+        assert_eq!(from_la.len_bytes, Some(RESEARCH_PDI_DEFAULT_DUMP_BYTES));
+        assert!(from_la.matches_live_research_dump_size);
+        assert!(!from_la.product_known_good);
+        assert!(from_la.fingerprint.is_none());
+        let pre = format_research_pdi_preflight_note(&from_la);
+        assert!(
+            pre.contains("research_pdi_not_product_known_good=1"),
+            "{pre}"
+        );
+
+        // Absent
+        let absent = research_pdi_identity_from_bytes(None, None);
+        assert_eq!(absent.source_kind, ResearchPdiSourceKind::Absent);
+        assert_eq!(absent.soft_residual_class_token(), "research_pdi_absent");
+    }
+
+    /// T3c: parse soft pdi_fp from detail for offline last_apply compare.
+    #[test]
+    fn parse_pdi_fingerprint_from_detail_compact_and_split() {
+        assert!(parse_pdi_fingerprint_from_detail("").is_none());
+        assert!(parse_pdi_fingerprint_from_detail("config_cu=1 pdi_bytes=283840").is_none());
+        let compact = "real_ioctl=true config_cu=1 pdi_fp len=283840 sha16=deadbeefcafebabe; \
+submit wait failed";
+        let fp = parse_pdi_fingerprint_from_detail(compact).expect("compact");
+        assert_eq!(fp.len_bytes, 283_840);
+        assert_eq!(fp.sha256_prefix16, "deadbeefcafebabe");
+        let split = "pdi_fp_len=100 pdi_fp_sha16=0123456789abcdef other=1";
+        let fp2 = parse_pdi_fingerprint_from_detail(split).expect("split");
+        assert_eq!(fp2.len_bytes, 100);
+        assert_eq!(fp2.sha256_prefix16, "0123456789abcdef");
+    }
+
     #[test]
     fn parse_paddr_json_null_and_hex() {
         assert_eq!(
@@ -12013,7 +19853,7 @@ mod tests {
             ifm_paddr: Some(u64::MAX),
             wts_paddr: Some(0x10),
             ofm_paddr: Some(0x20),
-            ..raw.clone()
+            ..raw
         };
         assert!(!raw_max.paddrs_complete());
         assert!(raw_max.as_io_tuple().is_none());
@@ -12081,6 +19921,793 @@ mod tests {
         assert_eq!(p.source.as_deref(), Some("unit"));
     }
 
+    // -----------------------------------------------------------------------
+    // W8 Track Paddr — O3 live extract + M3 live-mapped rela + O1/O2 class
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn w8_o3_extract_live_paddrs_from_detail_present() {
+        let detail = "lab_ofm pack=mladf_a16w4; io_paddrs ifm=0x7f57b364c000 wts=0x7f57b3482000 \
+                      ofm=0x7f57b364b000 ctrl=0x7f57b3643000; \
+                      inst_blob content=1688B bo_size=4096 xdna_addr=0x4020000 ty=Dev; \
+                      ofm_stats=...";
+        let e = extract_live_paddrs_from_detail(detail);
+        assert!(e.live_paddrs_present);
+        assert_eq!(e.ifm_paddr, Some(0x7f57_b364_c000));
+        assert_eq!(e.wts_paddr, Some(0x7f57_b348_2000));
+        assert_eq!(e.ofm_paddr, Some(0x7f57_b364_b000));
+        assert_eq!(e.ctrl_paddr, Some(0x7f57_b364_3000));
+        assert_eq!(e.instr_paddr, Some(0x402_0000));
+        assert_eq!(e.source, "detail");
+        let n = format_live_paddrs_research_note(&e);
+        assert!(residual_note_has_exact_token(&n, LIVE_PADDRS_RESEARCH_NOTE));
+        assert!(residual_note_has_exact_token(&n, "live_paddrs_present=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "residual_matched_claim=0"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+        assert!(e.as_io_tuple().is_some());
+    }
+
+    #[test]
+    fn w8_o3_extract_live_paddrs_absent_and_refuse_zeros() {
+        let empty = extract_live_paddrs_from_detail("");
+        assert!(!empty.live_paddrs_present);
+        assert_eq!(empty.source, "absent");
+        let n = format_live_paddrs_research_note(&empty);
+        assert!(residual_note_has_exact_token(&n, "live_paddrs_present=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+
+        let z = extract_live_paddrs_from_detail(
+            "io_paddrs ifm=0x0 wts=0x0 ofm=0x0 ctrl=0x0; xdna_addr=0x0",
+        );
+        assert!(!z.live_paddrs_present);
+        assert!(z.ifm_paddr.is_none());
+        assert!(z.instr_paddr.is_none());
+        // bo_diag instr path
+        let bo = extract_live_paddrs_from_detail(
+            "io_paddrs ifm=0x10 wts=0x20 ofm=0x30 ctrl=0x40; \
+             bo_diag=[DevHeap: xdna_addr=0x4000000; instr: xdna_addr=0x4068000 ty=Dev]",
+        );
+        assert!(bo.live_paddrs_present);
+        assert_eq!(bo.instr_paddr, Some(0x406_8000));
+    }
+
+    /// W9-B: bo_diag-only last_apply (no `io_paddrs` token) still yields live triad.
+    #[test]
+    fn w9_b_extract_live_paddrs_from_bo_diag_labels_alone() {
+        let detail = "hwctx ok; submit_and_wait failed (wait_cmd_einval); \
+             bo_diag=[DevHeap: handle=1 ty=DevHeap xdna_addr=0x4000000 vaddr=0x7fcbe4000000; \
+             instr: handle=3 ty=Dev xdna_addr=0x4028000 vaddr=0x7fcbe4028000; \
+             ifm: handle=4 ty=Shmem xdna_addr=0x7fcbe9a30000 vaddr=0x7fcbe9a30000; \
+             wts: handle=5 ty=Shmem xdna_addr=0x7fcbe977f000 vaddr=0x7fcbe977f000; \
+             ofm: handle=6 ty=Shmem xdna_addr=0x7fcbe9a2f000 vaddr=0x7fcbe9a2f000; \
+             ctrl: handle=7 ty=Shmem xdna_addr=0x7fcbe9a27000 vaddr=0x7fcbe9a27000]";
+        assert!(!detail.contains("io_paddrs"));
+        let e = extract_live_paddrs_from_detail(detail);
+        assert!(
+            e.live_paddrs_present,
+            "bo_diag labels alone must count: {e:?}"
+        );
+        assert_eq!(e.ifm_paddr, Some(0x7fcb_e9a3_0000));
+        assert_eq!(e.wts_paddr, Some(0x7fcb_e977_f000));
+        assert_eq!(e.ofm_paddr, Some(0x7fcb_e9a2_f000));
+        assert_eq!(e.ctrl_paddr, Some(0x7fcb_e9a2_7000));
+        assert_eq!(e.instr_paddr, Some(0x402_8000));
+        assert_eq!(
+            e.as_io_tuple(),
+            Some((
+                0x7fcb_e9a3_0000,
+                0x7fcb_e977_f000,
+                0x7fcb_e9a2_f000,
+                0x7fcb_e9a2_7000,
+            ))
+        );
+    }
+
+    /// W9-B: L1b readiness checklist — paddrs absent → offline/live unjustified.
+    #[test]
+    fn w9_b_l1b_readiness_absent_paddrs_not_justified() {
+        let empty = LivePaddrsExtract {
+            source: "absent",
+            ..LivePaddrsExtract::default()
+        };
+        let r = evaluate_l1b_readiness(&empty, false);
+        assert!(!r.live_paddrs_present);
+        assert!(!r.paddr_evidence_ready);
+        assert!(!r.l1b_offline_ready);
+        assert!(!r.l1b_live_justified);
+        assert!(!r.unlock_active);
+        assert!(r.unlock_required);
+        assert!(!r.residual_matched);
+        let n = format_l1b_readiness_checklist(&r);
+        assert!(residual_note_has_exact_token(
+            &n,
+            L1B_READINESS_CHECKLIST_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "live_paddrs_present=0"));
+        assert!(residual_note_has_exact_token(&n, "unlock_active=0"));
+        assert!(residual_note_has_exact_token(&n, "unlock_required=1"));
+        assert!(residual_note_has_exact_token(&n, "paddr_evidence_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "l1b_offline_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "l1b_live_justified=0"));
+        assert!(residual_note_has_exact_token(&n, "residual_matched=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "checklist_alone_not_unlock=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "l1b_live_justified=1"));
+        // Convenience wrapper (offline unlock=false).
+        let n2 = format_l1b_readiness_checklist_from_extract(&empty);
+        assert!(residual_note_has_exact_token(&n2, "l1b_live_justified=0"));
+    }
+
+    /// W9-B: paddrs present + unlock=false → offline ready, live **not** justified.
+    #[test]
+    fn w9_b_l1b_readiness_paddrs_present_unlock_still_required() {
+        let e = LivePaddrsExtract {
+            ifm_paddr: Some(0x7f57_b364_c000),
+            wts_paddr: Some(0x7f57_b348_2000),
+            ofm_paddr: Some(0x7f57_b364_b000),
+            ctrl_paddr: Some(0x7f57_b364_3000),
+            instr_paddr: Some(0x402_0000),
+            live_paddrs_present: true,
+            source: "vendor_json",
+        };
+        // Offline prep: unlock_active=false (no mint).
+        let r = evaluate_l1b_readiness(&e, false);
+        assert!(r.live_paddrs_present);
+        assert!(r.paddr_evidence_ready);
+        assert!(r.l1b_offline_ready);
+        assert!(!r.l1b_live_justified, "unlock still required offline");
+        assert!(r.unlock_required);
+        assert!(!r.unlock_active);
+        assert!(!r.residual_matched);
+        let n = r.format_checklist();
+        assert!(residual_note_has_exact_token(&n, "live_paddrs_present=1"));
+        assert!(residual_note_has_exact_token(&n, "paddr_evidence_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "unlock_required=1"));
+        assert!(residual_note_has_exact_token(&n, "unlock_active=0"));
+        assert!(residual_note_has_exact_token(&n, "l1b_offline_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "l1b_live_justified=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "true_post_patch_missing=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            &format!("oracle_sha16={LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16}")
+        ));
+        assert!(residual_note_has_exact_token(&n, "INSTR_BO_LIMIT=1"));
+        assert!(!residual_note_has_exact_token(&n, "l1b_live_justified=1"));
+
+        // With unlock_active=true (hypothetical; offline does not mint) → justified.
+        let live = evaluate_l1b_readiness(&e, true);
+        assert!(live.l1b_live_justified);
+        assert!(live.unlock_active);
+        let ln = format_l1b_readiness_checklist(&live);
+        assert!(residual_note_has_exact_token(&ln, "l1b_live_justified=1"));
+        assert!(residual_note_has_exact_token(&ln, "unlock_active=1"));
+        // Still never invent Pass.
+        assert!(residual_note_has_exact_token(&ln, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&ln, "residual_matched=0"));
+    }
+
+    /// W9-B: vendor_paddrs_from_last_apply fixture → offline ready, live unjustified.
+    #[test]
+    fn w9_b_l1b_readiness_from_vendor_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd");
+        let vp = root.join("gt_capture/vendor_paddrs_from_last_apply.json");
+        if !vp.is_file() {
+            eprintln!("skip: no vendor_paddrs_from_last_apply.json");
+            return;
+        }
+        let text = std::fs::read_to_string(&vp).expect("read vendor paddrs");
+        let e = extract_live_paddrs_from_vendor_json(&text);
+        assert!(e.live_paddrs_present);
+        let n = format_l1b_readiness_checklist_from_extract(&e);
+        assert!(residual_note_has_exact_token(&n, "live_paddrs_present=1"));
+        assert!(residual_note_has_exact_token(&n, "paddr_evidence_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "l1b_offline_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "l1b_live_justified=0"));
+        assert!(residual_note_has_exact_token(&n, "unlock_required=1"));
+        assert!(residual_note_has_exact_token(&n, "unlock_active=0"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+    }
+
+    /// live-shot-effective S2: compact last_apply gate tokens when same-shot on.
+    ///
+    /// Formatters are for env-on last_apply only (`XDNA2_LAB_SAME_SHOT_RELA`
+    /// gate open). They always emit `same_shot_gate=1` (never `same_shot_gate=0`);
+    /// success vs refuse is `same_shot=1` / `apply_ready=1` vs `same_shot=0`.
+    #[test]
+    fn w10_b_same_shot_last_apply_gate_tokens_loud() {
+        let plan = plan_same_shot_rela_from_io_paddrs(
+            0x7fcb_e9a3_0000,
+            0x7fcb_e977_f000,
+            0x7fcb_e9a2_f000,
+            0x7fcb_e9a2_7000,
+            true,
+        );
+        let g = format_same_shot_last_apply_gate_tokens(&plan);
+        assert!(residual_note_has_exact_token(
+            &g,
+            SAME_SHOT_LAST_APPLY_GATE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&g, "same_shot_gate=1"));
+        assert!(residual_note_has_exact_token(&g, "same_shot=1"));
+        assert!(residual_note_has_exact_token(&g, "env_requested=1"));
+        assert!(residual_note_has_exact_token(&g, "apply_ready=1"));
+        assert!(residual_note_has_exact_token(&g, "paddrs_valid=1"));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "source=in_process_bo_map"
+        ));
+        assert!(residual_note_has_exact_token(&g, "refuse_stale_disk=1"));
+        assert!(residual_note_has_exact_token(&g, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&g, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&g, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "same_shot_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "same_shot_alone_not_unlock=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &g,
+            &format!("env_name={ENV_LAB_SAME_SHOT_RELA}")
+        ));
+        assert!(!residual_note_has_exact_token(&g, "invent_pass=1"));
+        assert!(!g.contains("ran_on_npu=true"));
+
+        let d = format_same_shot_last_apply_detail(&plan);
+        // Leading gate tokens then full plan note.
+        assert!(d.starts_with(SAME_SHOT_LAST_APPLY_GATE_NOTE));
+        assert!(d.contains(SAME_SHOT_RELA_PLAN_NOTE));
+        assert!(residual_note_has_exact_token(&d, "same_shot_gate=1"));
+        assert!(residual_note_has_exact_token(&d, "same_shot=1"));
+        assert!(residual_note_has_exact_token(&d, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&d, "not_ran_on_npu=1"));
+
+        // Disk refuse still emits same_shot_gate=1 (env on) with same_shot=0.
+        let e = LivePaddrsExtract {
+            ifm_paddr: Some(0x1000),
+            wts_paddr: Some(0x2000),
+            ofm_paddr: Some(0x3000),
+            ctrl_paddr: None,
+            instr_paddr: None,
+            live_paddrs_present: true,
+            source: "last_apply_json",
+        };
+        let disk = plan_same_shot_rela_from_disk_extract(&e, true);
+        let dg = format_same_shot_last_apply_gate_tokens(&disk);
+        assert!(residual_note_has_exact_token(&dg, "same_shot_gate=1"));
+        assert!(residual_note_has_exact_token(&dg, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&dg, "apply_ready=0"));
+        assert!(residual_note_has_exact_token(&dg, "source=disk_last_apply"));
+        assert!(residual_note_has_exact_token(&dg, "invent_pass=0"));
+        // Issue 8: detail for disk starts with gate bag; same_shot=0 honesty.
+        let dd = format_same_shot_last_apply_detail(&disk);
+        assert!(dd.starts_with(SAME_SHOT_LAST_APPLY_GATE_NOTE));
+        assert!(residual_note_has_exact_token(&dd, "same_shot_gate=1"));
+        assert!(residual_note_has_exact_token(&dd, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&dd, "invent_pass=0"));
+        assert!(dd.contains(SAME_SHOT_RELA_PLAN_NOTE));
+    }
+
+    /// live-shot-effective S2/Issue 6: invalid in-process paddrs → plan_failed shape.
+    ///
+    /// After Issue 1: `same_shot = paddrs_valid` so bad map yields same_shot=0
+    /// (not same_shot=1 false-positive). Gate tokens still same_shot_gate=1
+    /// when formatters are used (env-on only). Source remains in_process_bo_map.
+    #[test]
+    fn w10_b_same_shot_last_apply_gate_tokens_invalid_paddrs() {
+        let bad = plan_same_shot_rela_from_io_paddrs(0, 0x20, 0x30, 0x40, true);
+        assert!(!bad.same_shot, "same_shot=paddrs_valid; invalid → 0");
+        assert!(!bad.paddrs_valid);
+        assert!(!bad.apply_ready);
+        assert_eq!(bad.source, SameShotPaddrSource::InProcessBoMap);
+        assert_eq!(bad.detail, "invalid_paddr");
+
+        let g = format_same_shot_last_apply_gate_tokens(&bad);
+        assert!(residual_note_has_exact_token(
+            &g,
+            SAME_SHOT_LAST_APPLY_GATE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&g, "same_shot_gate=1"));
+        assert!(residual_note_has_exact_token(&g, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&g, "apply_ready=0"));
+        assert!(residual_note_has_exact_token(&g, "paddrs_valid=0"));
+        assert!(residual_note_has_exact_token(&g, "env_requested=1"));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "source=in_process_bo_map"
+        ));
+        assert!(residual_note_has_exact_token(&g, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&g, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&g, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &g,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(!residual_note_has_exact_token(&g, "same_shot=1"));
+        assert!(!residual_note_has_exact_token(&g, "invent_pass=1"));
+
+        let d = format_same_shot_last_apply_detail(&bad);
+        assert!(d.starts_with(SAME_SHOT_LAST_APPLY_GATE_NOTE));
+        assert!(residual_note_has_exact_token(&d, "same_shot_gate=1"));
+        assert!(residual_note_has_exact_token(&d, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&d, "apply_ready=0"));
+        assert!(residual_note_has_exact_token(&d, "paddrs_valid=0"));
+        assert!(residual_note_has_exact_token(&d, "invent_pass=0"));
+        assert!(d.contains(SAME_SHOT_RELA_PLAN_NOTE));
+        assert!(d.contains("invalid_paddr"));
+    }
+
+    /// W10-B: env token table — default off; 1/true/yes/on enable.
+    #[test]
+    fn w10_b_same_shot_env_token_table() {
+        assert!(!lab_same_shot_rela_env_token_is_enabled(None));
+        assert!(!lab_same_shot_rela_env_token_is_enabled(Some("")));
+        assert!(!lab_same_shot_rela_env_token_is_enabled(Some("  ")));
+        assert!(!lab_same_shot_rela_env_token_is_enabled(Some("0")));
+        assert!(!lab_same_shot_rela_env_token_is_enabled(Some("false")));
+        assert!(!lab_same_shot_rela_env_token_is_enabled(Some("maybe")));
+        assert!(lab_same_shot_rela_env_token_is_enabled(Some("1")));
+        assert!(lab_same_shot_rela_env_token_is_enabled(Some("true")));
+        assert!(lab_same_shot_rela_env_token_is_enabled(Some("YES")));
+        assert!(lab_same_shot_rela_env_token_is_enabled(Some("on")));
+        assert_eq!(ENV_LAB_SAME_SHOT_RELA, "XDNA2_LAB_SAME_SHOT_RELA");
+    }
+
+    /// W10-B: in-process BO paddrs → same_shot plan apply_ready; zeros refused.
+    #[test]
+    fn w10_b_same_shot_plan_from_io_paddrs() {
+        let plan = plan_same_shot_rela_from_io_paddrs(
+            0x7fcb_e9a3_0000,
+            0x7fcb_e977_f000,
+            0x7fcb_e9a2_f000,
+            0x7fcb_e9a2_7000,
+            true,
+        );
+        assert!(plan.same_shot);
+        assert!(plan.paddrs_valid);
+        assert!(plan.apply_ready);
+        assert!(plan.refuse_stale_disk);
+        assert_eq!(plan.source, SameShotPaddrSource::InProcessBoMap);
+        assert!(plan.source.is_same_shot());
+        assert!(!plan.source.refuse_product_apply());
+        assert_eq!(plan.detail, "ok");
+        let t = plan.as_io_tuple().expect("tuple");
+        assert_eq!(t.0, 0x7fcb_e9a3_0000);
+        assert_eq!(t.3, 0x7fcb_e9a2_7000);
+        let n = format_same_shot_rela_plan_note(&plan);
+        assert!(residual_note_has_exact_token(&n, SAME_SHOT_RELA_PLAN_NOTE));
+        assert!(residual_note_has_exact_token(&n, "same_shot=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "apply_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "refuse_stale_disk=1"));
+        assert!(residual_note_has_exact_token(&n, "env_requested=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "source=in_process_bo_map"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "same_shot_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "same_shot_alone_not_unlock=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+
+        // Zeros / MAX refuse — never invent. same_shot = paddrs_valid (Issue 1).
+        // Source stays InProcessBoMap; same_shot=0 so greps do not false-positive.
+        let bad = plan_same_shot_rela_from_io_paddrs(0, 0x20, 0x30, 0x40, false);
+        assert!(!bad.same_shot, "same_shot=paddrs_valid; invalid → 0");
+        assert!(!bad.paddrs_valid);
+        assert!(!bad.apply_ready);
+        assert_eq!(bad.source, SameShotPaddrSource::InProcessBoMap);
+        assert!(bad.source.is_same_shot(), "source enum still in-process");
+        assert_eq!(bad.detail, "invalid_paddr");
+        assert!(bad.as_io_tuple().is_none());
+        let bn = bad.format_note();
+        assert!(residual_note_has_exact_token(&bn, "apply_ready=0"));
+        assert!(residual_note_has_exact_token(&bn, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&bn, "paddrs_valid=0"));
+        assert!(residual_note_has_exact_token(&bn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &bn,
+            "source=in_process_bo_map"
+        ));
+
+        let maxed = plan_same_shot_rela_from_io_paddrs(u64::MAX, 0x20, 0x30, 0x40, true);
+        assert!(!maxed.apply_ready);
+        assert!(!maxed.same_shot);
+        assert!(maxed.ifm_paddr.is_none());
+    }
+
+    /// W10-B: disk last_apply / vendor extract → same_shot=0, product apply refused.
+    #[test]
+    fn w10_b_same_shot_refuse_disk_extract() {
+        let e = LivePaddrsExtract {
+            ifm_paddr: Some(0x7f57_b364_c000),
+            wts_paddr: Some(0x7f57_b348_2000),
+            ofm_paddr: Some(0x7f57_b364_b000),
+            ctrl_paddr: Some(0x7f57_b364_3000),
+            instr_paddr: None,
+            live_paddrs_present: true,
+            source: "last_apply_json",
+        };
+        let plan = plan_same_shot_rela_from_disk_extract(&e, false);
+        assert!(!plan.same_shot);
+        assert!(plan.paddrs_valid);
+        assert!(!plan.apply_ready, "disk UVAs never product apply_ready");
+        assert!(plan.refuse_stale_disk);
+        assert_eq!(plan.source, SameShotPaddrSource::DiskLastApply);
+        assert!(plan.source.refuse_product_apply());
+        assert_eq!(plan.detail, "disk_refuse_stale_uva");
+        assert!(plan.as_io_tuple().is_none());
+        let n = format_same_shot_rela_plan_note(&plan);
+        assert!(residual_note_has_exact_token(&n, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&n, "apply_ready=0"));
+        assert!(residual_note_has_exact_token(&n, "source=disk_last_apply"));
+        assert!(residual_note_has_exact_token(&n, "refuse_stale_disk=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+
+        let v = LivePaddrsExtract {
+            source: "vendor_json",
+            live_paddrs_present: true,
+            ifm_paddr: Some(0x1000),
+            wts_paddr: Some(0x2000),
+            ofm_paddr: Some(0x3000),
+            ..LivePaddrsExtract::default()
+        };
+        let vp = plan_same_shot_rela_from_disk_extract(&v, true);
+        assert_eq!(vp.source, SameShotPaddrSource::DiskVendorJson);
+        assert!(!vp.apply_ready);
+        assert!(!vp.same_shot);
+
+        // Apply research on disk plan soft-refuses without inventing.
+        let ar = apply_same_shot_rela_research(&[], &plan, LabRelaMode::Overwrite);
+        assert!(!ar.patch_ok);
+        assert!(!ar.apply_ready);
+        assert_eq!(ar.detail, "disk_refuse_stale_uva");
+        let an = format_same_shot_rela_apply_note(&ar);
+        assert!(residual_note_has_exact_token(
+            &an,
+            SAME_SHOT_RELA_APPLY_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&an, "same_shot=0"));
+        assert!(residual_note_has_exact_token(&an, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&an, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &an,
+            "same_shot_apply_alone_not_pass=1"
+        ));
+    }
+
+    /// W10-B: pure apply with in-process paddrs + staged ELF when present.
+    #[test]
+    fn w10_b_same_shot_apply_research_in_process() {
+        let plan = plan_same_shot_rela_from_io_paddrs(
+            GT_SYNTHETIC_IFM_PADDR,
+            GT_SYNTHETIC_WTS_PADDR,
+            GT_SYNTHETIC_OFM_PADDR,
+            GT_SYNTHETIC_CTRL_PADDR,
+            true,
+        );
+        assert!(plan.apply_ready);
+        assert!(plan.same_shot);
+
+        let paths = [
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/gt_capture/instr_pre.elf"),
+        ];
+        let mut ran = false;
+        for p in &paths {
+            if !p.is_file() {
+                continue;
+            }
+            let Ok(elf) = std::fs::read(p) else {
+                continue;
+            };
+            if !is_aiebu_elf_ctrltext(&elf) {
+                continue;
+            }
+            let r = apply_same_shot_rela_research(&elf, &plan, LabRelaMode::Overwrite);
+            if r.rela_count != Some(12) || r.patched_len != Some(1688) {
+                eprintln!(
+                    "OFFLINE_ASSET_SKIP: {} not staged mladf rela×12/1688",
+                    p.display()
+                );
+                continue;
+            }
+            assert!(r.same_shot);
+            assert!(r.apply_ready);
+            assert!(r.patch_ok, "detail={}", r.detail);
+            assert!(r.classic_walk_ok);
+            assert_eq!(r.detail, "ok");
+            let n = r.format_note();
+            assert!(residual_note_has_exact_token(&n, "same_shot=1"));
+            assert!(residual_note_has_exact_token(&n, "patch_ok=1"));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+            // Synthetic paddrs reproduce GT oracle (research lock).
+            if let Some(ref body) = r.patched_ctrltext {
+                assert_eq!(sha256_hex_lower(body), GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA256);
+            }
+            ran = true;
+            break;
+        }
+        // Empty ELF soft-skip still honesty-locked.
+        let empty = apply_same_shot_rela_research(&[], &plan, LabRelaMode::Overwrite);
+        assert_eq!(empty.detail, "elf_empty_skip");
+        assert!(!empty.patch_ok);
+        if !ran {
+            eprintln!("NOTE: staged ELF not present; plan + empty-elf path green");
+        }
+    }
+
+    #[test]
+    fn w8_o3_extract_from_vendor_json_fixture_and_last_apply() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd");
+        let vp = root.join("gt_capture/vendor_paddrs_from_last_apply.json");
+        if vp.is_file() {
+            let text = std::fs::read_to_string(&vp).expect("read vendor paddrs");
+            let e = extract_live_paddrs_from_vendor_json(&text);
+            assert!(
+                e.live_paddrs_present,
+                "fixture should have ifm/wts/ofm: {e:?}"
+            );
+            assert_eq!(e.source, "vendor_json");
+            let n = format_live_paddrs_research_note(&e);
+            assert!(residual_note_has_exact_token(&n, "live_paddrs_present=1"));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        } else {
+            eprintln!("skip: no vendor_paddrs_from_last_apply.json");
+        }
+
+        // Capture vendor JSON: unpatched classic + host UVAs (not device DevHeap).
+        let cap = root.join("gt_capture/vendor_paddrs.json");
+        if cap.is_file() {
+            let text = std::fs::read_to_string(&cap).expect("read");
+            let e = extract_live_paddrs_from_vendor_json(&text);
+            // ifm/wts/ofm present as valid non-zero (host UVAs still pass is_valid_device_paddr)
+            assert!(e.live_paddrs_present || e.ifm_paddr.is_some());
+            let class = classify_capture_patch_class(
+                Some("txn_container_unpatched"),
+                Some(LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16),
+                Some(1688),
+            );
+            assert_eq!(class, CapturePatchClass::ClassicUnpatched);
+            assert!(class.residual_matched_refused());
+        }
+
+        // last_apply.json may lack io_paddrs (hwctx_ok only) → present=0, no invent.
+        let la = root.join("last_apply.json");
+        if la.is_file() {
+            let text = std::fs::read_to_string(&la).expect("read last_apply");
+            let e = extract_live_paddrs_from_last_apply_json(&text);
+            // Do not invent; fixture historically has no io_paddrs.
+            if !text.contains("io_paddrs") {
+                assert!(!e.live_paddrs_present);
+            }
+            let n = format_live_paddrs_research_note(&e);
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "residual_matched_claim=0"
+            ));
+        }
+    }
+
+    #[test]
+    fn w8_o1_o2_capture_patch_class_unpatched_refuse() {
+        let u = classify_capture_patch_class(
+            Some("txn_container_unpatched"),
+            Some("3c5ffca750922d3b6b1dec66b792273e46504cc1d3de6b5b96e12ac5c8197368"),
+            Some(1688),
+        );
+        assert_eq!(u, CapturePatchClass::ClassicUnpatched);
+        assert!(u.residual_matched_refused());
+        let n = format_capture_patch_class_note(u, Some("txn_container_unpatched"));
+        assert!(residual_note_has_exact_token(&n, CAPTURE_PATCH_CLASS_NOTE));
+        assert!(residual_note_has_exact_token(&n, "classic_unpatched=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "loud_refuse_residual_matched_unpatched=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+
+        let multi = classify_capture_patch_class(None, None, Some(32208));
+        assert_eq!(multi, CapturePatchClass::MultiTxnWrongBody);
+        assert!(multi.residual_matched_refused());
+
+        let post = classify_capture_patch_class(
+            Some("registry_get_instr_bo"),
+            Some("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"),
+            Some(1688),
+        );
+        assert_eq!(post, CapturePatchClass::TruePostPatchCandidate);
+        // Still offline residual_matched_claim=0 in soft note.
+        let pn = format_capture_patch_class_note(post, Some("registry_get_instr_bo"));
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &pn,
+            "true_post_patch_alone_not_residual_matched=1"
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn w8_m3_live_mapped_rela_differs_from_gt_synthetic() {
+        // Synthetic paddrs → match GT oracle when staged ELF present.
+        // Live-shaped paddrs → differ from ccab3960….
+        let paths = [
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/silicon_lab/lab_instr.elf"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/gt_capture/instr_pre.elf"),
+        ];
+        let mut ran = false;
+        for p in &paths {
+            if !p.is_file() {
+                continue;
+            }
+            let Ok(elf) = std::fs::read(p) else {
+                continue;
+            };
+            if !is_aiebu_elf_ctrltext(&elf) {
+                continue;
+            }
+            let syn = research_live_mapped_rela(
+                &elf,
+                GT_SYNTHETIC_IFM_PADDR,
+                GT_SYNTHETIC_WTS_PADDR,
+                GT_SYNTHETIC_OFM_PADDR,
+                GT_SYNTHETIC_CTRL_PADDR,
+            );
+            if syn.rela_count != Some(12) || syn.patched_len != Some(1688) {
+                eprintln!(
+                    "OFFLINE_ASSET_SKIP: {} not staged mladf rela×12/1688",
+                    p.display()
+                );
+                continue;
+            }
+            assert!(syn.live_paddrs_present);
+            assert!(syn.classic_walk_ok, "detail={}", syn.detail);
+            assert_eq!(
+                syn.patched_sha256_hex, GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA256,
+                "synthetic paddrs must reproduce GT oracle ccab3960…"
+            );
+            assert_eq!(syn.differs_from_gt_synthetic, Some(false));
+            // Unpatched peel identity: prefer oracle sha16 when peel == raw txn;
+            // some staged ELFs may peel a sibling body — still non-empty research field.
+            assert!(
+                !syn.unpatched_sha256_hex.is_empty(),
+                "expected unpatched peel sha"
+            );
+            if !syn
+                .unpatched_sha256_hex
+                .starts_with(LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16)
+            {
+                eprintln!(
+                    "NOTE: unpatched peel sha16={} (oracle {}); still pure-direct research",
+                    &syn.unpatched_sha256_hex[..16.min(syn.unpatched_sha256_hex.len())],
+                    LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16
+                );
+            }
+
+            // Live-shaped paddrs (from vendor_paddrs_from_last_apply shape).
+            let live = research_live_mapped_rela(
+                &elf,
+                0x7f57_b364_c000,
+                0x7f57_b348_2000,
+                0x7f57_b364_b000,
+                0x7f57_b364_3000,
+            );
+            assert!(live.classic_walk_ok);
+            assert_eq!(live.differs_from_gt_synthetic, Some(true));
+            assert_ne!(
+                live.patched_sha256_hex,
+                GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA256
+            );
+            assert!(
+                !live
+                    .patched_sha256_hex
+                    .starts_with(GT_SYNTHETIC_PATCHED_CTRLTEXT_SHA16)
+            );
+            let n = live.format_soft_note();
+            assert!(residual_note_has_exact_token(
+                &n,
+                LIVE_MAPPED_RELA_RESEARCH_NOTE
+            ));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+            assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "differs_from_gt_synthetic=1"
+            ));
+            assert!(residual_note_has_exact_token(&n, "l1b_offline_ready=0"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "residual_matched_claim=0"
+            ));
+
+            // From extract bag.
+            let ext = extract_live_paddrs_from_detail(
+                "io_paddrs ifm=0x7f57b364c000 wts=0x7f57b3482000 \
+                 ofm=0x7f57b364b000 ctrl=0x7f57b3643000",
+            );
+            let from_e = research_live_mapped_rela_from_extract(&elf, &ext);
+            assert_eq!(from_e.patched_sha256_hex, live.patched_sha256_hex);
+            ran = true;
+            break;
+        }
+        // Always-run pure path without staged ELF (noop synth).
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let r = research_live_mapped_rela(&synth, 0x10, 0x20, 0x30, 0x40);
+        assert!(r.live_paddrs_present);
+        assert_eq!(r.rela_count, Some(1));
+        let sn = format_live_mapped_rela_research_note(&r);
+        assert!(residual_note_has_exact_token(&sn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&sn, "not_ran_on_npu=1"));
+        // Invalid paddrs refuse.
+        let inv = research_live_mapped_rela(&synth, 0, 0x20, 0x30, 0x40);
+        assert!(!inv.live_paddrs_present);
+        assert_eq!(inv.detail, "invalid_live_paddr");
+        let empty = research_live_mapped_rela(&[], 0x10, 0x20, 0x30, 0x40);
+        assert_eq!(empty.detail, "elf_empty_skip");
+        if !ran {
+            eprintln!(
+                "NOTE: staged mladf ELF not exercised for GT sha lock; pure synth path green"
+            );
+        }
+    }
+
     /// C4: locked baseline fixture is NotPass (json_ran_on_npu=false + ERT Error).
     #[test]
     fn c4_pass_eval_fixture_last_apply_is_not_pass() {
@@ -12093,9 +20720,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).expect("json");
         let detail = v.get("detail").and_then(|x| x.as_str());
         let status = v.get("status").and_then(|x| x.as_str());
-        let ran = v.get("ran_on_npu").and_then(|x| x.as_bool());
-        let ert_error = v.get("ert_error").and_then(|x| x.as_bool());
-        let real_ioctl = v.get("real_ioctl").and_then(|x| x.as_bool());
+        let ran = v.get("ran_on_npu").and_then(serde_json::Value::as_bool);
+        let ert_error = v.get("ert_error").and_then(serde_json::Value::as_bool);
+        let real_ioctl = v.get("real_ioctl").and_then(serde_json::Value::as_bool);
         assert_eq!(ran, Some(false));
         let ev = silicon_pass_evidence_from_last_apply(ran, status, detail, ert_error, real_ioctl);
         let eval = evaluate_silicon_pass_evidence(&ev);
@@ -12554,8 +21181,10 @@ amdxdna: wait finished\n";
         assert_eq!(live[1], 0x0402_0000, "instr lo appears early in live dump");
         // Live dump is longer / different framing than pure 21-word BO.
         let pure_words: Vec<u32> = pure
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         assert_eq!(pure_words.len(), 21); // header + 20 data
         let d = diff_u32_word_lists(&pure_words, live);
@@ -12585,6 +21214,7 @@ amdxdna: wait finished\n";
 
     /// Track F — semantic map of live 28w dump vs pure xrt3 rebuild paddrs.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn decode_c2_live_cmdbuf_research_semantic_map() {
         let (inst, ifm, wts, ofm, _ctrl) = c2_live_io_paddrs_locked();
         let expect = C2ExpectPaddrs::from_c2_locked_io();
@@ -12699,7 +21329,7 @@ amdxdna: wait finished\n";
         assert!(!sh.envelope_exact_match);
 
         // Unaligned pure BO → pure_bo_unaligned + envelope false.
-        let mut unaligned = pure.clone();
+        let mut unaligned = pure;
         unaligned.push(0xaa);
         let ua = decode_c2_live_cmdbuf_research(live, Some(&unaligned), expect);
         assert!(ua.pure_bo_unaligned);
@@ -12711,7 +21341,7 @@ amdxdna: wait finished\n";
         assert!(env_ok.envelope_exact_match);
         assert_eq!(env_ok.suspected_framing_extra_words, 0);
         // Flip one pure word → envelope false; logical may still hold.
-        let mut flipped = live_as_bo.clone();
+        let mut flipped = live_as_bo;
         flipped[0] ^= 0xff;
         let env_bad = decode_c2_live_cmdbuf_research(live, Some(&flipped), expect);
         assert!(!env_bad.envelope_exact_match);
@@ -12787,6 +21417,7 @@ amdxdna: wait finished\n";
 
     /// Track H — empty / non-aiebu / invalid paddr + staged or synthetic ELF.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn audit_aiebu_rela_with_c2_live_paddrs_offline() {
         let empty = audit_aiebu_rela_with_live_paddrs(&[], 1, 2, 3, 4);
         assert!(!empty.elf_present);
@@ -12918,6 +21549,7 @@ amdxdna: wait finished\n";
 
     /// Track I — checklist optional journal dual codes; absent stays honest.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_checklist_journal_dual_optional() {
         let sig = LastApplyDetailSignals {
             aiebu_elf: Some(true),
@@ -13055,9 +21687,14 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
         );
         assert_eq!(sha256_digest(b"abc").map(|d| d.len()), Some(32));
         // Oversize refuse at public boundary (no multi-GiB clone).
-        let over = vec![0_u8; (MAX_INSTRUCTION_BLOB_BYTES as usize).saturating_add(1)];
+        let over = vec![
+            0_u8;
+            usize::try_from(MAX_INSTRUCTION_BLOB_BYTES)
+                .expect("value fits in usize")
+                .saturating_add(1)
+        ];
         assert!(sha256_digest(&over).is_none());
-        assert!(sha256_hex_lower(&over).is_empty());
+        assert_eq!(sha256_hex_lower(&over), "");
     }
 
     #[test]
@@ -13158,10 +21795,15 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
         assert!(residual_note_has_exact_token(&un, "not_c_ready=1"));
 
         // oversized_refused
-        let over = vec![0_u8; (MAX_INSTRUCTION_BLOB_BYTES as usize).saturating_add(1)];
+        let over = vec![
+            0_u8;
+            usize::try_from(MAX_INSTRUCTION_BLOB_BYTES)
+                .expect("value fits in usize")
+                .saturating_add(1)
+        ];
         let o = profile_instr_payload_bytes(&over);
         assert_eq!(o.blob_kind, "oversized_refused");
-        assert!(o.payload_sha256_hex.is_empty());
+        assert_eq!(o.payload_sha256_hex, "");
         let on = o.format_soft_note();
         assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
         assert!(residual_note_has_exact_token(&on, "not_c_ready=1"));
@@ -13194,6 +21836,7 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn profile_instr_payload_after_rela_ci_mandatory_userspace_ok() {
         // Empty / garbage / invalid paddr honesty.
         let empty = profile_instr_payload_after_rela(&[], 1, 2, 3, 4);
@@ -13267,7 +21910,11 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
         assert!(!pay.staged_mladf_classic_profile);
         // Single-patch: rela_audit holds same bytes as profiled.
         assert_eq!(
-            a_syn.rela_audit.patched_ctrltext.as_ref().map(|b| b.len()),
+            a_syn
+                .rela_audit
+                .patched_ctrltext
+                .as_ref()
+                .map(std::vec::Vec::len),
             Some(pay.payload_len)
         );
 
@@ -13283,9 +21930,8 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
             if !pth.is_file() {
                 continue;
             }
-            let elf = match std::fs::read(pth) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(elf) = std::fs::read(pth) else {
+                continue;
             };
             if !is_aiebu_elf_ctrltext(&elf) {
                 continue;
@@ -13550,7 +22196,7 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
         assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
         assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
         // Soft note hard-forces match_alone=0 even if a hand-built bag mutates field.
-        let mut mutated = r.clone();
+        let mut mutated = r;
         mutated.ctrltext_match_alone_closes_fw_residual = true;
         let mn = mutated.format_soft_note();
         assert!(
@@ -13691,7 +22337,7 @@ amdxdna: Failed cmd idx 0, status 0x3000003\n";
         ));
         assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
         // Soft note forces locks even if bag fields are mutated.
-        let mut mutated = m.clone();
+        let mut mutated = m;
         mutated.ctrltext_match_alone_closes_fw_residual = true;
         mutated.partition_name_alone_proves_root_cause = true;
         mutated.axis_partition_surface_status_name_only = false;
@@ -13876,7 +22522,7 @@ xclbin Information
         assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
         assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
         // Mutated decode/invent fields must not leak into soft note.
-        let mut mutated = r.clone();
+        let mut mutated = r;
         mutated.do_not_invent_pdi_layout = false;
         mutated.public_pdi_image_decode = true;
         let mn = mutated.format_soft_note();
@@ -14062,6 +22708,7 @@ xclbin Information
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn cu_pdi_section_identity_from_info_text_not_pass() {
         let info = "\
 Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
@@ -14106,7 +22753,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
         assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
         // Mutated invent/close fields must not leak into soft note.
-        let mut mutated = r.clone();
+        let mut mutated = r;
         mutated.section_identity_alone_closes_fw_residual = true;
         mutated.do_not_invent_pdi_layout = false;
         mutated.public_pdi_image_decode = true;
@@ -14343,7 +22990,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
         assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
         // Mutated invent/close fields must not leak into soft note.
-        let mut mutated = r.clone();
+        let mut mutated = r;
         mutated.section_offset_map_alone_closes_fw_residual = true;
         mutated.do_not_invent_pdi_layout = false;
         mutated.public_pdi_image_decode = true;
@@ -14485,7 +23132,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
         assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
         // Soft force-lock survives mutated close/invent fields.
-        let mut mutated = r.clone();
+        let mut mutated = r;
         mutated.section_offset_map_alone_closes_fw_residual = true;
         mutated.do_not_invent_pdi_layout = false;
         let mn = mutated.format_soft_note();
@@ -14505,6 +23152,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
 
     #[test]
     fn xclbin_section_offset_map_ve2_fixture_when_present_not_aie2_known_good() {
+        use std::io::Read;
         // VE2 validate.xclbin is a real public axlf — parse offsets for research
         // only. Always NOT product known-good / NOT AIE2 bag (platform refuse).
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14521,7 +23169,6 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
                 return;
             }
         };
-        use std::io::Read;
         // 456 + 256*40 is well under a page*2; VE2 has 10 sections.
         let mut prefix =
             vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + 16 * AXLF_SECTION_HEADER_SIZE];
@@ -14599,6 +23246,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn xclbin_section_body_bounds_synth_in_bounds_and_oob_not_pass() {
         // Header-only synth: claimed bodies past buffer end → OOB (honest).
         let header_only = synth_axlf_with_sections(&[
@@ -14653,7 +23301,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
             "public_pdi_image_decode=0"
         ));
         // Mutated invent/close fields must not leak into soft note.
-        let mut mutated = oob.clone();
+        let mut mutated = oob;
         mutated.body_bounds_alone_closes_fw_residual = true;
         mutated.do_not_invent_pdi_layout = false;
         mutated.public_pdi_image_decode = true;
@@ -14807,6 +23455,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
 
     #[test]
     fn xclbin_section_body_bounds_ve2_prefix_oob_not_aie2_known_good() {
+        use std::io::Read;
         // VE2 header prefix is shorter than BITSTREAM body → OOB vs prefix len.
         // Full-file windows would fit; we never load full multi-MiB body here.
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14822,7 +23471,6 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
                 return;
             }
         };
-        use std::io::Read;
         let mut prefix =
             vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + 16 * AXLF_SECTION_HEADER_SIZE];
         let n = match f.read(&mut prefix) {
@@ -14922,19 +23570,19 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd/last_apply.json");
         if last_apply.is_file() {
             let text = std::fs::read_to_string(&last_apply).unwrap_or_default();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(detail) = v.get("detail").and_then(|d| d.as_str()) {
-                    let p = parse_journal_fw_status_pair(detail);
-                    assert!(
-                        p.failed_cmd_status.is_none(),
-                        "last_apply detail must not invent failed_cmd"
-                    );
-                    assert!(
-                        p.chain_status.is_none(),
-                        "last_apply detail must not invent chain_status"
-                    );
-                    assert!(!p.is_c2_app_load_pair());
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(detail) = v.get("detail").and_then(serde_json::Value::as_str)
+            {
+                let p = parse_journal_fw_status_pair(detail);
+                assert!(
+                    p.failed_cmd_status.is_none(),
+                    "last_apply detail must not invent failed_cmd"
+                );
+                assert!(
+                    p.chain_status.is_none(),
+                    "last_apply detail must not invent chain_status"
+                );
+                assert!(!p.is_c2_app_load_pair());
             }
         }
     }
@@ -15110,6 +23758,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
 
     #[test]
     fn app_load_e2e_fixture_research_last_apply_fixture_no_invent_journal() {
+        use std::io::Read;
         let last_apply =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/xdna2_cmd/last_apply.json");
         if !last_apply.is_file() {
@@ -15126,12 +23775,25 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         };
         let status = v.get("status").and_then(|s| s.as_str());
         let detail = v.get("detail").and_then(|d| d.as_str());
-        let aiebu = v.get("aiebu_elf").and_then(|a| a.as_bool());
-        let ert_err = v.get("ert_error").and_then(|e| e.as_bool());
+        let aiebu = v.get("aiebu_elf").and_then(serde_json::Value::as_bool);
+        let ert_err = v.get("ert_error").and_then(serde_json::Value::as_bool);
         let rela = v
             .get("rela_count")
-            .and_then(|r| r.as_u64())
-            .map(|n| n as usize);
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| usize::try_from(n).expect("value fits in usize"));
+        let ran = v.get("ran_on_npu").and_then(serde_json::Value::as_bool);
+        let rela_u32 = v
+            .get("rela_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        if !last_apply_matches_locked_app_load_baseline(
+            status, aiebu, ert_err, ran, detail, rela_u32,
+        ) {
+            eprintln!(
+                "OFFLINE_ASSET_SKIP: last_apply.json present but not locked APP_LOAD baseline"
+            );
+            return;
+        }
         let class = classify_last_apply_residual_ex(status, detail, aiebu, ert_err, rela);
         assert_eq!(class, SiliconResidualClass::AppLoadPdiFailAfterAiebu);
 
@@ -15167,11 +23829,9 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         let ve2 = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/xdna2_cmd/ve2_latency/sources/ve2_runner_latency_validate.xclbin");
         if ve2.is_file() {
-            let mut f = match std::fs::File::open(&ve2) {
-                Ok(f) => f,
-                Err(_) => return,
+            let Ok(mut f) = std::fs::File::open(&ve2) else {
+                return;
             };
-            use std::io::Read;
             let mut prefix =
                 vec![0_u8; AXLF_FIRST_SECTION_HEADER_ABS_OFFSET + 16 * AXLF_SECTION_HEADER_SIZE];
             let n = f.read(&mut prefix).unwrap_or(0);
@@ -15316,6 +23976,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_offline_progress_scorecard_compare_status_and_refuse() {
         let ready = "Research only. Not product Pass. Not C-ready.\nSource stack: XRT public stack";
         // Loaded: bytes present, bag incomplete (no provenance) → status loaded.
@@ -15330,7 +23991,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         let st_loaded = external_compare_status_from_surfaces(&bag_loaded, None, false);
         assert_eq!(st_loaded, ExternalCompareStatus::Loaded);
         // Scorecard for Loaded (bytes present, no compare, bag incomplete).
-        let s_loaded = research_app_load_offline_progress_scorecard(
+        let score_loaded = research_app_load_offline_progress_scorecard(
             SiliconResidualClass::AppLoadPdiFailAfterAiebu,
             &bag_loaded,
             &e2e,
@@ -15338,17 +23999,17 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
             false,
         );
         assert_eq!(
-            s_loaded.external_compare_status,
+            score_loaded.external_compare_status,
             ExternalCompareStatus::Loaded
         );
-        assert!(!s_loaded.bag_drop_complete);
-        assert!(s_loaded.residual_not_closed);
-        assert!(!s_loaded.scorecard_alone_closes_fw_residual);
+        assert!(!score_loaded.bag_drop_complete);
+        assert!(score_loaded.residual_not_closed);
+        assert!(!score_loaded.scorecard_alone_closes_fw_residual);
         assert_eq!(
-            s_loaded.detail,
+            score_loaded.detail,
             "scorecard_app_load_userspace_ok_bag_incomplete_residual_open"
         );
-        let ln = s_loaded.format_soft_note();
+        let ln = score_loaded.format_soft_note();
         assert!(residual_note_has_exact_token(
             &ln,
             "external_compare_status=loaded"
@@ -15403,7 +24064,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(bag_ve2.refused_ve2_not_aie2);
         let st_ref = external_compare_status_from_surfaces(&bag_ve2, None, false);
         assert_eq!(st_ref, ExternalCompareStatus::Refused);
-        let s_ref = research_app_load_offline_progress_scorecard(
+        let score_ref = research_app_load_offline_progress_scorecard(
             SiliconResidualClass::AppLoadPdiFailAfterAiebu,
             &bag_ve2,
             &e2e,
@@ -15411,11 +24072,11 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
             false,
         );
         assert_eq!(
-            s_ref.external_compare_status,
+            score_ref.external_compare_status,
             ExternalCompareStatus::Refused
         );
-        assert_eq!(s_ref.detail, "scorecard_external_refused_residual_open");
-        assert!(s_ref.residual_not_closed);
+        assert_eq!(score_ref.detail, "scorecard_external_refused_residual_open");
+        assert!(score_ref.residual_not_closed);
 
         // external_load_refused even without bag refuse flags.
         let bag_ok = check_external_known_good_bag_drop(false, None, None, None);
@@ -15808,7 +24469,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(!residual_note_has_exact_token(&n, "residual_not_closed=0"));
 
         // Mismatch path still residual open.
-        let mut flipped = ctrltext.clone();
+        let mut flipped = ctrltext;
         if let Some(b) = flipped.first_mut() {
             *b ^= 0xff;
         }
@@ -16612,6 +25273,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_bag_feed_dry_run_scorecard_compare_detail_tokens_and_lab_not_ready() {
         // Lab not ready + external present → distinct residual-open detail (no invent Pass).
         let bag_absent = check_external_known_good_bag_drop(false, None, None, None);
@@ -16648,7 +25310,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
         let feed = research_lab_export_fingerprint_feed_from_elf(Some(&synth));
         assert!(feed.lab_export_ready);
-        let mut flipped = ctrltext.clone();
+        let mut flipped = ctrltext;
         if let Some(b) = flipped.first_mut() {
             *b ^= 0xff;
         }
@@ -16706,15 +25368,19 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
 
         // sha_match without structural: hand-built ready export (non-classic lab).
         let same = b"fixed-garbage-bytes-for-sha-only-path";
-        let mut exp = CtrltextFingerprintExport::default();
-        exp.unpatched_sha256_hex = sha256_hex_lower(same);
-        exp.ctrltext_len = Some(same.len());
-        exp.classic_walk_ok = false;
-        exp.known_good_status = KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN;
-        let mut feed_sha = LabExportFingerprintFeed::default();
-        feed_sha.lab_export_ready = true;
-        feed_sha.export = Some(exp);
-        feed_sha.feed_source = "unit_hand_export".into();
+        let exp = CtrltextFingerprintExport {
+            unpatched_sha256_hex: sha256_hex_lower(same),
+            ctrltext_len: Some(same.len()),
+            classic_walk_ok: false,
+            known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
+            ..Default::default()
+        };
+        let feed_sha = LabExportFingerprintFeed {
+            lab_export_ready: true,
+            export: Some(exp),
+            feed_source: "unit_hand_export".into(),
+            ..Default::default()
+        };
         assert!(feed_sha.ready_export().is_some());
         let s_sha = research_app_load_bag_feed_dry_run_scorecard(
             &bag_absent,
@@ -17320,7 +25986,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
         assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
         // Mutated close/invent fields must not leak.
-        let mut mutated = r.clone();
+        let mut mutated = r;
         mutated.field_map_alone_closes_fw_residual = true;
         mutated.root_cause_closed = true;
         mutated.do_not_invent_partition_id = false;
@@ -17450,7 +26116,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         // Non-ELF still returns a bag (not None); soft note must not claim paddr sha.
         let g = fingerprint_patched_ctrltext_after_rela(b"not-elf", 1, 2, 3, 4)
             .expect("non-empty non-elf bag");
-        assert!(g.patched_sha256_hex.is_empty());
+        assert_eq!(g.patched_sha256_hex, "");
         let gn = g.format_soft_note();
         assert!(residual_note_has_exact_token(&gn, "patched_sha=absent"));
         assert!(!residual_note_has_exact_token(
@@ -17476,8 +26142,8 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
             f1.detail
         );
         assert_eq!(f1.rela_count, Some(1));
-        assert!(!f1.patched_sha256_hex.is_empty());
-        assert!(!f1.unpatched_sha256_hex.is_empty());
+        assert_ne!(f1.patched_sha256_hex, "");
+        assert_ne!(f1.unpatched_sha256_hex, "");
         let f2 = fingerprint_patched_ctrltext_after_rela_c2_locked(&synth)
             .expect("synth fingerprint re-run");
         assert_eq!(f1.patched_sha256_hex, f2.patched_sha256_hex);
@@ -17577,7 +26243,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(!e.known_good_present);
         assert_eq!(e.known_good_status, KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN);
         assert_eq!(e.detail, "elf_empty");
-        assert!(e.unpatched_sha256_hex.is_empty());
+        assert_eq!(e.unpatched_sha256_hex, "");
         let n = e.format_soft_note();
         assert!(residual_note_has_exact_token(
             &n,
@@ -17600,7 +26266,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(g.is_known_good_absent());
         assert_eq!(g.detail, "not_aiebu_elf_ctrltext");
         assert!(g.rela_count.is_none());
-        assert!(g.unpatched_sha256_hex.is_empty());
+        assert_eq!(g.unpatched_sha256_hex, "");
         let gn = g.format_soft_note();
         assert!(residual_note_has_exact_token(&gn, "invent_pass=0"));
         assert!(residual_note_has_exact_token(&gn, "known_good_absent=1"));
@@ -18072,6 +26738,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn external_known_good_provenance_field_validation_fail_closed() {
         // Empty / whitespace.
         let empty = validate_external_known_good_provenance_text("");
@@ -18200,6 +26867,189 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
         assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
         assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+    }
+
+    /// W7-3: PROVENANCE `completed_on_this_fw` soft research parse (yes/no/absent/malformed).
+    ///
+    /// Honesty lock: even `yes` never invents residual_matched or load_accepted.
+    #[test]
+    #[allow(clippy::too_many_lines)] // multi-case honesty lock (yes/no/absent/malformed/template)
+    fn completed_on_this_fw_provenance_research_parse_honesty() {
+        // Absent text / no key.
+        let empty = parse_completed_on_this_fw_from_provenance("");
+        assert_eq!(empty.value, CompletedOnThisFwValue::Absent);
+        assert!(!empty.residual_matched_claim);
+        assert!(!empty.load_accepted_claim);
+        assert!(!empty.product_known_good);
+        assert_eq!(empty.detail, "completed_on_this_fw_absent");
+        let en = format_completed_on_this_fw_note(&empty);
+        assert!(residual_note_has_exact_token(
+            &en,
+            COMPLETED_ON_THIS_FW_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "completed_on_this_fw=absent"
+        ));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&en, "load_accepted_claim=0"));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&en, "field_alone_not_pass=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "field_alone_not_load_accepted=1"
+        ));
+        assert!(!residual_note_has_exact_token(&en, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(
+            &en,
+            "residual_matched_claim=1"
+        ));
+        assert!(!residual_note_has_exact_token(&en, "load_accepted_claim=1"));
+
+        let no_key = parse_completed_on_this_fw_from_provenance(
+            "Research only. invent_pass=0 not_c_ready=1\nSource stack: XRT.",
+        );
+        assert_eq!(no_key.value, CompletedOnThisFwValue::Absent);
+
+        // Explicit yes (key=value).
+        let yes = parse_completed_on_this_fw_from_provenance(
+            "Research only. completed_on_this_fw=yes invent_pass=0",
+        );
+        assert_eq!(yes.value, CompletedOnThisFwValue::Yes);
+        assert!(!yes.residual_matched_claim, "yes ≠ residual_matched");
+        assert!(!yes.load_accepted_claim, "yes ≠ load_accepted alone");
+        assert!(!yes.product_known_good);
+        assert_eq!(yes.detail, "completed_on_this_fw_yes");
+        let yn = yes.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &yn,
+            "completed_on_this_fw=yes"
+        ));
+        assert!(residual_note_has_exact_token(
+            &yn,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&yn, "load_accepted_claim=0"));
+        assert!(residual_note_has_exact_token(&yn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &yn,
+            "field_alone_not_residual_matched=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &yn,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(!residual_note_has_exact_token(&yn, "invent_pass=1"));
+
+        // Explicit no + synonyms.
+        let no = parse_completed_on_this_fw_from_provenance("completed_on_this_fw=no");
+        assert_eq!(no.value, CompletedOnThisFwValue::No);
+        assert!(!no.residual_matched_claim);
+        assert!(!no.load_accepted_claim);
+        let t_true = classify_completed_on_this_fw_token("TRUE");
+        assert_eq!(t_true, CompletedOnThisFwValue::Yes);
+        let t_false = classify_completed_on_this_fw_token("False");
+        assert_eq!(t_false, CompletedOnThisFwValue::No);
+        let t_1 = classify_completed_on_this_fw_token("1");
+        assert_eq!(t_1, CompletedOnThisFwValue::Yes);
+        let t_0 = classify_completed_on_this_fw_token("0");
+        assert_eq!(t_0, CompletedOnThisFwValue::No);
+
+        // Malformed present value.
+        let bad = parse_completed_on_this_fw_from_provenance("completed_on_this_fw=maybe");
+        assert_eq!(bad.value, CompletedOnThisFwValue::Malformed);
+        assert!(!bad.residual_matched_claim);
+        assert!(!bad.load_accepted_claim);
+        assert_eq!(bad.detail, "completed_on_this_fw_malformed");
+        let bn = format_completed_on_this_fw_note(&bad);
+        assert!(residual_note_has_exact_token(
+            &bn,
+            "completed_on_this_fw=malformed"
+        ));
+        assert!(residual_note_has_exact_token(&bn, "invent_pass=0"));
+
+        // iron_completed_on_this_fw alone must not parse as product field.
+        let iron_only = parse_completed_on_this_fw_from_provenance(
+            "iron_completed_on_this_fw=yes invent_pass=0 research only",
+        );
+        assert_eq!(
+            iron_only.value,
+            CompletedOnThisFwValue::Absent,
+            "iron_ prefix is a different key"
+        );
+
+        // Template "yes only if" skipped; later filled yes wins.
+        let template_then_yes = parse_completed_on_this_fw_from_provenance(
+            "| **completed_on_this_fw** | **yes** only if live ERT Completed |\n\
+             | `completed_on_this_fw` | **yes** (IRON verify on FW 1.1.2.64) |\n\
+             invent_pass=0 load_accepted_claim=0",
+        );
+        assert_eq!(template_then_yes.value, CompletedOnThisFwValue::Yes);
+        assert!(!template_then_yes.residual_matched_claim);
+        assert!(!template_then_yes.load_accepted_claim);
+
+        // Template-only → absent (instructional skipped).
+        let template_only = parse_completed_on_this_fw_from_provenance(
+            "| **completed_on_this_fw** | **yes** only if live ERT Completed + OFM allclose |",
+        );
+        assert_eq!(template_only.value, CompletedOnThisFwValue::Absent);
+        assert_eq!(
+            template_only.detail,
+            "completed_on_this_fw_instructional_or_empty"
+        );
+
+        // Markdown table no.
+        let table_no = parse_completed_on_this_fw_from_provenance(
+            "| completed_on_this_fw | no |\ninvent_pass=0",
+        );
+        assert_eq!(table_no.value, CompletedOnThisFwValue::No);
+
+        // Tracked bag PROVENANCE (when present) must not invent residual/load_accepted.
+        let bag = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd")
+            .join(EXTERNAL_KNOWN_GOOD_SUBDIR)
+            .join("PROVENANCE.md");
+        if bag.is_file() {
+            let text = std::fs::read_to_string(&bag).expect("read tracked PROVENANCE");
+            let r = parse_completed_on_this_fw_from_provenance(&text);
+            // Path B rows document completed_on_this_fw=yes for IRON; still research.
+            assert!(
+                matches!(
+                    r.value,
+                    CompletedOnThisFwValue::Yes
+                        | CompletedOnThisFwValue::No
+                        | CompletedOnThisFwValue::Absent
+                        | CompletedOnThisFwValue::Malformed
+                ),
+                "value must classify: {:?}",
+                r.value
+            );
+            assert!(
+                !r.residual_matched_claim,
+                "tracked PROVENANCE parse never residual_matched"
+            );
+            assert!(
+                !r.load_accepted_claim,
+                "tracked PROVENANCE parse never load_accepted"
+            );
+            assert!(!r.product_known_good);
+            let note = format_completed_on_this_fw_note(&r);
+            assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(
+                &note,
+                "residual_matched_claim=0"
+            ));
+            assert!(residual_note_has_exact_token(
+                &note,
+                "load_accepted_claim=0"
+            ));
+            assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+        }
     }
 
     #[test]
@@ -18453,6 +27303,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_checklist_userspace_elf_rela_app_load_token_split() {
         let sig_ok = LastApplyDetailSignals {
             aiebu_elf: Some(true),
@@ -18588,6 +27439,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_pdi_partition_research_c2_locked_and_honesty() {
         // CI-mandatory: locked C2 pair + APP_LOAD class + userspace content green.
         let r = research_app_load_pdi_partition_c2_locked(true);
@@ -18752,6 +27604,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_pdi_partition_research_negatives_no_invent() {
         // Split: userspace=false × (class-only | pair-only | neither) → fw=0.
         let class_only_no_us = research_app_load_pdi_partition(
@@ -18922,6 +27775,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn public_pdi_evidence_scan_track_m_closed_and_honesty() {
         // Track M: closed bag locks no new PDI fields beyond Track L.
         let s = scan_public_pdi_partition_evidence();
@@ -19130,7 +27984,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&hln, "not_c_ready=1"));
 
         // Soft-note sanitizer on M path: space/= inject cannot mint invent_pass=1.
-        let mut inject_m = s.clone();
+        let mut inject_m = s;
         inject_m.public_pdi_evidence_depth = "status invent_pass=1";
         // M closed does not gate on depth — still closed bit may stay 1; honesty
         // trio + sanitizer must still hold (no injected invent_pass=1 token).
@@ -19146,6 +28000,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn external_public_pdi_evidence_scan_track_n_closed_and_honesty() {
         // Track N: external public evidence closed — no new kernel/XRT beyond status-name.
         let s = scan_external_public_pdi_evidence();
@@ -19426,7 +28281,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(residual_note_has_exact_token(&ndn, "not_ran_on_npu=1"));
 
         // Soft-note sanitizer on N path: space/= inject cannot mint invent_pass=1.
-        let mut inject_n = s.clone();
+        let mut inject_n = s;
         inject_n.external_public_pdi_evidence = "x invent_pass=1 ran_on_npu=1";
         assert!(!inject_n.is_external_scan_closed_no_new());
         let inn = inject_n.format_soft_note();
@@ -19446,6 +28301,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn app_load_maintain_reconfirm_track_o_closed_and_honesty() {
         // Track O: maintain reconfirm A–N still closed — no new external public evidence.
         let s = reconfirm_app_load_tracks_a_n_closed();
@@ -19856,7 +28712,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         );
 
         // name_ok=false is diagnostic-only — closed bit stays 1 (M/N parity).
-        let mut name_diag = s.clone();
+        let mut name_diag = s;
         name_diag.app_load_code_name_ok = false;
         name_diag.invalid_param_code_name_ok = false;
         assert!(
@@ -19930,7 +28786,7 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         std::os::unix::fs::symlink("/", &link).expect(
             "symlink to / under /tmp required for last_apply_temp_root clamp coverage (Linux CI)",
         );
-        let _guard = TmpdirEnvGuard::set(&link);
+        let guard = TmpdirEnvGuard::set(&link);
         let root = last_apply_temp_root();
         assert_ne!(
             root,
@@ -19971,7 +28827,2958 @@ Sections: BITSTREAM, MEM_TOPOLOGY, IP_LAYOUT, CONNECTIVITY,
         assert!(path_under_allowed_roots(Path::new(
             "/tmp/dragon_npu_la_symlink_clamp_probe.json"
         )));
-        drop(_guard);
+        drop(guard);
         let _ = std::fs::remove_file(&link);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass-unblock P0: C1 validators + C2 structural FP + C3 residual splits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn c1_validate_aiebu_elf_ctrltext_structure_contracts() {
+        // empty
+        let empty = validate_aiebu_elf_ctrltext_structure(&[]);
+        assert!(!empty.ok);
+        assert_eq!(empty.reason, AiebuElfCtrltextValidateReason::Empty);
+        let en = format_c1_validator_note(&empty);
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "validate_alone_not_c_ready=1"
+        ));
+        assert!(residual_note_has_exact_token(&en, "reason=empty"));
+        assert!(!residual_note_has_exact_token(&en, "invent_pass=1"));
+
+        // bad magic
+        let bad = validate_aiebu_elf_ctrltext_structure(b"not-an-elf");
+        assert!(!bad.ok);
+        assert_eq!(bad.reason, AiebuElfCtrltextValidateReason::BadMagic);
+        let bn = format_c1_validator_note(&bad);
+        assert!(residual_note_has_exact_token(&bn, "reason=bad_magic"));
+        assert!(residual_note_has_exact_token(&bn, "invent_pass=0"));
+
+        // ELF magic but not ELF32 LE (class=2)
+        let mut e64 = vec![0_u8; 52];
+        e64[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e64[4] = 2; // ELFCLASS64
+        e64[5] = 1;
+        let n32 = validate_aiebu_elf_ctrltext_structure(&e64);
+        assert!(!n32.ok);
+        assert_eq!(n32.reason, AiebuElfCtrltextValidateReason::NotElf32Le);
+
+        // ELF32 LE without .ctrltext → missing_ctrltext
+        let bare = build_minimal_test_elf32(&[], &[]);
+        // empty ctrltext section: classify may miss PROGBITS with size 0
+        let miss = validate_aiebu_elf_ctrltext_structure(&bare);
+        assert!(!miss.ok);
+        assert!(
+            matches!(
+                miss.reason,
+                AiebuElfCtrltextValidateReason::MissingCtrltext
+                    | AiebuElfCtrltextValidateReason::CtrltextEmpty
+            ),
+            "expected missing/empty ctrltext, got {:?}",
+            miss.reason
+        );
+
+        // synthetic noop classic + rela → ok
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [(0_u32, (1_u32 << 8) | 5, 0_i32)];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let ok = validate_aiebu_elf_ctrltext_structure(&synth);
+        assert!(ok.ok, "detail={}", ok.detail);
+        assert_eq!(ok.reason, AiebuElfCtrltextValidateReason::Ok);
+        assert!(ok.classic_walk_ok);
+        assert_eq!(ok.rela_count, Some(1));
+        assert!(ok.ctrltext_len.is_some_and(|n| n > 0));
+        let on = format_c1_validator_note(&ok);
+        assert!(residual_note_has_exact_token(&on, "ok=1"));
+        assert!(residual_note_has_exact_token(&on, "reason=ok"));
+        assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&on, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&on, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&on, "classic_walk_ok=1"));
+        assert!(!residual_note_has_exact_token(&on, "invent_pass=1"));
+        assert!(!on.contains("ran_on_npu=true"));
+
+        // rela offset OOB for short ctrltext
+        let short = vec![0_u8; 16];
+        let oob_relas = [(100_u32, (1_u32 << 8) | 5, 0_i32)]; // offset 100 OOB for 16B
+        // Need ELF that classifies as Aie2ElfCtrltext — short may not walk classic but
+        // still peels as ctrltext if PROGBITS .ctrltext exists.
+        let oob_elf = build_minimal_test_elf32(&short, &oob_relas);
+        // If not classified as aiebu (non-walkable still returns Aie2ElfCtrltext),
+        // validate should catch OOB.
+        let oob = validate_aiebu_elf_ctrltext_structure(&oob_elf);
+        // short garbage may fail peel depending on section size; still not ok.
+        assert!(!oob.ok);
+        if oob.reason != AiebuElfCtrltextValidateReason::MissingCtrltext {
+            assert_eq!(
+                oob.reason,
+                AiebuElfCtrltextValidateReason::RelaOffsetOob,
+                "detail={}",
+                oob.detail
+            );
+        }
+        let oobn = format_c1_validator_note(&oob);
+        assert!(residual_note_has_exact_token(&oobn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&oobn, "not_c_ready=1"));
+    }
+
+    #[test]
+    fn c2_structural_fingerprint_from_detail_and_elf() {
+        let detail = "aiebu_elf=1 rela_count=12 content_size=1688B bo_size=4096B \
+             start_npu_size=1688B ty=Dev map_offset=0xffffffffffffffff \
+             layout=xrt3 config_cu=1 pdi_bytes=27200 cu_func=0";
+        let fp = structural_fingerprint_from_lab_detail(detail);
+        assert_eq!(fp.content_size_b, Some(1688));
+        assert_eq!(fp.bo_size_b, Some(4096));
+        assert_eq!(fp.start_npu_size_b, Some(1688));
+        assert_eq!(fp.instr_bo_type.as_deref(), Some("Dev"));
+        assert_eq!(fp.instr_map_offset, Some(u64::MAX));
+        assert!(fp.map_offset_is_no_mmap);
+        assert_eq!(fp.rela_count, Some(12));
+        assert_eq!(fp.config_cu, Some(1));
+        assert_eq!(fp.pdi_bytes, Some(27200));
+        assert_eq!(fp.cu_func, Some(0));
+        assert_eq!(fp.layout.as_deref(), Some("xrt3"));
+        assert_eq!(fp.aiebu_elf, Some(true));
+        let n = format_c2_structural_fingerprint_note(&fp);
+        assert!(residual_note_has_exact_token(
+            &n,
+            C2_STRUCTURAL_FINGERPRINT_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "fingerprint_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "content_size=1688"));
+        assert!(residual_note_has_exact_token(&n, "bo_size=4096"));
+        assert!(residual_note_has_exact_token(&n, "config_cu=1"));
+        assert!(residual_note_has_exact_token(&n, "pdi_bytes=27200"));
+        assert!(residual_note_has_exact_token(&n, "map_offset_is_no_mmap=1"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!n.contains("ran_on_npu=true"));
+
+        // empty detail
+        let empty = structural_fingerprint_from_lab_detail("");
+        assert!(empty.content_size_b.is_none());
+        let en = empty.format_soft_note();
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "content_size=absent"));
+
+        // merge ELF rela offsets
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [
+            (0_u32, (1_u32 << 8) | 5, 0_i32),
+            (8_u32, (2_u32 << 8) | 5, 0_i32),
+        ];
+        let synth = build_minimal_test_elf32(&ctrltext, &relas);
+        let merged = structural_fingerprint_merge_elf(fp, &synth);
+        assert_eq!(merged.rela_count, Some(2));
+        assert!(merged.rela_targets_summary.starts_with("n=2"));
+        assert_eq!(merged.aiebu_elf, Some(true));
+        let mn = format_c2_structural_fingerprint_note(&merged);
+        assert!(residual_note_has_exact_token(&mn, "rela_count=2"));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&mn, "not_ran_on_npu=1"));
+    }
+
+    #[test]
+    fn c3_residual_classifier_split_axes() {
+        // wait_cmd_einval must not become wait_timeout
+        let w = classify_residual_split(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed: os error 22 timeout_ms=120000"),
+            Some(true),
+            None,
+        );
+        assert_eq!(w.split, ResidualClassifierSplit::WaitCmdEinval);
+        assert_eq!(w.split.as_str(), "wait_cmd_einval");
+        assert_ne!(w.split.as_str(), "wait_timeout");
+        let wn = format_c3_residual_split_note(&w);
+        assert!(residual_note_has_exact_token(&wn, "split=wait_cmd_einval"));
+        assert!(residual_note_has_exact_token(
+            &wn,
+            "wait_cmd_einval_neq_wait_timeout=1"
+        ));
+        assert!(residual_note_has_exact_token(&wn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&wn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&wn, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&wn, "split=wait_timeout"));
+        assert!(!residual_note_has_exact_token(&wn, "invent_pass=1"));
+
+        // APP_LOAD after aiebu+rela+ert
+        let app = classify_residual_split(
+            Some("ert_cmd_error"),
+            Some("aiebu_elf=1 rela_count=12 aiebu_rela_patched ert_state=5(Error) 0x3000003"),
+            Some(true),
+            Some(true),
+        );
+        assert_eq!(app.split, ResidualClassifierSplit::AppLoad);
+        assert!(app.residual_class.is_locked_app_load_after_aiebu());
+        let an = format_c3_residual_split_note(&app);
+        assert!(residual_note_has_exact_token(&an, "split=app_load"));
+        assert!(residual_note_has_exact_token(&an, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&an, "not_ran_on_npu=1"));
+
+        // CU map fail
+        let cu = classify_residual_split(
+            Some("config_cu_failed"),
+            Some("config_cu_failed pdi_bytes=100"),
+            None,
+            None,
+        );
+        assert_eq!(cu.split, ResidualClassifierSplit::CuMap);
+        let cun = format_c3_residual_split_note(&cu);
+        assert!(residual_note_has_exact_token(&cun, "split=cu_map"));
+        assert!(residual_note_has_exact_token(&cun, "invent_pass=0"));
+
+        // PDI geometry (pdi_bytes without APP_LOAD class)
+        let pdi = classify_residual_split(
+            Some("lab_partial_config_cu"),
+            Some("config_cu=1 pdi_bytes=27200 pdi_fp len=27200 sha16=0eeeb70c84df056e"),
+            Some(true),
+            Some(false),
+        );
+        assert_eq!(pdi.split, ResidualClassifierSplit::PdiGeometry);
+        let pn = format_c3_residual_split_note(&pdi);
+        assert!(residual_note_has_exact_token(&pn, "split=pdi_geometry"));
+        assert!(residual_note_has_exact_token(&pn, "split_alone_not_pass=1"));
+        assert!(residual_note_has_exact_token(&pn, "not_c_ready=1"));
+
+        // protocol mismatch surface
+        let proto = classify_residual_split(
+            Some("submit_wait_failed"),
+            Some("SubmitWaitNotOk layout=xrt3"),
+            Some(true),
+            Some(false),
+        );
+        assert_eq!(proto.split, ResidualClassifierSplit::ProtocolMismatch);
+        let prn = format_c3_residual_split_note(&proto);
+        assert!(residual_note_has_exact_token(
+            &prn,
+            "split=protocol_mismatch"
+        ));
+        assert!(residual_note_has_exact_token(&prn, "invent_pass=0"));
+
+        // unknown empty
+        let unk = classify_residual_split(None, None, None, None);
+        assert_eq!(unk.split, ResidualClassifierSplit::Unknown);
+        let un = format_c3_residual_split_note(&unk);
+        assert!(residual_note_has_exact_token(&un, "split=unknown"));
+        assert!(residual_note_has_exact_token(&un, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&un, "not_ran_on_npu=1"));
+    }
+
+    /// Offline dig: WAIT_CMD EINVAL axes on lab classic START_NPU without CONFIG_CU.
+    /// Shape matches skip-CONFIG_CU last_apply under `1f761bf4` (CONSUMED).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn wait_cmd_einval_axes_skip_cu_lab_classic_1f761bf4_shape() {
+        // RED→GREEN: synthetic detail matching measured residual (no invent Pass).
+        let detail = "hwctx ok (handle=1) Cmd BO host-filled (inst_blob content=1688B \
+            bo_size=4096B ty=Dev xdna_addr=0x4020000 map_offset=0xffffffffffffffff; \
+            inst_size_mode=content content_size=1688B bo_size=4096B start_npu_size=1688B \
+            aiebu_elf=1 (rela pending) rela_count=12; aiebu_rela_patched ctrltext=1688B \
+            rela_mode=overwrite) but submit_and_wait failed (wait_cmd_einval): ioctl failed: \
+            WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000, request=0xc0106449): \
+            Invalid argument (os error 22). lab_ofm pack=mladf_a16w4; tiles=32; \
+            layout=count4; fw_status_hint=n/a";
+        let axes = parse_wait_cmd_einval_axes(Some("wait_cmd_einval"), Some(detail));
+        assert!(axes.status_is_wait_cmd_einval);
+        assert!(axes.invalid_argument);
+        assert_eq!(axes.timeout_ms, Some(5000));
+        assert_eq!(axes.hwctx, Some(1));
+        assert_eq!(axes.seq, Some(0));
+        assert_eq!(axes.wait_cmd_request, Some(0xc010_6449));
+        assert!(!axes.config_cu_present);
+        assert!(axes.pdi_bytes.is_none());
+        assert_eq!(axes.aiebu_elf, Some(true));
+        assert_eq!(axes.rela_count, Some(12));
+        assert!(axes.aiebu_rela_patched);
+        assert_eq!(axes.content_size_b, Some(1688));
+        assert_eq!(axes.start_npu_size_b, Some(1688));
+        assert!(axes.lab_classic_1688);
+        assert!(axes.userspace_elf_rela_ok);
+        assert!(axes.skip_config_cu_shape);
+        assert!(axes.ert_state.is_none());
+        assert!(!axes.ert_error);
+        assert_eq!(axes.detail, "skip_cu_lab_classic_wait_einval");
+
+        let note = format_wait_cmd_einval_axes_note(&axes);
+        assert!(residual_note_has_exact_token(
+            &note,
+            WAIT_CMD_EINVAL_AXES_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "status_is_wait_cmd_einval=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invalid_argument=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "skip_config_cu_shape=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "lab_classic_1688=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "userspace_elf_rela_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "config_cu_present=0"));
+        assert!(residual_note_has_exact_token(&note, "pdi_bytes=absent"));
+        assert!(residual_note_has_exact_token(&note, "timeout_ms=5000"));
+        assert!(residual_note_has_exact_token(&note, "hwctx=1"));
+        assert!(residual_note_has_exact_token(&note, "seq=0"));
+        assert!(residual_note_has_exact_token(&note, "request=0xc0106449"));
+        assert!(residual_note_has_exact_token(&note, "aiebu_elf=1"));
+        assert!(residual_note_has_exact_token(&note, "rela_count=12"));
+        assert!(residual_note_has_exact_token(&note, "content_size=1688"));
+        assert!(residual_note_has_exact_token(&note, "start_npu_size=1688"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "detail=skip_cu_lab_classic_wait_einval"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "axes_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "hypothesis_not_proven_root=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "wait_cmd_einval_neq_wait_timeout=1"
+        ));
+        assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&note, "ran_on_npu=1"));
+
+        // With CONFIG_CU present → not skip shape (soft-note honesty retained).
+        let with_cu = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some(
+                "config_cu=1 pdi_bytes=27200 submit_and_wait failed (wait_cmd_einval): \
+                 WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000): Invalid argument (os error 22)",
+            ),
+        );
+        assert!(with_cu.status_is_wait_cmd_einval);
+        assert!(with_cu.config_cu_present);
+        assert!(!with_cu.skip_config_cu_shape);
+        assert_eq!(with_cu.pdi_bytes, Some(27_200));
+        assert_eq!(with_cu.detail, "wait_einval_with_config_cu");
+        let with_cu_note = format_wait_cmd_einval_axes_note(&with_cu);
+        assert!(residual_note_has_exact_token(
+            &with_cu_note,
+            "skip_config_cu_shape=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &with_cu_note,
+            "config_cu_present=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &with_cu_note,
+            "invent_pass=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &with_cu_note,
+            "not_c_ready=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &with_cu_note,
+            "not_ran_on_npu=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &with_cu_note,
+            "axes_alone_not_pass=1"
+        ));
+
+        // Not wait_cmd_einval status.
+        let not = parse_wait_cmd_einval_axes(Some("wait_timeout"), Some("timeout_ms=5000"));
+        assert!(!not.status_is_wait_cmd_einval);
+        assert_eq!(not.detail, "not_wait_cmd_einval");
+        let nn = not.format_soft_note();
+        assert!(residual_note_has_exact_token(&nn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&nn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&nn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &nn,
+            "status_is_wait_cmd_einval=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &nn,
+            "product_pass_requires_live_decide=1"
+        ));
+    }
+
+    /// W1 O2: driver-shaped WAIT axes map — hwctx miss vs fence/syncobj vs ETIME.
+    ///
+    /// Pure offline honesty only. invent_pass=0 always. Axes alone ≠ Pass.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn wait_cmd_einval_driver_axes_map_hwctx_vs_fence_vs_etime() {
+        // --- Static driver→product class table (staged aie2_cmd_wait) ----------
+        assert!(WaitCmdDriverAxis::HwctxMissing.is_product_einval());
+        assert!(WaitCmdDriverAxis::FenceOrSyncobjOrSeqMiss.is_product_einval());
+        assert!(WaitCmdDriverAxis::OsEinvalUndifferentiated.is_product_einval());
+        assert!(!WaitCmdDriverAxis::EtimeTimeout.is_product_einval());
+        assert!(WaitCmdDriverAxis::EtimeTimeout.is_product_timeout());
+        assert!(!WaitCmdDriverAxis::HwctxMissing.is_product_timeout());
+        assert!(!WaitCmdDriverAxis::NotWaitFailureAxis.is_product_einval());
+        assert!(!WaitCmdDriverAxis::NotWaitFailureAxis.is_product_timeout());
+
+        // --- Live skip-CU shape (1f761bf4): os EINVAL, no journal split --------
+        let skip_detail = "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000, request=0xc0106449): \
+            Invalid argument (os error 22)";
+        let skip =
+            map_wait_cmd_einval_driver_axes(Some("wait_cmd_einval"), Some(skip_detail), None);
+        assert_eq!(skip.product_class, WaitSubmitProductClass::WaitCmdEinval);
+        assert_eq!(
+            skip.driver_axis,
+            WaitCmdDriverAxis::OsEinvalUndifferentiated
+        );
+        assert!(skip.driver_einval_fence_or_hwctx);
+        assert!(!skip.etime_is_timeout);
+        assert!(!skip.journal_syncobj_seq_hint);
+        assert!(!skip.journal_hwctx_miss_hint);
+        assert_eq!(skip.detail, "driver_os_einval_undifferentiated");
+        // Field name timeout_ms= must NOT force timeout class when EINVAL present.
+        assert_ne!(skip.product_class, WaitSubmitProductClass::WaitTimeout);
+
+        let skip_note = format_wait_cmd_einval_driver_axes_note(&skip);
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            WAIT_CMD_EINVAL_DRIVER_AXES_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "product_class=wait_cmd_einval"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "driver_axis=os_einval_undifferentiated"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "driver_einval_fence_or_hwctx=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "etime_is_timeout=0"
+        ));
+        assert!(residual_note_has_exact_token(&skip_note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&skip_note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "not_ran_on_npu=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "axes_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "hypothesis_not_proven_root=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "wait_cmd_einval_neq_wait_timeout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &skip_note,
+            "syncobj_wait_parity_alone_not_pass=1"
+        ));
+        assert!(!residual_note_has_exact_token(&skip_note, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&skip_note, "ran_on_npu=1"));
+
+        // --- Fence / syncobj / seq miss (journal split) -----------------------
+        let fence = map_wait_cmd_einval_driver_axes(
+            Some("wait_cmd_einval"),
+            Some(skip_detail),
+            Some("aie2_cmd_wait: Invalid syncobj or sequence number"),
+        );
+        assert_eq!(fence.product_class, WaitSubmitProductClass::WaitCmdEinval);
+        assert_eq!(
+            fence.driver_axis,
+            WaitCmdDriverAxis::FenceOrSyncobjOrSeqMiss
+        );
+        assert!(fence.driver_einval_fence_or_hwctx);
+        assert!(!fence.etime_is_timeout);
+        assert!(fence.journal_syncobj_seq_hint);
+        assert!(!fence.journal_hwctx_miss_hint);
+        assert_eq!(fence.detail, "driver_fence_syncobj_seq_einval");
+        let fence_note = fence.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &fence_note,
+            "driver_axis=fence_or_syncobj_or_seq_miss"
+        ));
+        assert!(residual_note_has_exact_token(
+            &fence_note,
+            "journal_syncobj_seq_hint=1"
+        ));
+        assert!(residual_note_has_exact_token(&fence_note, "invent_pass=0"));
+
+        // --- Hwctx missing (journal split) ------------------------------------
+        let hwctx_miss = map_wait_cmd_einval_driver_axes(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed (hwctx=99, seq=0, timeout_ms=5000): Invalid argument"),
+            Some("amdxdna_cmd_wait: failed to find context"),
+        );
+        assert_eq!(
+            hwctx_miss.product_class,
+            WaitSubmitProductClass::WaitCmdEinval
+        );
+        assert_eq!(hwctx_miss.driver_axis, WaitCmdDriverAxis::HwctxMissing);
+        assert!(hwctx_miss.driver_einval_fence_or_hwctx);
+        assert!(!hwctx_miss.etime_is_timeout);
+        assert!(hwctx_miss.journal_hwctx_miss_hint);
+        assert!(!hwctx_miss.journal_syncobj_seq_hint);
+        assert_eq!(hwctx_miss.detail, "driver_hwctx_missing_einval");
+        let hw_note = format_wait_cmd_einval_driver_axes_note(&hwctx_miss);
+        assert!(residual_note_has_exact_token(
+            &hw_note,
+            "driver_axis=hwctx_missing"
+        ));
+        assert!(residual_note_has_exact_token(
+            &hw_note,
+            "journal_hwctx_miss_hint=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &hw_note,
+            "driver_einval_fence_or_hwctx=1"
+        ));
+        assert!(residual_note_has_exact_token(&hw_note, "invent_pass=0"));
+
+        // Fence journal wins when both hints present (more specific EINVAL path).
+        let both = map_wait_cmd_einval_driver_axes(
+            Some("wait_cmd_einval"),
+            Some("Invalid argument (os error 22)"),
+            Some("failed to find context; Invalid syncobj or sequence number"),
+        );
+        assert_eq!(both.driver_axis, WaitCmdDriverAxis::FenceOrSyncobjOrSeqMiss);
+        assert!(both.journal_syncobj_seq_hint);
+        assert!(both.journal_hwctx_miss_hint);
+
+        // --- ETIME / true timeout (not EINVAL) --------------------------------
+        let etime = map_wait_cmd_einval_driver_axes(
+            Some("wait_timeout"),
+            Some(
+                "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000): Connection timed out (os error 110)",
+            ),
+            Some("dma_fence_wait_timeout: etime"),
+        );
+        assert_eq!(etime.product_class, WaitSubmitProductClass::WaitTimeout);
+        assert_eq!(etime.driver_axis, WaitCmdDriverAxis::EtimeTimeout);
+        assert!(!etime.driver_einval_fence_or_hwctx);
+        assert!(etime.etime_is_timeout);
+        assert_eq!(etime.detail, "driver_etime_is_timeout");
+        let et_note = format_wait_cmd_einval_driver_axes_note(&etime);
+        assert!(residual_note_has_exact_token(
+            &et_note,
+            "product_class=wait_timeout"
+        ));
+        assert!(residual_note_has_exact_token(
+            &et_note,
+            "driver_axis=etime_timeout"
+        ));
+        assert!(residual_note_has_exact_token(
+            &et_note,
+            "etime_is_timeout=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &et_note,
+            "driver_einval_fence_or_hwctx=0"
+        ));
+        assert!(residual_note_has_exact_token(&et_note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&et_note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&et_note, "not_ran_on_npu=1"));
+
+        // Bare "timed out" without status → timeout class.
+        let bare_to =
+            map_wait_cmd_einval_driver_axes(None, Some("submit wait timed out after 5000ms"), None);
+        assert_eq!(bare_to.product_class, WaitSubmitProductClass::WaitTimeout);
+        assert_eq!(bare_to.driver_axis, WaitCmdDriverAxis::EtimeTimeout);
+        assert!(bare_to.etime_is_timeout);
+
+        // --- Other / not wait failure -----------------------------------------
+        let other = map_wait_cmd_einval_driver_axes(
+            Some("exec_eio"),
+            Some("map_host buffer failed os error 5"),
+            None,
+        );
+        assert_eq!(other.product_class, WaitSubmitProductClass::Other);
+        assert_eq!(other.driver_axis, WaitCmdDriverAxis::NotWaitFailureAxis);
+        assert!(!other.driver_einval_fence_or_hwctx);
+        assert!(!other.etime_is_timeout);
+        assert_eq!(other.detail, "not_wait_failure_axis");
+        let o_note = other.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &o_note,
+            "driver_axis=not_wait_failure_axis"
+        ));
+        assert!(residual_note_has_exact_token(&o_note, "invent_pass=0"));
+
+        // Empty → not wait failure.
+        let empty = map_wait_cmd_einval_driver_axes(None, None, None);
+        assert_eq!(empty.product_class, WaitSubmitProductClass::Other);
+        assert_eq!(empty.driver_axis, WaitCmdDriverAxis::NotWaitFailureAxis);
+
+        // Helper token parsers.
+        assert!(wait_message_looks_like_os_einval(
+            "Invalid argument (os error 22)"
+        ));
+        assert!(wait_message_looks_like_true_timeout("etimedout"));
+        assert!(wait_message_looks_like_true_timeout("Connection timed out"));
+        // Mere field name timeout_ms= alone is NOT true timeout.
+        assert!(!wait_message_looks_like_true_timeout(
+            "WAIT_CMD failed (timeout_ms=5000): Invalid argument"
+        ));
+        assert!(journal_hints_invalid_syncobj_or_seq(
+            "Invalid syncobj or sequence number"
+        ));
+        assert!(journal_hints_hwctx_missing("failed to find context"));
+    }
+
+    /// W3 O13: XRT-parity wait path decision — pure offline only.
+    ///
+    /// Non-zero CREATE_HWCTX syncobj_handle → prefer syncobj timeline wait
+    /// (timepoint = EXEC seq). Zero / invalid fence → WAIT_CMD. Soft note
+    /// always invent_pass=0; not live-wired; parity alone ≠ Pass.
+    #[test]
+    fn should_wait_via_syncobj_xrt_parity_decision() {
+        assert_eq!(AMDXDNA_INVALID_FENCE_HANDLE, 0);
+        assert!(!should_wait_via_syncobj(AMDXDNA_INVALID_FENCE_HANDLE));
+        assert!(!should_wait_via_syncobj(0));
+        assert!(should_wait_via_syncobj(1));
+        assert!(should_wait_via_syncobj(42));
+        assert!(should_wait_via_syncobj(u32::MAX));
+
+        assert_eq!(select_wait_completion_path(0), WaitCompletionPath::WaitCmd);
+        assert_eq!(
+            select_wait_completion_path(AMDXDNA_INVALID_FENCE_HANDLE),
+            WaitCompletionPath::WaitCmd
+        );
+        assert_eq!(
+            select_wait_completion_path(7),
+            WaitCompletionPath::SyncobjTimeline
+        );
+        assert_eq!(WaitCompletionPath::WaitCmd.as_str(), "wait_cmd");
+        assert_eq!(
+            WaitCompletionPath::SyncobjTimeline.as_str(),
+            "syncobj_timeline"
+        );
+
+        // Pack: only when handle valid; timepoint must equal EXEC seq (shim).
+        assert!(pack_syncobj_timeline_wait_args(0, 0, 5000).is_none());
+        assert!(pack_syncobj_timeline_wait_args(0, 99, 100).is_none());
+        let packed = pack_syncobj_timeline_wait_args(3, 0, 5000).expect("non-zero handle packs");
+        assert_eq!(
+            packed,
+            SyncobjTimelineWaitArgs {
+                handle: 3,
+                timepoint: 0,
+                timeout_ms: 5000,
+            }
+        );
+        let packed_seq = pack_syncobj_timeline_wait_args(9, 17, 120_000).expect("pack");
+        assert_eq!(packed_seq.handle, 9);
+        assert_eq!(packed_seq.timepoint, 17);
+        assert_eq!(packed_seq.timeout_ms, 120_000);
+
+        // Soft note honesty (valid handle path).
+        let note = format_syncobj_wait_path_decision_note(5, 0, 5000);
+        assert!(residual_note_has_exact_token(
+            &note,
+            SYNCOBJ_WAIT_PATH_DECISION_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&note, "syncobj_handle=5"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "should_wait_via_syncobj=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "path=syncobj_timeline"
+        ));
+        assert!(residual_note_has_exact_token(&note, "seq=0"));
+        assert!(residual_note_has_exact_token(&note, "timeout_ms=5000"));
+        assert!(residual_note_has_exact_token(&note, "timepoint=0"));
+        assert!(residual_note_has_exact_token(&note, "default_wait_cmd=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "research_wire_offline=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "wait_path_syncobj_research=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "syncobj_wait_parity_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "hypothesis_not_proven_root=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "not_live_proven=1"));
+        assert!(residual_note_has_exact_token(&note, "l8_not_minted=1"));
+        // Stale pre-W4c token must not appear after research wire landed.
+        assert!(!residual_note_has_exact_token(&note, "not_live_wired=1"));
+        assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&note, "ran_on_npu=1"));
+
+        // Soft note: invalid handle → WAIT_CMD, timepoint absent.
+        let note0 = format_syncobj_wait_path_decision_note(0, 3, 1000);
+        assert!(residual_note_has_exact_token(
+            &note0,
+            "should_wait_via_syncobj=0"
+        ));
+        assert!(residual_note_has_exact_token(&note0, "path=wait_cmd"));
+        assert!(residual_note_has_exact_token(&note0, "timepoint=absent"));
+        assert!(residual_note_has_exact_token(&note0, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note0, "default_wait_cmd=1"));
+        assert!(residual_note_has_exact_token(
+            &note0,
+            "wait_path_syncobj_research=1"
+        ));
+        assert!(!residual_note_has_exact_token(&note0, "not_live_wired=1"));
+    }
+
+    /// P1-B: soft wait-path research from last_apply detail (syncobj + wait_path).
+    ///
+    /// Live-shaped skip-CU / same-shot detail already greps `syncobj=` and
+    /// `wait_path=wait_cmd`. Soft summary always invent_pass=0; ≠ Pass ≠ unlock.
+    #[test]
+    fn wait_path_syncobj_research_soft_from_last_apply_detail() {
+        // Same-shot / skip-CU shape: greppable syncobj + product wait_path=wait_cmd.
+        let detail = "hwctx ok (handle=1 syncobj=1) Cmd BO host-filled \
+            (inst_blob content=1688B) but submit_and_wait failed \
+            (wait_cmd_einval): ioctl failed: WAIT_CMD failed \
+            (hwctx=1, seq=0, timeout_ms=5000, wait_path=wait_cmd, \
+            request=0xc0106449): Invalid argument (os error 22)";
+        let soft = format_wait_path_syncobj_research_soft(Some("wait_cmd_einval"), Some(detail));
+        assert!(residual_note_has_exact_token(
+            &soft,
+            "wait_path_syncobj_research=1"
+        ));
+        assert!(residual_note_has_exact_token(&soft, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&soft, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&soft, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &soft,
+            "research_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft,
+            "research_alone_not_unlock=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft,
+            "detail_syncobj_present=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft,
+            "detail_wait_path_present=1"
+        ));
+        assert!(residual_note_has_exact_token(&soft, "syncobj=1"));
+        assert!(residual_note_has_exact_token(&soft, "wait_path=wait_cmd"));
+        // Decision path prefers syncobj timeline when handle ≠ 0 (XRT parity);
+        // product default still WAIT_CMD on live.
+        assert!(soft.contains("should_wait_via_syncobj=1"));
+        assert!(soft.contains("path=syncobj_timeline"));
+        assert!(soft.contains("default_wait_cmd=1"));
+        assert!(!residual_note_has_exact_token(&soft, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&soft, "ran_on_npu=1"));
+
+        // No detail → still honesty, syncobj absent.
+        let empty = format_wait_path_syncobj_research_soft(None, None);
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "wait_path_syncobj_research=1"
+        ));
+        assert!(residual_note_has_exact_token(&empty, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&empty, "syncobj=absent"));
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "detail_syncobj_present=0"
+        ));
+    }
+
+    /// O1 P5: post-fail ERT / Cmd BO dump observability (pure + soft).
+    ///
+    /// Live-shaped `wait_cmd_einval` last_apply historically lacks `ert_state=`
+    /// on the Err path. Soft research must greppably report present / unread /
+    /// absent / missing. Always invent_pass=0; research alone ≠ Pass ≠ unlock.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn post_fail_ert_research_from_wait_cmd_einval_detail() {
+        // Historical same-shot shape: WAIT EINVAL, no ert_state token at all.
+        let historical = "hwctx ok (handle=1 syncobj=1) Cmd BO host-filled \
+            (inst_blob content=1688B) but submit_and_wait failed \
+            (wait_cmd_einval): ioctl failed: WAIT_CMD failed \
+            (hwctx=1, seq=0, timeout_ms=5000, wait_path=wait_cmd, \
+            request=0xc0106449): Invalid argument (os error 22)";
+        let hist = parse_post_fail_ert_research(Some("wait_cmd_einval"), Some(historical));
+        assert!(hist.status_is_submit_wait_fail);
+        assert_eq!(hist.presence, PostFailErtPresence::MissingFromDetail);
+        assert!(hist.ert_state.is_none());
+        assert!(!hist.ert_error);
+        assert_eq!(hist.split_hint, "historical_no_ert_token");
+        let soft_hist =
+            format_post_fail_ert_research_soft(Some("wait_cmd_einval"), Some(historical));
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "post_fail_ert_research=1"
+        ));
+        assert!(residual_note_has_exact_token(&soft_hist, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&soft_hist, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "not_ran_on_npu=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "research_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "research_alone_not_unlock=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "ert_post_fail=missing_from_detail"
+        ));
+        assert!(!residual_note_has_exact_token(&soft_hist, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&soft_hist, "ran_on_npu=1"));
+
+        // Product dump after WAIT fail: readable ERT New → fence / state present.
+        let present_detail = "hwctx ok (handle=1 syncobj=1) Cmd BO host-filled \
+            (inst_blob) but submit_and_wait failed (wait_cmd_einval): \
+            Invalid argument (os error 22). ert_state=1(New) ert_post_fail=present; \
+            bo_diag=[]";
+        let present = parse_post_fail_ert_research(Some("wait_cmd_einval"), Some(present_detail));
+        assert_eq!(present.presence, PostFailErtPresence::Present);
+        assert_eq!(present.ert_state, Some(1));
+        assert!(!present.ert_error);
+        assert_eq!(present.split_hint, "r1_fence_or_state_present");
+        let soft_p =
+            format_post_fail_ert_research_soft(Some("wait_cmd_einval"), Some(present_detail));
+        assert!(residual_note_has_exact_token(
+            &soft_p,
+            "ert_post_fail=present"
+        ));
+        assert!(residual_note_has_exact_token(&soft_p, "ert_state=1"));
+        assert!(residual_note_has_exact_token(&soft_p, "invent_pass=0"));
+
+        // Soft honesty always-on tokens (historical fixture).
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_hist,
+            "hypothesis_not_proven_root=1"
+        ));
+
+        // ERT Error after wait fail → R4-ish FW reject hint (not proven root).
+        let err_detail = "submit_and_wait failed (wait_cmd_einval): x. \
+            ert_state=5(Error) ert_post_fail=present";
+        let er = parse_post_fail_ert_research(Some("wait_cmd_einval"), Some(err_detail));
+        assert_eq!(er.presence, PostFailErtPresence::Present);
+        assert_eq!(er.ert_state, Some(5));
+        assert!(er.ert_error);
+        assert_eq!(er.split_hint, "r4_fw_reject_hint");
+        // Soft on Error fixture: invent_pass=0 + r4 split + honesty.
+        let soft_er = format_post_fail_ert_research_soft(Some("wait_cmd_einval"), Some(err_detail));
+        assert!(residual_note_has_exact_token(&soft_er, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&soft_er, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&soft_er, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &soft_er,
+            "research_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_er,
+            "split_hint=r4_fw_reject_hint"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_er,
+            "ert_post_fail=present"
+        ));
+        assert!(residual_note_has_exact_token(&soft_er, "ert_error=1"));
+        assert!(!residual_note_has_exact_token(&soft_er, "invent_pass=1"));
+
+        // ERT Completed after wait fail → dedicated split_hint (rare / honesty).
+        let completed_detail = "submit_and_wait failed (wait_cmd_einval): x. \
+            ert_state=4(Completed) ert_post_fail=present";
+        let done = parse_post_fail_ert_research(Some("wait_cmd_einval"), Some(completed_detail));
+        assert_eq!(done.presence, PostFailErtPresence::Present);
+        assert_eq!(done.ert_state, Some(4));
+        assert!(done.ert_completed);
+        assert!(!done.ert_error);
+        assert_eq!(done.split_hint, "ert_completed_after_wait_fail");
+        let soft_done =
+            format_post_fail_ert_research_soft(Some("wait_cmd_einval"), Some(completed_detail));
+        assert!(residual_note_has_exact_token(
+            &soft_done,
+            "split_hint=ert_completed_after_wait_fail"
+        ));
+        assert!(residual_note_has_exact_token(&soft_done, "ert_completed=1"));
+        assert!(residual_note_has_exact_token(&soft_done, "invent_pass=0"));
+
+        // Read attempted, header unreadable.
+        let unread_detail = "submit_and_wait failed (wait_cmd_einval): x. \
+            ert_state=unread ert_post_fail=unread";
+        let un = parse_post_fail_ert_research(Some("wait_cmd_einval"), Some(unread_detail));
+        assert_eq!(un.presence, PostFailErtPresence::Unread);
+        assert!(un.ert_state.is_none());
+        assert_eq!(un.split_hint, "r1_fence_maybe_unread");
+        let soft_u =
+            format_post_fail_ert_research_soft(Some("wait_cmd_einval"), Some(unread_detail));
+        assert!(residual_note_has_exact_token(
+            &soft_u,
+            "ert_post_fail=unread"
+        ));
+        assert!(residual_note_has_exact_token(&soft_u, "invent_pass=0"));
+
+        // Explicit expected_absent (fail before EXEC / no Cmd BO) — product pre-EXEC.
+        let expected_detail = "cmd_bo_failed: CREATE_BO(Cmd) failed. ert_post_fail=expected_absent";
+        let ab = parse_post_fail_ert_research(Some("cmd_bo_failed"), Some(expected_detail));
+        assert_eq!(ab.presence, PostFailErtPresence::ExpectedAbsent);
+        assert_eq!(ab.split_hint, "pre_exec_ert_expected_absent");
+        let soft_ab =
+            format_post_fail_ert_research_soft(Some("cmd_bo_failed"), Some(expected_detail));
+        assert!(residual_note_has_exact_token(
+            &soft_ab,
+            "ert_post_fail=expected_absent"
+        ));
+        assert!(residual_note_has_exact_token(&soft_ab, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &soft_ab,
+            "split_hint=pre_exec_ert_expected_absent"
+        ));
+
+        // Pure absent (BO valid but read not attempted) — parse + soft.
+        let absent_only = "lab detail without exec. ert_post_fail=absent";
+        let abs = parse_post_fail_ert_research(Some("hwctx_ok"), Some(absent_only));
+        assert_eq!(abs.presence, PostFailErtPresence::Absent);
+        assert_eq!(abs.split_hint, "ert_post_fail_absent");
+        let soft_abs = format_post_fail_ert_research_soft(Some("hwctx_ok"), Some(absent_only));
+        assert!(residual_note_has_exact_token(
+            &soft_abs,
+            "ert_post_fail=absent"
+        ));
+        assert!(residual_note_has_exact_token(&soft_abs, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &soft_abs,
+            "hypothesis_not_proven_root=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &soft_abs,
+            "product_pass_requires_live_decide=1"
+        ));
+
+        // Pure product detail token formatter (WAIT Err + pre-EXEC arms).
+        let tok_present = format_post_fail_ert_detail_tokens(Some(1), true, true);
+        assert!(tok_present.contains("ert_state=1(New)"));
+        assert!(tok_present.contains("ert_post_fail=present"));
+        let tok_unread = format_post_fail_ert_detail_tokens(None, true, true);
+        assert!(tok_unread.contains("ert_state=unread"));
+        assert!(tok_unread.contains("ert_post_fail=unread"));
+        let tok_expected = format_post_fail_ert_detail_tokens(None, false, false);
+        assert!(tok_expected.contains("ert_post_fail=expected_absent"));
+        assert!(!tok_expected.contains("ert_state="));
+        // Formatter branch: BO valid, read not attempted → absent (not expected_absent).
+        let tok_absent = format_post_fail_ert_detail_tokens(None, false, true);
+        assert_eq!(tok_absent, "ert_post_fail=absent");
+        assert!(!tok_absent.contains("expected_absent"));
+        assert!(!tok_absent.contains("ert_state="));
+
+        // format → parse round-trip of product tokens (WAIT present / unread / pre-EXEC).
+        for (status, tok, want_presence, want_hint) in [
+            (
+                "wait_cmd_einval",
+                format_post_fail_ert_detail_tokens(Some(5), true, true),
+                PostFailErtPresence::Present,
+                "r4_fw_reject_hint",
+            ),
+            (
+                "wait_cmd_einval",
+                format_post_fail_ert_detail_tokens(Some(1), true, true),
+                PostFailErtPresence::Present,
+                "r1_fence_or_state_present",
+            ),
+            (
+                "wait_cmd_einval",
+                format_post_fail_ert_detail_tokens(None, true, true),
+                PostFailErtPresence::Unread,
+                "r1_fence_maybe_unread",
+            ),
+            (
+                "cmd_bo_failed",
+                format_post_fail_ert_detail_tokens(None, false, false),
+                PostFailErtPresence::ExpectedAbsent,
+                "pre_exec_ert_expected_absent",
+            ),
+            (
+                "hwctx_ok",
+                format_post_fail_ert_detail_tokens(None, false, true),
+                PostFailErtPresence::Absent,
+                "ert_post_fail_absent",
+            ),
+        ] {
+            let detail = format!("submit_and_wait failed ({status}): x. {tok}");
+            let parsed = parse_post_fail_ert_research(Some(status), Some(&detail));
+            assert_eq!(
+                parsed.presence, want_presence,
+                "round-trip presence for tok={tok}"
+            );
+            assert_eq!(
+                parsed.split_hint, want_hint,
+                "round-trip split_hint for tok={tok}"
+            );
+            let soft = format_post_fail_ert_research_soft(Some(status), Some(&detail));
+            assert!(
+                residual_note_has_exact_token(&soft, "invent_pass=0"),
+                "round-trip soft invent_pass=0 for tok={tok}"
+            );
+            assert!(
+                residual_note_has_exact_token(
+                    &soft,
+                    &format!("ert_post_fail={}", want_presence.as_str())
+                ),
+                "round-trip soft presence for tok={tok}; soft={soft}"
+            );
+        }
+
+        // Empty → honesty only, missing.
+        let empty = format_post_fail_ert_research_soft(None, None);
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "post_fail_ert_research=1"
+        ));
+        assert!(residual_note_has_exact_token(&empty, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "ert_post_fail=missing_from_detail"
+        ));
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "hypothesis_not_proven_root=1"
+        ));
+        assert!(!residual_note_has_exact_token(&empty, "invent_pass=1"));
+    }
+
+    /// S3: ranked WAIT fence diagnostic — out-fence lookup vs unpublished job
+    /// vs syncobj parity. Reuses wait axes + post-fail ERT. invent_pass=0.
+    /// Diagnostic ≠ live_justified ≠ unlock ≠ Pass.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn wait_fence_diagnostic_ranks_out_fence_unpublished_syncobj() {
+        assert_eq!(
+            WaitFenceHypothesis::OutFenceLookupFail.as_str(),
+            "out_fence_lookup_fail"
+        );
+        assert_eq!(WaitFenceHypothesis::OutFenceLookupFail.rank(), 1);
+        assert_eq!(
+            WaitFenceHypothesis::UnpublishedJob.as_str(),
+            "unpublished_job"
+        );
+        assert_eq!(WaitFenceHypothesis::UnpublishedJob.rank(), 2);
+        assert_eq!(
+            WaitFenceHypothesis::SyncobjParityUnproven.as_str(),
+            "syncobj_parity_unproven"
+        );
+        assert_eq!(WaitFenceHypothesis::SyncobjParityUnproven.rank(), 3);
+        assert_eq!(
+            WaitFenceHypothesis::NotWaitFenceClass.as_str(),
+            "not_wait_fence_class"
+        );
+        assert_eq!(WaitFenceHypothesis::NotWaitFenceClass.rank(), 0);
+
+        // Live-shaped same-shot / skip-CU (`2c9c12e8` / `1f761bf4`): WAIT EINVAL,
+        // EXEC returned seq=0, syncobj=1, product wait_path=wait_cmd, no ERT token.
+        let live = "hwctx ok (handle=1 syncobj=1) Cmd BO host-filled \
+            (inst_blob content=1688B aiebu_elf=1 rela_count=12 aiebu_rela_patched) \
+            but submit_and_wait failed (wait_cmd_einval): ioctl failed: \
+            WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000, wait_path=wait_cmd, \
+            request=0xc0106449): Invalid argument (os error 22)";
+        let d = parse_wait_fence_diagnostic(Some("wait_cmd_einval"), Some(live), None);
+        assert!(d.status_is_wait_cmd_einval);
+        assert_eq!(d.primary, WaitFenceHypothesis::OutFenceLookupFail);
+        assert!(d.out_fence_lookup_open);
+        assert!(d.unpublished_job_open);
+        assert!(d.syncobj_parity_unproven);
+        assert!(d.timeout_ruled_out);
+        assert!(d.seq_zero_ruled_out);
+        assert!(d.ioctl_size_ruled_out);
+        assert_eq!(d.driver_axis, WaitCmdDriverAxis::OsEinvalUndifferentiated);
+        assert_eq!(
+            d.post_fail_ert_presence,
+            PostFailErtPresence::MissingFromDetail
+        );
+        assert_eq!(d.detail_syncobj, Some(1));
+        assert_eq!(d.detail_wait_path.as_deref(), Some("wait_cmd"));
+
+        let note = format_wait_fence_diagnostic_note(&d);
+        assert!(residual_note_has_exact_token(
+            &note,
+            WAIT_FENCE_DIAGNOSTIC_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "primary=out_fence_lookup_fail"
+        ));
+        assert!(residual_note_has_exact_token(&note, "rank=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "out_fence_lookup_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "unpublished_job_open=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "syncobj_parity_unproven=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "timeout_ruled_out=1"));
+        assert!(residual_note_has_exact_token(&note, "seq_zero_ruled_out=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "ioctl_size_ruled_out=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "axes_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "live_justified=0"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "hypothesis_not_proven_root=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "diagnostic_alone_not_unlock=1"
+        ));
+        assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&note, "ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&note, "live_justified=1"));
+
+        let soft = format_wait_fence_diagnostic_soft(Some("wait_cmd_einval"), Some(live));
+        assert!(residual_note_has_exact_token(&soft, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&soft, "live_justified=0"));
+        assert!(residual_note_has_exact_token(&soft, "not_ran_on_npu=1"));
+
+        // Journal fence miss: still rank-1 out-fence; unpublished remains open.
+        let fence = parse_wait_fence_diagnostic(
+            Some("wait_cmd_einval"),
+            Some(live),
+            Some("aie2_cmd_wait: Invalid syncobj or sequence number"),
+        );
+        assert_eq!(fence.primary, WaitFenceHypothesis::OutFenceLookupFail);
+        assert_eq!(
+            fence.driver_axis,
+            WaitCmdDriverAxis::FenceOrSyncobjOrSeqMiss
+        );
+        assert!(fence.out_fence_lookup_open);
+        assert!(fence.unpublished_job_open);
+        let fence_note = fence.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &fence_note,
+            "driver_axis=fence_or_syncobj_or_seq_miss"
+        ));
+        assert!(residual_note_has_exact_token(
+            &fence_note,
+            "live_justified=0"
+        ));
+        assert!(residual_note_has_exact_token(&fence_note, "invent_pass=0"));
+
+        // ERT Error after WAIT fail: unpublished job not open (job existed enough
+        // to reject); rank-1 still out-fence lookup.
+        let err_detail = format!("{live} ert_state=5(Error) ert_post_fail=present");
+        let er = parse_wait_fence_diagnostic(Some("wait_cmd_einval"), Some(&err_detail), None);
+        assert_eq!(er.primary, WaitFenceHypothesis::OutFenceLookupFail);
+        assert!(er.out_fence_lookup_open);
+        assert!(!er.unpublished_job_open);
+        assert!(er.syncobj_parity_unproven);
+        let er_note = format_wait_fence_diagnostic_note(&er);
+        assert!(residual_note_has_exact_token(
+            &er_note,
+            "unpublished_job_open=0"
+        ));
+        assert!(residual_note_has_exact_token(&er_note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&er_note, "live_justified=0"));
+
+        // True timeout class is not the fence residual.
+        let to = parse_wait_fence_diagnostic(
+            Some("wait_timeout"),
+            Some("WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000): etimedout"),
+            None,
+        );
+        assert!(!to.status_is_wait_cmd_einval);
+        assert_eq!(to.primary, WaitFenceHypothesis::NotWaitFenceClass);
+        assert!(!to.out_fence_lookup_open);
+        assert!(!to.unpublished_job_open);
+        assert!(!to.syncobj_parity_unproven);
+        assert!(!to.timeout_ruled_out);
+        let to_note = format_wait_fence_diagnostic_note(&to);
+        assert!(residual_note_has_exact_token(
+            &to_note,
+            "primary=not_wait_fence_class"
+        ));
+        assert!(residual_note_has_exact_token(&to_note, "rank=0"));
+        assert!(residual_note_has_exact_token(
+            &to_note,
+            "timeout_ruled_out=0"
+        ));
+        assert!(residual_note_has_exact_token(&to_note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&to_note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&to_note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &to_note,
+            "axes_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&to_note, "live_justified=0"));
+        assert!(!residual_note_has_exact_token(&to_note, "live_justified=1"));
+
+        // Empty → honesty only, not a fence class.
+        let empty = format_wait_fence_diagnostic_soft(None, None);
+        assert!(residual_note_has_exact_token(
+            &empty,
+            WAIT_FENCE_DIAGNOSTIC_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &empty,
+            "primary=not_wait_fence_class"
+        ));
+        assert!(residual_note_has_exact_token(&empty, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&empty, "live_justified=0"));
+        assert!(residual_note_has_exact_token(&empty, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(&empty, "invent_pass=1"));
+    }
+
+    /// W4a T5: absolute timeout nsec, flags, errno classify, fail-closed pack.
+    ///
+    /// Offline pure only. No live SYNCOBJ_TIMELINE_WAIT. invent_pass=0.
+    /// L8 not minted. Product wait path unchanged (WAIT_CMD).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn syncobj_timeline_wait_pack_timeout_and_errno_classify() {
+        // --- Flags constants match public drm.h bit positions -----------------
+        assert_eq!(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, 1);
+        assert_eq!(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, 2);
+        assert_eq!(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, 4);
+        assert_eq!(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE, 8);
+        assert_eq!(
+            SYNCOBJ_TIMELINE_WAIT_FLAGS_XRT_DEFAULT,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+        );
+        assert_eq!(SYNCOBJ_NSEC_PER_MS, 1_000_000);
+        assert_eq!(ENV_LAB_WAIT_VIA_SYNCOBJ, "XDNA2_LAB_WAIT_VIA_SYNCOBJ");
+
+        // --- Absolute timeout nsec (XRT: 0 → forever; else now + ms*1e6) ------
+        assert_eq!(syncobj_timeout_ms_to_abs_nsec(0, 0), i64::MAX);
+        assert_eq!(syncobj_timeout_ms_to_abs_nsec(0, 99), i64::MAX);
+        assert_eq!(syncobj_timeout_ms_to_abs_nsec(1, 0), SYNCOBJ_NSEC_PER_MS);
+        assert_eq!(
+            syncobj_timeout_ms_to_abs_nsec(5_000, 1_000_000_000),
+            1_000_000_000 + 5_000 * SYNCOBJ_NSEC_PER_MS
+        );
+        // Negative now clamped to 0 (fail-closed clock sample).
+        assert_eq!(
+            syncobj_timeout_ms_to_abs_nsec(2, -100),
+            2 * SYNCOBJ_NSEC_PER_MS
+        );
+        // Overflow-safe: large now + large budget saturates at i64::MAX.
+        assert_eq!(
+            syncobj_timeout_ms_to_abs_nsec(u32::MAX, i64::MAX - 1),
+            i64::MAX
+        );
+        // u32::MAX * 1e6 alone still fits; check exact when now=0.
+        let max_delta = i64::from(u32::MAX) * SYNCOBJ_NSEC_PER_MS;
+        assert_eq!(syncobj_timeout_ms_to_abs_nsec(u32::MAX, 0), max_delta);
+
+        // --- Errno classify (ETIME vs EINVAL vs other) ------------------------
+        assert_eq!(SYNCOBJ_ERRNO_EINVAL, 22);
+        assert_eq!(SYNCOBJ_ERRNO_ETIME, 62);
+        assert_eq!(SYNCOBJ_ERRNO_ETIMEDOUT, 110);
+        assert_eq!(
+            classify_syncobj_wait_errno(SYNCOBJ_ERRNO_ETIME),
+            SyncobjWaitErrorClass::Etime
+        );
+        assert_eq!(
+            classify_syncobj_wait_errno(-SYNCOBJ_ERRNO_ETIME),
+            SyncobjWaitErrorClass::Etime
+        );
+        assert_eq!(
+            classify_syncobj_wait_errno(SYNCOBJ_ERRNO_ETIMEDOUT),
+            SyncobjWaitErrorClass::Etime
+        );
+        assert_eq!(
+            classify_syncobj_wait_errno(-SYNCOBJ_ERRNO_ETIMEDOUT),
+            SyncobjWaitErrorClass::Etime
+        );
+        assert_eq!(
+            classify_syncobj_wait_errno(SYNCOBJ_ERRNO_EINVAL),
+            SyncobjWaitErrorClass::Einval
+        );
+        assert_eq!(
+            classify_syncobj_wait_errno(-SYNCOBJ_ERRNO_EINVAL),
+            SyncobjWaitErrorClass::Einval
+        );
+        assert_eq!(
+            classify_syncobj_wait_errno(5), // EIO
+            SyncobjWaitErrorClass::Other
+        );
+        assert_eq!(classify_syncobj_wait_errno(0), SyncobjWaitErrorClass::Other);
+        assert_eq!(SyncobjWaitErrorClass::Etime.as_str(), "etime");
+        assert_eq!(SyncobjWaitErrorClass::Einval.as_str(), "einval");
+        assert_eq!(SyncobjWaitErrorClass::Other.as_str(), "other");
+
+        // Message classify reuses WAIT honesty helpers.
+        assert_eq!(
+            classify_syncobj_wait_error_message("WAIT_CMD ETIME after budget"),
+            SyncobjWaitErrorClass::Etime
+        );
+        assert_eq!(
+            classify_syncobj_wait_error_message(
+                "SYNCOBJ_TIMELINE_WAIT: Invalid argument (os error 22)"
+            ),
+            SyncobjWaitErrorClass::Einval
+        );
+        // Mere timeout_ms= field is NOT true timeout (WAIT classify honesty).
+        assert_eq!(
+            classify_syncobj_wait_error_message(
+                "failed (timeout_ms=5000): Invalid argument (os error 22)"
+            ),
+            SyncobjWaitErrorClass::Einval
+        );
+        assert_eq!(
+            classify_syncobj_wait_error_message("Connection timed out"),
+            SyncobjWaitErrorClass::Etime
+        );
+        assert_eq!(
+            classify_syncobj_wait_error_message("permission denied"),
+            SyncobjWaitErrorClass::Other
+        );
+
+        // --- Fail-closed handle 0 → no pack / no claim syncobj path -----------
+        assert!(pack_syncobj_timeline_wait_ioctl(0, 0, 5000, 0).is_none());
+        assert!(
+            pack_syncobj_timeline_wait_ioctl(AMDXDNA_INVALID_FENCE_HANDLE, 99, 100, 1_000)
+                .is_none()
+        );
+        // Non-zero handle packs full XRT-shaped ioctl args.
+        let pack = pack_syncobj_timeline_wait_ioctl(7, 3, 5_000, 1_000_000_000)
+            .expect("valid handle packs");
+        assert_eq!(
+            pack,
+            SyncobjTimelineWaitIoctlPack {
+                handle: 7,
+                timepoint: 3,
+                timeout_nsec: syncobj_timeout_ms_to_abs_nsec(5_000, 1_000_000_000),
+                flags: SYNCOBJ_TIMELINE_WAIT_FLAGS_XRT_DEFAULT,
+                count_handles: 1,
+            }
+        );
+        // Forever budget on valid handle.
+        let forever = pack_syncobj_timeline_wait_ioctl(1, 0, 0, 42).expect("pack");
+        assert_eq!(forever.timeout_nsec, i64::MAX);
+        assert_eq!(forever.flags, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+
+        // --- Research env intent (not product wait path) ----------------------
+        assert!(!lab_wait_via_syncobj_research_env_enabled(None));
+        assert!(!lab_wait_via_syncobj_research_env_enabled(Some("")));
+        assert!(!lab_wait_via_syncobj_research_env_enabled(Some("0")));
+        assert!(!lab_wait_via_syncobj_research_env_enabled(Some("false")));
+        assert!(!lab_wait_via_syncobj_research_env_enabled(Some("maybe")));
+        assert!(lab_wait_via_syncobj_research_env_enabled(Some("1")));
+        assert!(lab_wait_via_syncobj_research_env_enabled(Some("true")));
+        assert!(lab_wait_via_syncobj_research_env_enabled(Some("YES")));
+        assert!(lab_wait_via_syncobj_research_env_enabled(Some(" 1 ")));
+
+        // --- Soft note honesty ------------------------------------------------
+        let note = format_syncobj_timeline_wait_pack_note(5, 0, 5000, 0);
+        assert!(residual_note_has_exact_token(
+            &note,
+            SYNCOBJ_TIMELINE_WAIT_PACK_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&note, "syncobj_handle=5"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "should_wait_via_syncobj=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "wait_path_syncobj_research=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "pack_ok=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            &format!("timeout_nsec={}", syncobj_timeout_ms_to_abs_nsec(5000, 0))
+        ));
+        assert!(residual_note_has_exact_token(&note, "flags=0x2"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&note, "default_wait_cmd=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "research_wire_offline=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "not_live_proven=1"));
+        assert!(residual_note_has_exact_token(&note, "l8_not_minted=1"));
+        // Stale pre-W4c token must not appear after research wire landed.
+        assert!(!residual_note_has_exact_token(&note, "not_live_wired=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "syncobj_pack_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "syncobj_pack_alone_not_unlock=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "env_name=XDNA2_LAB_WAIT_VIA_SYNCOBJ"
+        ));
+        assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&note, "ran_on_npu=1"));
+
+        // Handle 0: soft note pack_ok=0, timeout absent.
+        let note0 = format_syncobj_timeline_wait_pack_note(0, 3, 1000, 0);
+        assert!(residual_note_has_exact_token(
+            &note0,
+            "should_wait_via_syncobj=0"
+        ));
+        assert!(residual_note_has_exact_token(&note0, "pack_ok=0"));
+        assert!(residual_note_has_exact_token(&note0, "timeout_nsec=absent"));
+        assert!(residual_note_has_exact_token(&note0, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note0, "l8_not_minted=1"));
+    }
+
+    /// Compact edge cases: empty status/detail, malformed request, partial shapes.
+    #[test]
+    fn wait_cmd_einval_axes_edge_empty_malformed_partial() {
+        // Isolated request= punctuation (detail_token_end + parse_detail_u64_token).
+        let req_colon = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed (request=0xc0106449): Invalid argument"),
+        );
+        assert_eq!(req_colon.wait_cmd_request, Some(0xc010_6449));
+        assert!(req_colon.invalid_argument);
+
+        let req_paren = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed request=0xc0106449) more"),
+        );
+        assert_eq!(req_paren.wait_cmd_request, Some(0xc010_6449));
+
+        let req_bare = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed request=0xc0106449"),
+        );
+        assert_eq!(req_bare.wait_cmd_request, Some(0xc010_6449));
+
+        let req_missing =
+            parse_wait_cmd_einval_axes(Some("wait_cmd_einval"), Some("WAIT_CMD failed no_request"));
+        assert!(req_missing.wait_cmd_request.is_none());
+
+        let req_garbage = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed request=nothex):"),
+        );
+        assert!(req_garbage.wait_cmd_request.is_none());
+
+        // Empty status + empty detail → absent tokens / not wait_cmd_einval.
+        let empty = parse_wait_cmd_einval_axes(None, None);
+        assert!(!empty.status_is_wait_cmd_einval);
+        assert!(!empty.invalid_argument);
+        assert!(empty.timeout_ms.is_none());
+        assert!(empty.hwctx.is_none());
+        assert!(empty.seq.is_none());
+        assert!(empty.wait_cmd_request.is_none());
+        assert_eq!(empty.detail, "not_wait_cmd_einval");
+        let en = format_wait_cmd_einval_axes_note(&empty);
+        assert!(residual_note_has_exact_token(&en, "timeout_ms=absent"));
+        assert!(residual_note_has_exact_token(&en, "hwctx=absent"));
+        assert!(residual_note_has_exact_token(&en, "request=absent"));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+
+        // Empty strings same as None for axes parse.
+        let empty_s = parse_wait_cmd_einval_axes(Some(""), Some("   "));
+        assert!(!empty_s.status_is_wait_cmd_einval);
+        assert_eq!(empty_s.detail, "not_wait_cmd_einval");
+
+        // skip_cu_wait_einval: wait_cmd_einval + no CU + no classic 1688 / no rela.
+        let skip_plain = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some(
+                "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=100): Invalid argument (os error 22)",
+            ),
+        );
+        assert!(skip_plain.skip_config_cu_shape);
+        assert!(!skip_plain.lab_classic_1688);
+        assert!(!skip_plain.userspace_elf_rela_ok);
+        assert_eq!(skip_plain.detail, "skip_cu_wait_einval");
+
+        // wait_einval_invalid_argument: pdi_bytes present so not skip-CU shape,
+        // but no config_cu= token (config_cu_present=false) + invalid_argument.
+        let inv_no_cu = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("pdi_bytes=100 WAIT_CMD failed (hwctx=1): Invalid argument (os error 22)"),
+        );
+        assert!(!inv_no_cu.config_cu_present);
+        assert!(!inv_no_cu.skip_config_cu_shape);
+        assert!(inv_no_cu.invalid_argument);
+        assert_eq!(inv_no_cu.detail, "wait_einval_invalid_argument");
+
+        // wait_einval_partial: pdi present (not skip-CU) + no config_cu token +
+        // no Invalid argument text.
+        let partial = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("pdi_bytes=100 WAIT_CMD failed (hwctx=2)"),
+        );
+        assert!(partial.status_is_wait_cmd_einval);
+        assert!(!partial.invalid_argument);
+        assert!(!partial.config_cu_present);
+        assert!(!partial.skip_config_cu_shape);
+        assert_eq!(partial.detail, "wait_einval_partial");
+
+        // aiebu without rela → userspace_elf_rela_ok false.
+        let aiebu_no_rela = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some(
+                "aiebu_elf=1 content_size=1688B start_npu_size=1688B WAIT_CMD failed \
+                 (hwctx=1, seq=0, timeout_ms=5000, request=0xc0106449): Invalid argument",
+            ),
+        );
+        assert_eq!(aiebu_no_rela.aiebu_elf, Some(true));
+        assert!(aiebu_no_rela.rela_count.is_none());
+        assert!(!aiebu_no_rela.aiebu_rela_patched);
+        assert!(!aiebu_no_rela.userspace_elf_rela_ok);
+        assert!(aiebu_no_rela.lab_classic_1688);
+        assert!(aiebu_no_rela.skip_config_cu_shape);
+        assert_eq!(aiebu_no_rela.detail, "skip_cu_wait_einval");
+
+        // status wait_cmd_einval without Invalid argument text.
+        let no_inv = parse_wait_cmd_einval_axes(
+            Some("wait_cmd_einval"),
+            Some("WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000)"),
+        );
+        assert!(no_inv.status_is_wait_cmd_einval);
+        assert!(!no_inv.invalid_argument);
+        assert_eq!(no_inv.detail, "skip_cu_wait_einval");
+        let no_inv_note = format_wait_cmd_einval_axes_note(&no_inv);
+        assert!(residual_note_has_exact_token(
+            &no_inv_note,
+            "invalid_argument=0"
+        ));
+        assert!(residual_note_has_exact_token(&no_inv_note, "invent_pass=0"));
+    }
+
+    /// Residual-matched vs public-npu2-small research-only material inventory.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn material_residual_match_inventory_public_vs_load_accepted() {
+        // Policy: CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES=1024 covers public research
+        // peels 300 B and 660 B as PublicNpu2SmallResearchOnly; residual_matched_claim
+        // always false offline (never auto residual match / Pass).
+        assert_eq!(CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES, 1024);
+
+        // Public npu2 small tagged → research only.
+        let v = classify_material_residual_match(Some(300), Some("public-npu2-small"));
+        assert_eq!(
+            v.kind,
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly
+        );
+        assert!(!v.residual_matched_claim);
+        assert!(v.research_only);
+        assert!(!v.unlock_justification_alone);
+        assert!(!v.product_known_good);
+        let vn = format_material_residual_match_note(&v);
+        assert!(residual_note_has_exact_token(
+            &vn,
+            MATERIAL_RESIDUAL_MATCH_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &vn,
+            "kind=public_npu2_small_research_only"
+        ));
+        assert!(residual_note_has_exact_token(
+            &vn,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&vn, "research_only=1"));
+        assert!(residual_note_has_exact_token(
+            &vn,
+            "unlock_justification_alone=0"
+        ));
+        assert!(residual_note_has_exact_token(&vn, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&vn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&vn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&vn, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &vn,
+            "public_aot_neq_residual_identity=1"
+        ));
+        assert!(!residual_note_has_exact_token(&vn, "invent_pass=1"));
+
+        // Length-only 300 → public-npu2-small research only (≤1024 band).
+        let m300 = classify_material_residual_match(Some(300), None);
+        assert_eq!(
+            m300.kind,
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly
+        );
+        assert_eq!(m300.size_class, CtrltextSizeClass::SmallPublicNpu2);
+        assert!(!m300.residual_matched_claim);
+        assert_eq!(m300.detail, "public_npu2_small_length");
+
+        // Length-only 660 → same band (matmul research peel); never residual match.
+        let m660 = classify_material_residual_match(Some(660), None);
+        assert_eq!(
+            m660.kind,
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly
+        );
+        assert_eq!(m660.size_class, CtrltextSizeClass::SmallPublicNpu2);
+        assert!(!m660.residual_matched_claim);
+        // Explicit tag still research-only at 660.
+        let m660t = classify_material_residual_match(Some(660), Some("public-npu2-small"));
+        assert_eq!(
+            m660t.kind,
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly
+        );
+        assert!(!m660t.residual_matched_claim);
+
+        // Empty / zero length → Unknown.
+        let empty = classify_material_residual_match(None, None);
+        assert_eq!(empty.kind, MaterialResidualMatchKind::Unknown);
+        assert_eq!(empty.size_class, CtrltextSizeClass::Empty);
+        assert!(!empty.residual_matched_claim);
+        let zero = classify_material_residual_match(Some(0), None);
+        assert_eq!(zero.kind, MaterialResidualMatchKind::Unknown);
+        assert!(!zero.residual_matched_claim);
+
+        // Tag synonyms (one each).
+        let syn_mlir = classify_material_residual_match(None, Some("mlir_aie"));
+        assert_eq!(
+            syn_mlir.kind,
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly
+        );
+        let syn_iron = classify_material_residual_match(None, Some("iron-aot"));
+        assert_eq!(
+            syn_iron.kind,
+            MaterialResidualMatchKind::PublicNpu2SmallResearchOnly
+        );
+        let syn_lab = classify_material_residual_match(None, Some("lab_classic"));
+        assert_eq!(
+            syn_lab.kind,
+            MaterialResidualMatchKind::LabClassicMladfOracle
+        );
+        let syn_fx = classify_material_residual_match(None, Some("flexml_spent"));
+        assert_eq!(syn_fx.kind, MaterialResidualMatchKind::FlexmlSpentResearch);
+        let syn_rm = classify_material_residual_match(None, Some("residual-matched"));
+        assert_eq!(syn_rm.kind, MaterialResidualMatchKind::LoadAcceptedCriteria);
+        assert!(!syn_rm.residual_matched_claim);
+
+        // Lab classic 1688 oracle (length wins over small-public band).
+        let lab = classify_material_residual_match(Some(1688), None);
+        assert_eq!(lab.kind, MaterialResidualMatchKind::LabClassicMladfOracle);
+        assert!(!lab.residual_matched_claim);
+        assert_eq!(lab.size_class, CtrltextSizeClass::MladfClassic1688);
+
+        // Flexml spent research.
+        let fx = classify_material_residual_match(None, Some("flexml-2x4x4-class"));
+        assert_eq!(fx.kind, MaterialResidualMatchKind::FlexmlSpentResearch);
+        assert!(!fx.residual_matched_claim);
+        assert!(fx.research_only);
+
+        // Load-accepted / residual-matched hint is criteria-only — never claim match offline.
+        let la = classify_material_residual_match(None, Some("load-accepted"));
+        assert_eq!(la.kind, MaterialResidualMatchKind::LoadAcceptedCriteria);
+        assert!(
+            !la.residual_matched_claim,
+            "offline criteria must never set residual_matched_claim"
+        );
+        let lan = la.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &lan,
+            "kind=load_accepted_criteria"
+        ));
+        assert!(residual_note_has_exact_token(
+            &lan,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&lan, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &lan,
+            "unlock_justification_alone=0"
+        ));
+        assert!(residual_note_has_exact_token(&lan, "product_known_good=0"));
+
+        // Above band (1025) without tag → Other / Unknown (not residual match).
+        let big = classify_material_residual_match(Some(1025), None);
+        assert_eq!(big.kind, MaterialResidualMatchKind::Unknown);
+        assert_eq!(big.size_class, CtrltextSizeClass::Other);
+        assert!(!big.residual_matched_claim);
+
+        // Checklist SSoT honesty (full always-present set).
+        let ck = format_material_residual_match_checklist();
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "material_residual_match_checklist=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "load_accepted_requires_live_ert_completed=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "load_accepted_requires_ofm_nonzero_allclose=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "load_accepted_requires_real_ioctl=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "load_accepted_requires_decide_ran_on_npu=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "public_npu2_small_research_only=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "public_aot_neq_residual_identity=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "public_aot_neq_unlock_alone=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "public_aot_neq_product_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "lab_classic_1688_oracle_neq_product_known_good=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "flexml_spent_relive_neq_progress=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "size_class_alone_neq_residual_match=1"
+        ));
+        assert!(residual_note_has_exact_token(&ck, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&ck, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&ck, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&ck, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "product_pass_requires_live_decide=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "offline_inventory_only=1"
+        ));
+        assert!(!residual_note_has_exact_token(&ck, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&ck, "ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "iron_npu2_vector_add_neq_classic_1688=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &ck,
+            "public_300_kind_match_neq_1688_load_accepted=1"
+        ));
+    }
+
+    /// Second identity: iron_npu2_vector_add is not classic 1688 load-accepted.
+    #[test]
+    fn iron_npu2_vector_add_job_is_not_classic_1688_identity() {
+        assert_eq!(
+            classify_job_residual_identity("iron_npu2_vector_add"),
+            JobResidualIdentity::IronNpu2VectorAdd
+        );
+        assert_eq!(
+            classify_job_residual_identity("mladf_classic_1688"),
+            JobResidualIdentity::MladfClassic1688
+        );
+        assert_eq!(
+            classify_job_residual_identity(""),
+            JobResidualIdentity::Unknown
+        );
+        assert_eq!(
+            JobResidualIdentity::IronNpu2VectorAdd.as_str(),
+            "iron_npu2_vector_add"
+        );
+        assert_ne!(
+            JobResidualIdentity::IronNpu2VectorAdd,
+            JobResidualIdentity::MladfClassic1688
+        );
+
+        // Public 300-byte peel is the right *kind* for the IRON job, never 1688 match.
+        let iron300 = classify_material_residual_match_for_job(
+            "iron_npu2_vector_add",
+            Some(300),
+            Some("public-npu2-small"),
+        );
+        assert_eq!(iron300.identity, JobResidualIdentity::IronNpu2VectorAdd);
+        assert_eq!(
+            iron300.material.kind,
+            MaterialResidualMatchKind::IronNpu2VectorAddKindMatch
+        );
+        assert_eq!(
+            iron300.material.size_class,
+            CtrltextSizeClass::SmallPublicNpu2
+        );
+        assert!(iron300.kind_match_for_job);
+        assert!(iron300.classic_1688_claim_refused);
+        assert!(!iron300.material.residual_matched_claim);
+        assert!(iron300.material.research_only);
+        assert!(!iron300.material.product_known_good);
+        let note = format_job_residual_match_note(&iron300);
+        assert!(residual_note_has_exact_token(
+            &note,
+            "job=iron_npu2_vector_add"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "identity=iron_npu2_vector_add"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "kind=iron_npu2_vector_add_kind_match"
+        ));
+        assert!(residual_note_has_exact_token(&note, "kind_match_for_job=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "classic_1688_claim_refused=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "iron_job_neq_classic_1688=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "public_aot_neq_1688_load_accepted=1"
+        ));
+        assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&note, "ran_on_npu=1"));
+
+        // 1688 bytes under the IRON job are not a classic residual match.
+        let iron1688 =
+            classify_material_residual_match_for_job("iron_npu2_vector_add", Some(1688), None);
+        assert_eq!(iron1688.identity, JobResidualIdentity::IronNpu2VectorAdd);
+        assert!(!iron1688.kind_match_for_job);
+        assert!(iron1688.classic_1688_claim_refused);
+        assert!(!iron1688.material.residual_matched_claim);
+        assert_ne!(
+            iron1688.material.kind,
+            MaterialResidualMatchKind::LabClassicMladfOracle,
+            "IRON job must not retag 1688 length as classic residual match"
+        );
+
+        // Classic job still classifies 1688 as the frozen oracle (claim stays 0).
+        let classic =
+            classify_material_residual_match_for_job("mladf_classic_1688", Some(1688), None);
+        assert_eq!(classic.identity, JobResidualIdentity::MladfClassic1688);
+        assert_eq!(
+            classic.material.kind,
+            MaterialResidualMatchKind::LabClassicMladfOracle
+        );
+        assert!(!classic.material.residual_matched_claim);
+        assert!(!classic.classic_1688_claim_refused);
+    }
+
+    #[test]
+    fn iron_npu2_vector_add_kind_match_excludes_660() {
+        let iron660 = classify_material_residual_match_for_job(
+            "iron_npu2_vector_add",
+            Some(660),
+            Some("public-npu2-small"),
+        );
+        assert_eq!(iron660.identity, JobResidualIdentity::IronNpu2VectorAdd);
+        assert!(
+            !iron660.kind_match_for_job,
+            "660 B is not the IRON vector-add kind-match (300 B only)"
+        );
+        assert!(!iron660.material.residual_matched_claim);
+        assert!(iron660.classic_1688_claim_refused);
+        assert_ne!(
+            iron660.material.kind,
+            MaterialResidualMatchKind::IronNpu2VectorAddKindMatch
+        );
+    }
+
+    #[test]
+    fn iron_npu2_vector_add_job_aliases_classify_and_refuse() {
+        for alias in [
+            "iron_npu2_vector_add",
+            "IRON_NPU2_VECTOR_ADD",
+            "iron-npu2-vector-add",
+            "Iron-Npu2-Vector-Add",
+        ] {
+            assert_eq!(
+                classify_job_residual_identity(alias),
+                JobResidualIdentity::IronNpu2VectorAdd,
+                "classify miss: {alias}"
+            );
+            assert!(
+                crate::backends::iron_kernel::refuse_classic_1688_residual_claim_for_job(alias),
+                "refuse miss: {alias}"
+            );
+        }
+        assert_eq!(
+            classify_job_residual_identity(""),
+            JobResidualIdentity::Unknown
+        );
+        assert!(!crate::backends::iron_kernel::refuse_classic_1688_residual_claim_for_job(""));
+        assert!(!crate::backends::iron_kernel::refuse_classic_1688_residual_claim_for_job("   "));
+    }
+
+    #[test]
+    fn format_job_residual_match_note_iron_job_neq_only_for_iron_identity() {
+        let iron =
+            classify_material_residual_match_for_job("iron_npu2_vector_add", Some(300), None);
+        let iron_note = format_job_residual_match_note(&iron);
+        assert!(residual_note_has_exact_token(
+            &iron_note,
+            "iron_job_neq_classic_1688=1"
+        ));
+
+        let classic =
+            classify_material_residual_match_for_job("mladf_classic_1688", Some(1688), None);
+        let classic_note = format_job_residual_match_note(&classic);
+        assert!(residual_note_has_exact_token(
+            &classic_note,
+            "identity=mladf_classic_1688"
+        ));
+        assert!(
+            !classic_note.contains("iron_job_neq_classic_1688=1"),
+            "classic-job note must not contain iron_job_neq_classic_1688=1: {classic_note}"
+        );
+        assert!(residual_note_has_exact_token(
+            &classic_note,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &classic_note,
+            "invent_pass=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &classic_note,
+            "not_ran_on_npu=1"
+        ));
+    }
+
+    #[test]
+    fn iron_npu2_vector_add_1688_length_formats_as_unknown() {
+        let mut iron1688 =
+            classify_material_residual_match_for_job("iron_npu2_vector_add", Some(1688), None);
+        assert_eq!(iron1688.identity, JobResidualIdentity::IronNpu2VectorAdd);
+        assert_eq!(iron1688.material.kind, MaterialResidualMatchKind::Unknown);
+        assert!(!iron1688.kind_match_for_job);
+        iron1688.material.residual_matched_claim = true;
+        let note = format_job_residual_match_note(&iron1688);
+        assert!(residual_note_has_exact_token(&note, "kind=unknown"));
+        assert!(residual_note_has_exact_token(&note, "kind_match_for_job=0"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "classic_1688_claim_refused=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+        assert!(!residual_note_has_exact_token(
+            &note,
+            "residual_matched_claim=1"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass-unblock P1: C4 IRON ingest + C5 PDI geometry vs spent flexml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn c4_iron_artifact_ingest_empty_blocked_and_classify() {
+        // Empty / absent → blocked
+        let empty = classify_iron_artifact_ingest(None, None);
+        assert!(empty.blocked_on_empty);
+        assert!(!empty.bytes_present);
+        assert_eq!(empty.kind, IronArtifactKind::Absent);
+        assert!(!empty.product_known_good);
+        let en = format_c4_iron_ingest_note(&empty);
+        assert!(residual_note_has_exact_token(&en, C4_IRON_INGEST_NOTE));
+        assert!(residual_note_has_exact_token(&en, "blocked_on_empty=1"));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&en, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "iron_ingest_alone_not_pass=1"
+        ));
+        assert!(!residual_note_has_exact_token(&en, "invent_pass=1"));
+
+        let empty_bytes = classify_iron_artifact_ingest(None, Some(&[]));
+        assert!(empty_bytes.blocked_on_empty);
+        assert_eq!(empty_bytes.kind, IronArtifactKind::Absent);
+
+        // Extension allowlist
+        assert!(iron_artifact_extension_ok(Path::new("x.bin")));
+        assert!(iron_artifact_extension_ok(Path::new("x.ctrltext")));
+        assert!(iron_artifact_extension_ok(Path::new("x.elf")));
+        assert!(iron_artifact_extension_ok(Path::new("x.pdi")));
+        assert!(!iron_artifact_extension_ok(Path::new("x.json")));
+        assert!(!iron_artifact_extension_ok(Path::new("x.xclbin")));
+
+        // Path refuse: post-patch oracle
+        let oracle = Path::new("/tmp/instr_post_patch.bin");
+        assert!(!iron_artifact_path_is_allowed(oracle));
+        let refused = classify_iron_artifact_ingest(Some(oracle), Some(b"abc"));
+        assert_eq!(refused.kind, IronArtifactKind::RefusedLocalOracle);
+        assert!(!refused.product_known_good);
+        let rn = format_c4_iron_ingest_note(&refused);
+        assert!(residual_note_has_exact_token(
+            &rn,
+            "kind=refused_local_oracle"
+        ));
+        assert!(residual_note_has_exact_token(&rn, "invent_pass=0"));
+
+        // Path not under roots → path_not_allowed
+        let abroad = Path::new("/etc/passwd.bin");
+        assert!(!iron_artifact_path_is_allowed(abroad));
+        let na = classify_iron_artifact_ingest(Some(abroad), Some(b"payload-bytes"));
+        assert_eq!(na.kind, IronArtifactKind::PathNotAllowed);
+        assert!(!na.path_allowed);
+        assert!(na.bytes_present);
+        let nan = format_c4_iron_ingest_note(&na);
+        assert!(residual_note_has_exact_token(&nan, "kind=path_not_allowed"));
+        assert!(residual_note_has_exact_token(&nan, "product_known_good=0"));
+
+        // Temp-root path + ctrltext bytes → classify
+        let tmp = std::env::temp_dir().join("dragon_npu_c4_iron_probe.bin");
+        let payload = b"iron-research-ctrltext-payload";
+        std::fs::write(&tmp, payload).expect("write temp");
+        assert!(
+            iron_artifact_path_is_allowed(&tmp),
+            "temp_dir root should allow .bin"
+        );
+        let ok = classify_iron_artifact_ingest(Some(&tmp), Some(payload));
+        assert!(!ok.blocked_on_empty);
+        assert!(ok.bytes_present);
+        assert!(ok.path_allowed);
+        assert_eq!(ok.kind, IronArtifactKind::CtrltextBin);
+        assert!(!ok.product_known_good);
+        assert_eq!(ok.len_bytes, Some(payload.len() as u64));
+        assert_ne!(ok.sha256_prefix16, "");
+        let on = format_c4_iron_ingest_note(&ok);
+        assert!(residual_note_has_exact_token(&on, "kind=ctrltext_bin"));
+        assert!(residual_note_has_exact_token(&on, "blocked_on_empty=0"));
+        assert!(residual_note_has_exact_token(&on, "bytes_present=1"));
+        assert!(residual_note_has_exact_token(&on, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&on, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&on, "product_known_good=0"));
+        let _ = std::fs::remove_file(&tmp);
+
+        // ELF magic → aiebu_elf kind (path-free pure classify)
+        let mut elf = vec![0_u8; 16];
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        let ek = classify_iron_artifact_ingest(None, Some(&elf));
+        assert_eq!(ek.kind, IronArtifactKind::AiebuElf);
+        assert!(!ek.blocked_on_empty);
+        let ekn = format_c4_iron_ingest_note(&ek);
+        assert!(residual_note_has_exact_token(&ekn, "kind=aiebu_elf"));
+        assert!(residual_note_has_exact_token(&ekn, "invent_pass=0"));
+
+        // Spent flexml size class → pdi_opaque
+        let pdi_like = vec![
+            0xABu8;
+            usize::try_from(SPENT_FLEXML_UNIFIED_2X4X4_BYTES)
+                .expect("value fits in usize")
+        ];
+        let pk = classify_iron_artifact_ingest(None, Some(&pdi_like));
+        assert_eq!(pk.kind, IronArtifactKind::PdiOpaque);
+        assert_eq!(pk.len_bytes, Some(SPENT_FLEXML_UNIFIED_2X4X4_BYTES));
+        let pkn = pk.format_soft_note();
+        assert!(residual_note_has_exact_token(&pkn, "kind=pdi_opaque"));
+        assert!(residual_note_has_exact_token(&pkn, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&pkn, "invent_pass=1"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn c5_pdi_geometry_vs_spent_flexml_contracts() {
+        // Empty
+        let empty = compare_pdi_geometry_to_spent_flexml(&[]);
+        assert_eq!(empty.compare, PdiGeometryVsSpent::Empty);
+        assert!(empty.spent_rematch_not_unlock_alone);
+        let en = format_c5_pdi_geometry_note(&empty);
+        assert!(residual_note_has_exact_token(&en, C5_PDI_GEOMETRY_NOTE));
+        assert!(residual_note_has_exact_token(&en, "compare=empty"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "spent_rematch_not_unlock_alone=1"
+        ));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "geometry_alone_not_pass=1"
+        ));
+        assert!(!residual_note_has_exact_token(&en, "invent_pass=1"));
+
+        // Diff: small payload
+        let small = b"not-spent-pdi";
+        let diff = compare_pdi_geometry_to_spent_flexml(small);
+        assert_eq!(diff.compare, PdiGeometryVsSpent::Diff);
+        assert_eq!(diff.geometry.size_class, PdiGeometrySizeClass::Other);
+        assert_eq!(diff.geometry.len_bytes, small.len() as u64);
+        assert!(diff.geometry.first_u32_le.is_some());
+        let dn = format_c5_pdi_geometry_note(&diff);
+        assert!(residual_note_has_exact_token(&dn, "compare=diff"));
+        assert!(residual_note_has_exact_token(&dn, "size_class=other"));
+        assert!(residual_note_has_exact_token(
+            &dn,
+            "spent_rematch_not_unlock_alone=1"
+        ));
+        assert!(residual_note_has_exact_token(&dn, "invent_pass=0"));
+
+        // Size class spent, different sha
+        let size_class = vec![
+            0x5Au8;
+            usize::try_from(SPENT_FLEXML_UNIFIED_2X4X4_BYTES)
+                .expect("value fits in usize")
+        ];
+        let sm = compare_pdi_geometry_to_spent_flexml(&size_class);
+        assert_eq!(sm.compare, PdiGeometryVsSpent::SizeMatchShaDiff);
+        assert_eq!(
+            sm.geometry.size_class,
+            PdiGeometrySizeClass::SpentFlexml2x4x4
+        );
+        assert_ne!(
+            sm.geometry.sha256_prefix16.to_ascii_lowercase(),
+            SPENT_FLEXML_UNIFIED_2X4X4_SHA16
+        );
+        let sn = format_c5_pdi_geometry_note(&sm);
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "compare=size_match_sha_diff"
+        ));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "size_class=spent_flexml_2x4x4"
+        ));
+        assert!(residual_note_has_exact_token(
+            &sn,
+            "spent_rematch_not_unlock_alone=1"
+        ));
+        assert!(residual_note_has_exact_token(&sn, "not_ran_on_npu=1"));
+
+        // Research CVML dump size class
+        let cvml = vec![
+            0x11u8;
+            usize::try_from(RESEARCH_PDI_DEFAULT_DUMP_BYTES)
+                .expect("value fits in usize")
+        ];
+        let cg = fingerprint_pdi_geometry_bytes(&cvml);
+        assert_eq!(cg.size_class, PdiGeometrySizeClass::ResearchCvmlDump);
+        let cd = compare_pdi_geometry_to_spent_flexml(&cvml);
+        assert_eq!(cd.compare, PdiGeometryVsSpent::Diff);
+
+        // MatchSpent via fingerprint path (synthetic: craft bytes that hash to spent
+        // sha is impractical offline; lock MatchSpent via compare_pdi_fingerprint).
+        let spent_fp = PdiBlobFingerprint {
+            len_bytes: SPENT_FLEXML_UNIFIED_2X4X4_BYTES,
+            sha256_prefix16: SPENT_FLEXML_UNIFIED_2X4X4_SHA16.into(),
+            sha256_hex: String::new(),
+        };
+        let match_spent = compare_pdi_fingerprint_to_spent_flexml(&spent_fp);
+        assert_eq!(match_spent.compare, PdiGeometryVsSpent::MatchSpent);
+        assert!(match_spent.spent_rematch_not_unlock_alone);
+        let mn = format_c5_pdi_geometry_note(&match_spent);
+        assert!(residual_note_has_exact_token(&mn, "compare=match_spent"));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "spent_rematch_not_unlock_alone=1"
+        ));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&mn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &mn,
+            "geometry_alone_not_pass=1"
+        ));
+        // Match spent is research reconfirm only — never unlock alone / Pass.
+        assert!(!residual_note_has_exact_token(&mn, "invent_pass=1"));
+        assert!(!mn.contains("ran_on_npu=true"));
+
+        // Size-only incomplete fp → unknown
+        let size_only = PdiBlobFingerprint {
+            len_bytes: 1000,
+            sha256_prefix16: String::new(),
+            sha256_hex: String::new(),
+        };
+        let unk = compare_pdi_fingerprint_to_spent_flexml(&size_only);
+        assert_eq!(unk.compare, PdiGeometryVsSpent::Unknown);
+        let un = format_c5_pdi_geometry_note(&unk);
+        assert!(residual_note_has_exact_token(&un, "compare=unknown"));
+        assert!(residual_note_has_exact_token(&un, "invent_pass=0"));
+
+        // Geometry header peeks
+        let hdr = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xff];
+        let g = fingerprint_pdi_geometry_bytes(&hdr);
+        assert_eq!(g.first_u32_le, Some(0x0403_0201));
+        assert_eq!(g.second_u32_le, Some(0x0807_0605));
+        assert_eq!(g.leading_zero_bytes, 0);
+        let zeros = [0u8; 12];
+        let gz = fingerprint_pdi_geometry_bytes(&zeros);
+        assert_eq!(gz.leading_zero_bytes, 12);
+    }
+
+    #[test]
+    fn c6_debug_bo_uapi_prep_aie2_contracts() {
+        // Assign pack green path
+        let assign = debug_bo_uapi_prep_aie2(11, HwctxDbgBufOp::Assign, 77);
+        assert!(assign.layout_ok);
+        assert!(!assign.live_wired);
+        assert_eq!(assign.op, "assign");
+        assert_eq!(assign.param_type, 1);
+        assert_eq!(assign.hwctx, 11);
+        assert_eq!(assign.bo_handle, 77);
+        assert!(assign.param_val_is_bo_handle_value);
+        assert_eq!(assign.param_val_size, 0);
+        let an = format_c6_debug_bo_prep_note(&assign);
+        assert!(residual_note_has_exact_token(&an, C6_DEBUG_BO_PREP_NOTE));
+        assert!(residual_note_has_exact_token(&an, "op=assign"));
+        assert!(residual_note_has_exact_token(&an, "param_type=1"));
+        assert!(residual_note_has_exact_token(&an, "layout_ok=1"));
+        assert!(residual_note_has_exact_token(&an, "live_wired=0"));
+        assert!(residual_note_has_exact_token(&an, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&an, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&an, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &an,
+            "debug_bo_prep_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&an, "research_only=1"));
+        assert!(!residual_note_has_exact_token(&an, "invent_pass=1"));
+        assert!(!an.contains("ran_on_npu=true"));
+        // Soft alias matches formatter
+        assert_eq!(assign.format_soft_note(), an);
+
+        // Remove path
+        let remove = debug_bo_uapi_prep_aie2(2, HwctxDbgBufOp::Remove, 9);
+        assert!(remove.layout_ok);
+        assert_eq!(remove.op, "remove");
+        assert_eq!(remove.param_type, 2);
+        let rn = format_c6_debug_bo_prep_note(&remove);
+        assert!(residual_note_has_exact_token(&rn, "op=remove"));
+        assert!(residual_note_has_exact_token(&rn, "param_type=2"));
+        assert!(residual_note_has_exact_token(&rn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&rn, "research_only=1"));
+
+        // Zero BO → layout_ok=false (pack refuse)
+        let z = debug_bo_uapi_prep_aie2(1, HwctxDbgBufOp::Assign, 0);
+        assert!(!z.layout_ok);
+        assert!(!z.live_wired);
+        let zn = format_c6_debug_bo_prep_note(&z);
+        assert!(residual_note_has_exact_token(&zn, "layout_ok=0"));
+        assert!(residual_note_has_exact_token(&zn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&zn, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(
+            &zn,
+            "debug_bo_prep_alone_not_pass=1"
+        ));
+        assert!(zn.contains("pack_failed") || zn.contains("detail="));
+    }
+
+    // -----------------------------------------------------------------------
+    // Route B — structural distance / size-class / capture-dir / rela structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn structural_distance_size_class_labels() {
+        assert_eq!(
+            classify_ctrltext_size_class(0, None),
+            CtrltextSizeClass::Empty
+        );
+        assert_eq!(
+            classify_ctrltext_size_class(1688, None),
+            CtrltextSizeClass::MladfClassic1688
+        );
+        assert_eq!(
+            classify_ctrltext_size_class(300, None),
+            CtrltextSizeClass::SmallPublicNpu2
+        );
+        // Public research matmul peel (660) is in the small-public band (≤1024).
+        assert_eq!(
+            classify_ctrltext_size_class(660, None),
+            CtrltextSizeClass::SmallPublicNpu2
+        );
+        assert_eq!(
+            classify_ctrltext_size_class(512, None),
+            CtrltextSizeClass::SmallPublicNpu2
+        );
+        assert_eq!(
+            classify_ctrltext_size_class(CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES, None),
+            CtrltextSizeClass::SmallPublicNpu2
+        );
+        assert_eq!(
+            classify_ctrltext_size_class(CTRLTEXT_SMALL_PUBLIC_NPU2_MAX_BYTES + 1, None),
+            CtrltextSizeClass::Other
+        );
+        // Staged profile forces mladf even if length were wrong (synthetic).
+        let staged = InstrPayloadProfile {
+            staged_mladf_classic_profile: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_ctrltext_size_class(40, Some(&staged)),
+            CtrltextSizeClass::MladfClassic1688
+        );
+        assert_eq!(
+            CtrltextSizeClass::SmallPublicNpu2.as_str(),
+            "small_public_npu2"
+        );
+        assert_eq!(
+            CtrltextSizeClass::MladfClassic1688.as_str(),
+            "mladf_classic_1688"
+        );
+    }
+
+    #[test]
+    fn structural_distance_300_vs_lab_export_shape() {
+        // Lab export shaped like staged classic 1688 (no asset required).
+        let lab = CtrltextFingerprintExport {
+            ctrltext_len: Some(1688),
+            classic_walk_ok: true,
+            staged_mladf_classic_profile: true,
+            txn_num_ops: Some(40),
+            txn_dev_gen: Some(4),
+            txn_num_cols: Some(8),
+            txn_num_rows: Some(6),
+            op_profile: Some(TxnOpOpcodeProfile {
+                write: 10,
+                noop: 30,
+                total: 40,
+                ..TxnOpOpcodeProfile::default()
+            }),
+            unpatched_sha256_hex: sha256_hex_lower(&vec![0x11_u8; 1688]),
+            known_good_present: false,
+            known_good_status: KNOWN_GOOD_CTRLTEXT_ABSENT_TOKEN,
+            detail: "unit_lab_1688".into(),
+            ..CtrltextFingerprintExport::default()
+        };
+        assert_eq!(
+            classify_ctrltext_size_class_from_export(&lab),
+            CtrltextSizeClass::MladfClassic1688
+        );
+
+        let external_300 = vec![0xAA_u8; 300];
+        let d = research_external_vs_lab_structural_distance(&lab, &external_300);
+        assert_eq!(d.external_size_class, CtrltextSizeClass::SmallPublicNpu2);
+        assert_eq!(d.lab_size_class, CtrltextSizeClass::MladfClassic1688);
+        assert!(!d.size_class_match);
+        assert!(!d.classic_both);
+        assert!(!d.sha_match);
+        assert!(!d.len_match);
+        assert_eq!(d.external_len, 300);
+        assert_eq!(d.lab_len, Some(1688));
+        assert_eq!(d.detail, "size_class_mismatch_distance");
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            EXTERNAL_VS_LAB_STRUCTURAL_DISTANCE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "external_size_class=small_public_npu2"
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "lab_size_class=mladf_classic_1688"
+        ));
+        assert!(residual_note_has_exact_token(&n, "size_class_match=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "distance_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+    }
+
+    #[test]
+    fn structural_distance_self_match_zero_still_invent_pass_0() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        assert!(exp.classic_walk_ok);
+        assert!(exp.op_profile.is_some());
+
+        let d = research_external_vs_lab_structural_distance(&exp, &ctrltext);
+        assert!(d.size_class_match);
+        assert!(d.classic_both);
+        assert!(d.op_hist_both);
+        assert_eq!(d.op_hist_l1, 0);
+        assert!(d.sha_match);
+        assert!(d.len_match);
+        assert_eq!(d.header_ops_diff, Some(0));
+        assert_eq!(d.header_cols_diff, Some(0));
+        assert_eq!(d.header_rows_diff, Some(0));
+        assert_eq!(d.detail, "structural_distance_zero_self_match");
+        let n = d.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "op_hist_l1=0"));
+        assert!(residual_note_has_exact_token(&n, "sha_match=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "distance_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+
+        // Different op count → nonzero L1 when both classic.
+        let other = build_minimal_noop_txn(1, 4, 6, 1, 4).expect("1 noop");
+        let d2 = research_external_vs_lab_structural_distance(&exp, &other);
+        assert!(d2.op_hist_both);
+        assert!(d2.op_hist_l1 > 0);
+        assert!(!d2.sha_match);
+        let n2 = d2.format_soft_note();
+        assert!(residual_note_has_exact_token(&n2, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(
+            &n2,
+            "distance_alone_not_pass=1"
+        ));
+    }
+
+    #[test]
+    fn external_ctrltext_compare_surfaces_opcode_histogram_when_classic() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let synth = build_minimal_test_elf32(&ctrltext, &[(0_u32, (1_u32 << 8) | 5, 0_i32)]);
+        let exp = export_ctrltext_fingerprint_research(&synth);
+        assert!(exp.op_profile.is_some());
+        assert!(exp.op_profile.as_ref().is_some_and(|p| p.noop >= 1));
+
+        let cmp = compare_external_ctrltext_to_lab_export(&exp, Some(&ctrltext));
+        assert!(cmp.structural_match);
+        assert!(cmp.sha_match);
+        assert!(cmp.external_op_profile.is_some());
+        assert!(cmp.lab_op_profile.is_some());
+        assert_eq!(cmp.external_txn_num_ops, exp.txn_num_ops);
+        assert_eq!(cmp.lab_txn_num_ops, exp.txn_num_ops);
+        assert_eq!(cmp.external_txn_num_cols, exp.txn_num_cols);
+        assert_eq!(cmp.lab_txn_num_cols, exp.txn_num_cols);
+        let n = cmp.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            EXTERNAL_CTRLTEXT_COMPARE_NOTE
+        ));
+        // Per-side header tokens (Route B1).
+        if let Some(ops) = exp.txn_num_ops {
+            assert!(residual_note_has_exact_token(
+                &n,
+                &format!("lab_txn_num_ops={ops}")
+            ));
+            assert!(residual_note_has_exact_token(
+                &n,
+                &format!("external_txn_num_ops={ops}")
+            ));
+        }
+        if let Some(c) = exp.txn_num_cols {
+            assert!(residual_note_has_exact_token(
+                &n,
+                &format!("lab_txn_num_cols={c}")
+            ));
+            assert!(residual_note_has_exact_token(
+                &n,
+                &format!("external_txn_num_cols={c}")
+            ));
+        }
+        // Opcode histogram prefixes.
+        assert!(residual_note_has_exact_token(&n, "lab_op_noop=4") || n.contains("lab_op_noop="));
+        assert!(
+            residual_note_has_exact_token(&n, "external_op_noop=4")
+                || n.contains("external_op_noop=")
+        );
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        // Match still not Pass.
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+
+        // Mutated op mix: 1-noop classic vs 4-noop lab → headers may differ.
+        let one = build_minimal_noop_txn(1, 4, 6, 1, 4).expect("1 noop");
+        let c_mix = compare_external_ctrltext_to_lab_export(&exp, Some(&one));
+        assert!(c_mix.external_op_profile.is_some());
+        assert!(!c_mix.sha_match);
+        let mn = c_mix.format_soft_note();
+        assert!(residual_note_has_exact_token(&mn, "external_txn_num_ops=1"));
+        assert!(mn.contains("external_op_noop="));
+        assert!(residual_note_has_exact_token(&mn, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&mn, "product_known_good=0"));
+    }
+
+    #[test]
+    fn capture_material_fingerprint_empty_blocked() {
+        // Unique empty dir under process temp (confined root for fingerprint).
+        let dir = std::env::temp_dir().join(format!(
+            "dragon_npu_capture_fp_empty_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir empty capture dir");
+        let fp = fingerprint_capture_material_dir_research(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fp.blocked_on_external_bytes);
+        assert_eq!(fp.bin_count, 0);
+        assert!(!fp.product_known_good);
+        assert_eq!(fp.first_ctrltext_size_class, CtrltextSizeClass::Empty);
+        assert_eq!(fp.detail, "empty_dir_blocked_on_external_bytes");
+        let n = fp.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            CAPTURE_MATERIAL_FINGERPRINT_NOTE
+        ));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "blocked_on_external_bytes=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "capture_material_alone_not_pass=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+    }
+
+    #[test]
+    fn capture_material_fingerprint_ctrltext_only_no_pass() {
+        let dir =
+            std::env::temp_dir().join(format!("dragon_npu_capture_fp_ctrl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir capture dir");
+        let ctrl = build_strix_research_noop_txn().expect("noop");
+        let path = dir.join("working_stack_ctrltext.bin");
+        std::fs::write(&path, &ctrl).expect("write ctrltext");
+        let fp = fingerprint_capture_material_dir_research(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!fp.blocked_on_external_bytes);
+        assert_eq!(fp.bin_count, 1);
+        assert_eq!(fp.first_ctrltext_len, Some(ctrl.len()));
+        assert!(fp.first_classic_walk_ok);
+        assert_eq!(
+            fp.first_ctrltext_size_class,
+            CtrltextSizeClass::SmallPublicNpu2
+        );
+        assert!(!fp.product_known_good);
+        assert_eq!(fp.detail, "ctrltext_present_classified_not_pass");
+        let n = fp.format_soft_note();
+        assert!(residual_note_has_exact_token(&n, "bin_count=1"));
+        assert!(residual_note_has_exact_token(&n, "first_classic_walk_ok=1"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "first_ctrltext_size_class=small_public_npu2"
+        ));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "capture_material_alone_not_pass=1"
+        ));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(!residual_note_has_exact_token(&n, "ran_on_npu=1"));
+    }
+
+    #[test]
+    fn rela_structure_compare_synthetic_match_neq_pass() {
+        let ctrltext = build_strix_research_noop_txn().expect("noop");
+        let relas = [
+            (0_u32, (1_u32 << 8) | 5, 0_i32),
+            (8_u32, (2_u32 << 8) | 5, 0_i32),
+        ];
+        let lab = build_minimal_test_elf32(&ctrltext, &relas);
+        let ext = build_minimal_test_elf32(&ctrltext, &relas);
+        let r = compare_rela_structure_lab_vs_external_elf(&lab, Some(&ext));
+        assert!(r.external_present);
+        assert_eq!(r.lab_rela_count, Some(2));
+        assert_eq!(r.external_rela_count, Some(2));
+        assert!(r.count_match);
+        assert!(r.offsets_match);
+        assert!(r.sym_multiset_match);
+        assert_eq!(r.detail, "rela_structure_match_neq_pass");
+        let n = r.format_soft_note();
+        assert!(residual_note_has_exact_token(
+            &n,
+            RELA_STRUCTURE_COMPARE_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&n, "count_match=1"));
+        assert!(residual_note_has_exact_token(&n, "offsets_match=1"));
+        assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&n, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&n, "product_known_good=0"));
+        assert!(residual_note_has_exact_token(
+            &n,
+            "rela_structure_alone_not_pass=1"
+        ));
+        assert!(!residual_note_has_exact_token(&n, "invent_pass=1"));
+
+        // Count mismatch.
+        let ext_one = build_minimal_test_elf32(&ctrltext, &relas[..1]);
+        let r2 = compare_rela_structure_lab_vs_external_elf(&lab, Some(&ext_one));
+        assert!(!r2.count_match);
+        assert_eq!(r2.detail, "rela_count_mismatch");
+        assert!(residual_note_has_exact_token(
+            &r2.format_soft_note(),
+            "invent_pass=0"
+        ));
+
+        // Absent external.
+        let r3 = compare_rela_structure_lab_vs_external_elf(&lab, None);
+        assert!(!r3.external_present);
+        assert_eq!(r3.detail, "external_absent_rela_compare");
+        assert!(residual_note_has_exact_token(
+            &r3.format_soft_note(),
+            "external_present=0"
+        ));
+        assert!(residual_note_has_exact_token(
+            &r3.format_soft_note(),
+            "invent_pass=0"
+        ));
+    }
+
+    /// W4a T3: last_apply rich tokens — fixture ert + L5b-shaped debug_bo/syncobj.
+    #[test]
+    fn last_apply_rich_tokens_fixture_and_l5b_shape() {
+        // Locked fixture shape is ert_state=5 and no debug_bo. A private
+        // hwctx_ok debug_bo snapshot is not that fixture.
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/last_apply.json");
+        if fixture.is_file() {
+            let raw = std::fs::read_to_string(&fixture).expect("read fixture");
+            let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+            let detail = v["detail"].as_str().unwrap_or("");
+            let status = v["status"].as_str();
+            let rich = parse_last_apply_rich_tokens(status, Some(detail));
+            if rich.ert_state != Some(5) || rich.debug_bo_present {
+                eprintln!(
+                    "OFFLINE_ASSET_SKIP: last_apply.json present but not ert_state=5 fixture without debug_bo"
+                );
+            } else {
+                assert_eq!(rich.ert_state, Some(5));
+                assert!(rich.ert_error);
+                assert!(!rich.debug_bo_present);
+                assert_eq!(rich.syncobj, None);
+                assert_eq!(rich.wait_path, None);
+                let note = rich.format_soft_note();
+                assert!(residual_note_has_exact_token(
+                    &note,
+                    LAST_APPLY_RICH_TOKENS_NOTE
+                ));
+                assert!(residual_note_has_exact_token(&note, "ert_state=5"));
+                assert!(residual_note_has_exact_token(&note, "debug_bo_present=0"));
+                assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+                assert!(residual_note_has_exact_token(&note, "not_c_ready=1"));
+                assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+                assert!(residual_note_has_exact_token(
+                    &note,
+                    "rich_tokens_alone_not_pass=1"
+                ));
+                assert!(!residual_note_has_exact_token(&note, "invent_pass=1"));
+            }
+        }
+
+        // L5b-shaped Dev debug-BO + wait_cmd_einval (from live shot detail).
+        let l5b = "debug_bo_config op=assign param_type=1 hwctx=1 bo_handle=2 \
+                   gate_open=1 attempt_ok=1 path=lab invent_pass=0 not_c_ready=1 \
+                   not_ran_on_npu=1 debug_bo_alone_not_pass=1 research_only=1 \
+                   debug_bo_size=4096 debug_bo_ty=dev lab_debug_bo_attach=1; \
+                   hwctx ok (handle=1 syncobj=1) Cmd BO host-filled \
+                   (inst_blob content=1688B) but submit_and_wait failed \
+                   (wait_cmd_einval): WAIT_CMD failed (hwctx=1, seq=1, \
+                   timeout_ms=5000, request=0xc0106449): Invalid argument";
+        let rich = parse_last_apply_rich_tokens(Some("wait_cmd_einval"), Some(l5b));
+        assert!(rich.debug_bo_present);
+        assert_eq!(rich.debug_bo_attempt_ok, Some(true));
+        assert_eq!(rich.debug_bo_size, Some(4096));
+        assert_eq!(rich.debug_bo_ty.as_deref(), Some("dev"));
+        assert_eq!(rich.debug_bo_op.as_deref(), Some("assign"));
+        assert_eq!(rich.debug_bo_handle, Some(2));
+        assert_eq!(rich.debug_bo_gate_open, Some(true));
+        assert_eq!(rich.debug_bo_path.as_deref(), Some("lab"));
+        assert_eq!(rich.syncobj, Some(1));
+        assert_eq!(rich.ert_state, None);
+        assert!(!rich.ert_error);
+        assert_eq!(rich.status.as_deref(), Some("wait_cmd_einval"));
+        assert_eq!(rich.detail, "rich_debug_bo");
+        let note = format_last_apply_rich_tokens_note(&rich);
+        assert!(residual_note_has_exact_token(&note, "debug_bo_present=1"));
+        assert!(residual_note_has_exact_token(
+            &note,
+            "debug_bo_attempt_ok=1"
+        ));
+        assert!(residual_note_has_exact_token(&note, "debug_bo_size=4096"));
+        assert!(residual_note_has_exact_token(&note, "debug_bo_ty=dev"));
+        assert!(residual_note_has_exact_token(&note, "debug_bo_op=assign"));
+        assert!(residual_note_has_exact_token(&note, "debug_bo_handle=2"));
+        assert!(residual_note_has_exact_token(&note, "syncobj=1"));
+        assert!(residual_note_has_exact_token(&note, "wait_path=absent"));
+        assert!(residual_note_has_exact_token(&note, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&note, "not_ran_on_npu=1"));
+
+        // Explicit wait_path= + syncobj_handle=
+        let wp = parse_last_apply_rich_tokens(
+            None,
+            Some("wait_path=syncobj_timeline syncobj_handle=7 ert_state=4(Completed)"),
+        );
+        assert_eq!(wp.wait_path.as_deref(), Some("syncobj_timeline"));
+        assert_eq!(wp.syncobj, Some(7));
+        assert_eq!(wp.ert_state, Some(4));
+        assert!(!wp.ert_error);
+        assert!(residual_note_has_exact_token(
+            &wp.format_soft_note(),
+            "wait_path=syncobj_timeline"
+        ));
+
+        // Empty
+        let empty = parse_last_apply_rich_tokens(None, None);
+        assert_eq!(empty.detail, "no_detail");
+        assert!(residual_note_has_exact_token(
+            &empty.format_soft_note(),
+            "invent_pass=0"
+        ));
+    }
+
+    /// W4a T6: material EXEC readiness — lab 1688, cascade other, empty refuse.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn material_exec_readiness_scorecard_lab_cascade_empty() {
+        // Empty refuse.
+        let empty = score_material_exec_readiness(&[]);
+        assert!(empty.empty_refused);
+        assert!(!empty.classic_walk_ok);
+        assert!(!empty.residual_matched_claim);
+        assert_eq!(empty.size_class, CtrltextSizeClass::Empty);
+        assert_eq!(
+            empty.distance_to_1688,
+            u32::try_from(MATERIAL_EXEC_LAB_CLASSIC_BYTES).expect("value fits in u32")
+        );
+        assert_eq!(empty.detail, "empty_refused");
+        let en = format_material_exec_readiness_note(&empty);
+        assert!(residual_note_has_exact_token(
+            &en,
+            MATERIAL_EXEC_READINESS_NOTE
+        ));
+        assert!(residual_note_has_exact_token(&en, "empty_refused=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "residual_matched_claim=0"
+        ));
+        assert!(residual_note_has_exact_token(&en, "invent_pass=0"));
+        assert!(residual_note_has_exact_token(&en, "not_c_ready=1"));
+        assert!(residual_note_has_exact_token(&en, "not_ran_on_npu=1"));
+        assert!(residual_note_has_exact_token(
+            &en,
+            "scorecard_alone_not_pass=1"
+        ));
+        assert!(!residual_note_has_exact_token(
+            &en,
+            "residual_matched_claim=1"
+        ));
+        assert!(!residual_note_has_exact_token(&en, "invent_pass=1"));
+
+        // Lab classic 1688-shaped (fixture lab_instr.bin).
+        let lab = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/lab_instr.bin");
+        if lab.is_file() {
+            let bytes = std::fs::read(&lab).expect("lab_instr");
+            assert_eq!(bytes.len(), MATERIAL_EXEC_LAB_CLASSIC_BYTES);
+            let sc = score_material_exec_readiness(&bytes);
+            assert!(!sc.empty_refused);
+            assert!(sc.classic_walk_ok, "lab classic must walk");
+            assert_eq!(sc.blob_len, 1688);
+            assert_eq!(sc.distance_to_1688, 0);
+            assert_eq!(sc.size_class, CtrltextSizeClass::MladfClassic1688);
+            assert_eq!(sc.op_count, Some(40));
+            assert!(!sc.residual_matched_claim); // locked
+            assert_eq!(sc.detail, "lab_classic_1688_shaped");
+            let n = sc.format_soft_note();
+            assert!(residual_note_has_exact_token(&n, "classic_walk_ok=1"));
+            assert!(residual_note_has_exact_token(&n, "distance_to_1688=0"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "size_class=mladf_classic_1688"
+            ));
+            assert!(residual_note_has_exact_token(&n, "op_count=40"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "residual_matched_claim=0"
+            ));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            // Path load
+            assert!(material_exec_readiness_path_is_allowed(&lab));
+            let from_path = score_material_exec_readiness_from_path(&lab);
+            assert_eq!(from_path.blob_len, sc.blob_len);
+            assert!(!from_path.residual_matched_claim);
+            assert!(!from_path.path_refused);
+        }
+
+        // Cascade-sized other (4512) under external_known_good.
+        let cascade = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "testdata/xdna2_cmd/external_known_good/mlir_aie_cascade_matmul_npu2.ctrltext.bin",
+        );
+        if cascade.is_file() {
+            let bytes = std::fs::read(&cascade).expect("cascade");
+            assert_eq!(bytes.len(), 4512);
+            let sc = score_material_exec_readiness(&bytes);
+            assert!(!sc.empty_refused);
+            assert_eq!(sc.blob_len, 4512);
+            assert_eq!(sc.distance_to_1688, 4512_u32.abs_diff(1688));
+            assert_eq!(sc.size_class, CtrltextSizeClass::Other);
+            assert!(!sc.residual_matched_claim);
+            // Classic walk may or may not be OK — either way claim stays 0.
+            let n = sc.format_soft_note();
+            assert!(residual_note_has_exact_token(&n, "size_class=other"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "residual_matched_claim=0"
+            ));
+            assert!(residual_note_has_exact_token(&n, "invent_pass=0"));
+            assert!(residual_note_has_exact_token(
+                &n,
+                "scorecard_alone_not_pass=1"
+            ));
+            if sc.classic_walk_ok {
+                assert!(
+                    sc.detail == "other_size_classic_walk_ok"
+                        || sc.detail == "classic_walk_ok_not_lab_oracle"
+                );
+                assert!(sc.op_count.is_some());
+            }
+            let from_path = score_material_exec_readiness_from_path(&cascade);
+            assert!(!from_path.path_refused);
+            assert_eq!(from_path.blob_len, 4512);
+            assert!(!from_path.residual_matched_claim);
+        }
+
+        // Path refuse outside confinement.
+        let bad = score_material_exec_readiness_from_path(std::path::Path::new("/etc/passwd"));
+        assert!(bad.path_refused);
+        assert!(!bad.residual_matched_claim);
+        assert!(residual_note_has_exact_token(
+            &bad.format_soft_note(),
+            "path_refused=1"
+        ));
+        assert!(residual_note_has_exact_token(
+            &bad.format_soft_note(),
+            "residual_matched_claim=0"
+        ));
+
+        // Bag soft lines always honesty (may be multi-line when bins present).
+        let bag = format_material_exec_readiness_bag_soft_lines();
+        assert!(bag.contains(MATERIAL_EXEC_READINESS_NOTE));
+        assert!(bag.contains("invent_pass=0"));
+        assert!(bag.contains("residual_matched_claim=0"));
+        assert!(!bag.contains("residual_matched_claim=1"));
+        assert!(!bag.contains("invent_pass=1"));
+    }
+
+    /// W4b: bag soft + multi-txn candidate always residual_matched_claim=0.
+    #[test]
+    fn material_exec_readiness_w4b_bag_and_candidate_print() {
+        let bag = format_material_exec_readiness_bag_soft_lines();
+        assert!(bag.contains("residual_matched_claim=0"));
+        assert!(bag.contains("invent_pass=0"));
+        assert!(!bag.contains("residual_matched_claim=1"));
+        // Public AOT research present under external_known_good (not residual match).
+        assert!(
+            bag.contains("working_stack_ctrltext.bin")
+                || bag.contains("bag_empty")
+                || bag.contains("blocked_on_external_bytes")
+        );
+
+        // Wave7+: classic 1688 may be primary post_patch; multi-txn diagnostic is
+        // instr_vendor_get_transaction_bin.bin (32208). Prefer multi when present.
+        let multi = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/xdna2_cmd/gt_capture/instr_vendor_get_transaction_bin.bin");
+        let multi = if multi.is_file() {
+            multi
+        } else {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/xdna2_cmd/gt_capture/instr_vendor_post_patch.bin")
+        };
+        if multi.is_file() {
+            // Path load refuses gt_capture (not bag root). Score raw bytes only.
+            let path_sc = score_material_exec_readiness_from_path(&multi);
+            assert!(!path_sc.residual_matched_claim);
+            let bytes = std::fs::read(&multi).expect("read material candidate");
+            let sc = score_material_exec_readiness(&bytes);
+            assert!(!sc.residual_matched_claim);
+            if sc.blob_len == 32208 {
+                assert!(path_sc.path_refused || path_sc.blob_len != 1688);
+                assert_ne!(sc.distance_to_1688, 0);
+                assert_ne!(sc.size_class, CtrltextSizeClass::MladfClassic1688);
+                assert_eq!(sc.size_class, CtrltextSizeClass::Other);
+            } else if sc.blob_len == 1688 {
+                // Classic primary (wave7 re-land) — still residual_matched_claim=0
+                // offline until load-accepted product path.
+                assert_eq!(sc.size_class, CtrltextSizeClass::MladfClassic1688);
+            }
+        }
     }
 }

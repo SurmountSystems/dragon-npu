@@ -26,11 +26,13 @@
 //! See docs/XDNA2_REAL_EXECUTION.md and docs/XDNA2_HARDWARE_TESTING.md for more.
 
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::Backend;
+use earth_dragon_npu::backends::Backend;
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
+use earth_dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::amd_xdna2::direct::{BufferType, Command, CommandType, HardwareContext};
+use earth_dragon_npu::backends::amd_xdna2::direct::{
+    BufferType, Command, CommandType, HardwareContext,
+};
 
 fn main() {
     #[cfg(not(feature = "amd-xdna2"))]
@@ -109,6 +111,13 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
         println!("{label}.device.npu_name={npu_display}");
         println!("{label}.device.modalias={}", dev.modalias);
         println!("{label}.device.variant={:?}", dev.xdna2_variant);
+        // Ids came from the sysfs probe. Printing the note does not open a device.
+        let cmdlist = if dev.cmdlist_class.is_empty() {
+            "unparsed"
+        } else {
+            dev.cmdlist_class.as_str()
+        };
+        println!("{label}.device.cmdlist_class={cmdlist}");
     }
 
     if let Ok(status) = backend.status() {
@@ -210,7 +219,7 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
 
     // Determine early whether the user wants us to retain a successful hwctx
     // for an immediate real-hwctx submit_command attempt. Needed before the grid.
-    let try_real_submit = dragon_npu::backends::amd_xdna2::direct::exec_cmd_is_enabled();
+    let try_real_submit = earth_dragon_npu::backends::amd_xdna2::direct::exec_cmd_is_enabled();
 
     // Demonstrate real hwctx create attempts with a small bring-up grid.
     // This is now one of the most useful things to run on real XDNA2 hardware.
@@ -295,12 +304,12 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
     println!("\n=== Submission path (EXEC_CMD permanently gated) ===");
     println!(
         "{label}.exec_cmd_enabled={} reason={}",
-        dragon_npu::backends::amd_xdna2::direct::exec_cmd_is_enabled(),
-        dragon_npu::backends::amd_xdna2::direct::exec_cmd_block_reason()
+        earth_dragon_npu::backends::amd_xdna2::direct::exec_cmd_is_enabled(),
+        earth_dragon_npu::backends::amd_xdna2::direct::exec_cmd_block_reason()
     );
 
     let sub = backend.direct_submission();
-    if !dragon_npu::backends::amd_xdna2::direct::exec_cmd_is_enabled() {
+    if !earth_dragon_npu::backends::amd_xdna2::direct::exec_cmd_is_enabled() {
         println!(
             "{label}.submit_skipped=1 (CREATE_BO(Cmd) still ok for diagnostics; no EXEC_CMD ioctl)"
         );
@@ -333,12 +342,12 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(dragon_npu::backends::amd_xdna2::DEFAULT_WAIT_CMD_TIMEOUT_MS);
+            .unwrap_or(earth_dragon_npu::backends::amd_xdna2::DEFAULT_WAIT_CMD_TIMEOUT_MS);
 
         // Phase 1 START_NPU envelope + host fill is mandatory before EXEC_CMD.
         // inst_buffer=0 is structural research only (not GEMM). Refuse rather than
         // empty-submit (2026-07-13 wedge class). No no-cmd-bo fallback.
-        match dragon_npu::backends::amd_xdna2::build_ert_start_npu_cmd_bo(0, 0, &[], 0x1) {
+        match earth_dragon_npu::backends::amd_xdna2::build_ert_start_npu_cmd_bo(0, 0, &[], 0x1) {
             Ok(payload) => {
                 let cmd_bo_size = payload.len() as u64;
                 match sub2.create_buffer(0, cmd_bo_size, BufferType::Cmd) {
@@ -348,7 +357,7 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
                              (START_NPU envelope)",
                             cmd_handle.0, cmd_bo_size
                         );
-                        match dragon_npu::backends::amd_xdna2::fill_cmd_bo_with_payload(
+                        match earth_dragon_npu::backends::amd_xdna2::fill_cmd_bo_with_payload(
                             sub2.as_ref(),
                             0,
                             cmd_handle.0,
@@ -367,7 +376,7 @@ fn print_backend_state(label: &str, backend: &AmdXdna2Backend) {
                                     // Envelope-only probe path: no IFM/WTS/OFM pin list.
                                     arg_bo_handles: Vec::new(),
                                 };
-                                match dragon_npu::backends::amd_xdna2::submit_and_wait_command(
+                                match earth_dragon_npu::backends::amd_xdna2::submit_and_wait_command(
                                     sub2.as_ref(),
                                     0,
                                     &real_cmd,

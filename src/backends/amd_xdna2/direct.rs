@@ -108,6 +108,31 @@ pub struct amdxdna_drm_wait_cmd {
     pub seq: u64,
 }
 
+/// Port of `struct drm_syncobj_timeline_wait` (`<drm/drm.h>`).
+///
+/// Used only by the research wait path behind
+/// [`super::silicon_contract::ENV_LAB_WAIT_VIA_SYNCOBJ`] (`XDNA2_LAB_WAIT_VIA_SYNCOBJ=1`).
+/// Product default remains [`amdxdna_drm_wait_cmd`] / WAIT_CMD.
+///
+/// Layout: handles/points user pointers, absolute mono timeout nsec, count, flags,
+/// first_signaled, pad, deadline_nsec. Size **48** bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(missing_docs)]
+pub struct drm_syncobj_timeline_wait {
+    /// User pointer to array of syncobj handles (`u32`s).
+    pub handles: u64,
+    /// User pointer to array of timeline points (`u64`s).
+    pub points: u64,
+    /// Absolute CLOCK_MONOTONIC timeout in nanoseconds (`i64::MAX` = forever).
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    pub first_signaled: u32,
+    pub pad: u32,
+    pub deadline_nsec: u64,
+}
+
 /// Buffer object types (direct port of enum amdxdna_bo_type from the uAPI).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +214,21 @@ pub struct amdxdna_drm_sync_bo {
 
 /// `enum amdxdna_drm_config_hwctx_param` — first value is CONFIG_CU.
 pub const DRM_AMDXDNA_HWCTX_CONFIG_CU: u32 = 0;
+/// Assign firmware debug buffer to hwctx (`DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF`).
+///
+/// Public uAPI (`amdxdna_accel.h`); XRT shim uses this via `config_ctx_debug_bo`.
+/// **AIE2 / AIE2P (Strix):** `param_val` is the **BO handle as a value** (not a
+/// pointer); `param_val_size` is ignored (driver path treats it as value mode).
+/// Pure pack: [`pack_config_hwctx_dbg_buf_aie2`]. Live trait path:
+/// [`DirectSubmission::config_hwctx_dbg_buf`] — **fail-closed** unless
+/// [`research_debug_bo_config_is_enabled`] (`XDNA2_LAB_RESEARCH_DEBUG_BO`).
+/// Assign alone ≠ Pass / ≠ `ran_on_npu` / ≠ C-ready.
+pub const DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF: u32 = 1;
+/// Remove firmware debug buffer (`DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF`).
+///
+/// Same value-mode packing as assign on AIE2. See [`pack_config_hwctx_dbg_buf_aie2`]
+/// and [`DirectSubmission::config_hwctx_dbg_buf`].
+pub const DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF: u32 = 2;
 
 /// `sizeof(struct amdxdna_cu_config)` — locked by unit test.
 pub const AMDXDNA_CU_CONFIG_SIZE: usize = 8;
@@ -552,6 +592,11 @@ mod ioctl {
     #[allow(dead_code)]
     pub const DRM_IOCTL_AMDXDNA_WAIT_CMD: libc::c_ulong = 0xc010_6449;
     // exact: iowr::<amdxdna_drm_wait_cmd>(9) == 0xc010_6449
+
+    // Core DRM (not amdxdna command-base): DRM_IOWR(0xCA, struct drm_syncobj_timeline_wait)
+    // size=48 → 0xc030_64ca. Research path only (`XDNA2_LAB_WAIT_VIA_SYNCOBJ=1`).
+    #[allow(dead_code)]
+    pub const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: libc::c_ulong = 0xc030_64ca;
 }
 
 /// Core pure parser for a BO flags string (comma-separated decimal or 0x-hex).
@@ -1050,6 +1095,16 @@ impl DirectSubmission for SharedRealDirectSubmission {
         self.inner.config_hwctx_cu(fd, hwctx, cu_entries)
     }
 
+    fn config_hwctx_dbg_buf(
+        &self,
+        fd: RawFd,
+        hwctx: u32,
+        op: HwctxDbgBufOp,
+        bo_handle: u32,
+    ) -> Result<(), DirectError> {
+        self.inner.config_hwctx_dbg_buf(fd, hwctx, op, bo_handle)
+    }
+
     fn destroy_buffer(&self, fd: RawFd, handle: u32) -> Result<(), DirectError> {
         self.inner.destroy_buffer(fd, handle)
     }
@@ -1075,6 +1130,18 @@ impl DirectSubmission for SharedRealDirectSubmission {
         timeout_ms: u32,
     ) -> Result<(), DirectError> {
         self.inner.wait_command(fd, hwctx, seq, timeout_ms)
+    }
+
+    fn wait_command_with_syncobj(
+        &self,
+        fd: RawFd,
+        hwctx: u32,
+        seq: u64,
+        timeout_ms: u32,
+        syncobj_handle: u32,
+    ) -> Result<(), DirectError> {
+        self.inner
+            .wait_command_with_syncobj(fd, hwctx, seq, timeout_ms, syncobj_handle)
     }
 
     fn sync_buffer(
@@ -1234,19 +1301,20 @@ impl RealDirectSubmission {
                 .pinned_shmem
                 .lock()
                 .map_err(|_| DirectError::DriverError(-1))?;
-            if let Some(&(ptr, len)) = guard.0.get(&handle) {
-                if len >= need && !ptr.is_null() {
-                    drop(guard);
-                    let info = self.get_bo_info(self.fd, handle)?;
-                    if !is_valid_xdna_device_addr(info.xdna_addr) {
-                        return Err(DirectError::InvalidArgument(format!(
-                            "pin_shmem_bo_for_pasid: handle={handle} still invalid xdna_addr={:#x} \
+            if let Some(&(ptr, len)) = guard.0.get(&handle)
+                && len >= need
+                && !ptr.is_null()
+            {
+                drop(guard);
+                let info = self.get_bo_info(self.fd, handle)?;
+                if !is_valid_xdna_device_addr(info.xdna_addr) {
+                    return Err(DirectError::InvalidArgument(format!(
+                        "pin_shmem_bo_for_pasid: handle={handle} still invalid xdna_addr={:#x} \
                              after pin (map_offset={:#x} vaddr={:#x})",
-                            info.xdna_addr, info.map_offset, info.vaddr
-                        )));
-                    }
-                    return Ok(info);
+                        info.xdna_addr, info.map_offset, info.vaddr
+                    )));
                 }
+                return Ok(info);
             }
         }
         // Drop old pin if resizing.
@@ -1303,11 +1371,13 @@ impl RealDirectSubmission {
             .lock()
             .ok()
             .and_then(|mut g| g.0.remove(&handle));
-        if let Some((ptr, len)) = entry {
-            if !ptr.is_null() && ptr != libc::MAP_FAILED && len > 0 {
-                unsafe {
-                    let _ = libc::munmap(ptr, len);
-                }
+        if let Some((ptr, len)) = entry
+            && !ptr.is_null()
+            && ptr != libc::MAP_FAILED
+            && len > 0
+        {
+            unsafe {
+                let _ = libc::munmap(ptr, len);
             }
         }
     }
@@ -1761,6 +1831,9 @@ impl DirectSubmission for RealDirectSubmission {
                             mem_size,
                             umq_bo,
                             log_buf_bo,
+                            // Retain CREATE_HWCTX out-param (was log-only). WAIT_CMD
+                            // path unchanged; syncobj wait is research/parity only.
+                            syncobj_handle: req.syncobj_handle,
                         })
                     }
                     Err(e) => {
@@ -2017,6 +2090,45 @@ impl DirectSubmission for RealDirectSubmission {
         }
     }
 
+    #[allow(unsafe_code)]
+    fn config_hwctx_dbg_buf(
+        &self,
+        _fd: RawFd,
+        hwctx: u32,
+        op: HwctxDbgBufOp,
+        bo_handle: u32,
+    ) -> Result<(), DirectError> {
+        // Fail-closed research gate (env); not EXEC_CMD double-gate.
+        if !research_debug_bo_config_is_enabled() {
+            return Err(DirectError::Unsupported(
+                research_debug_bo_config_block_reason().to_string(),
+            ));
+        }
+        let mut req = pack_config_hwctx_dbg_buf_aie2(hwctx, op, bo_handle)?;
+        let _ = validate_config_hwctx_dbg_buf_aie2(&req)?;
+        #[cfg(feature = "amd-xdna2")]
+        {
+            // SAFETY: req is stack-owned for the full ioctl (AIE2 value-mode; no user ptr).
+            let ret = unsafe {
+                ioctl::ioctl(self.fd, ioctl::DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &raw mut req)
+            };
+            match ret {
+                Ok(_) => Ok(()),
+                Err(e) => Err(DirectError::IoctlFailed(format!(
+                    "CONFIG_HWCTX({} DBG_BUF) failed hwctx={hwctx} bo={bo_handle}: {e}",
+                    op.as_str()
+                ))),
+            }
+        }
+        #[cfg(not(feature = "amd-xdna2"))]
+        {
+            let _ = (req, op, bo_handle, hwctx);
+            Err(DirectError::Unsupported(
+                "config_hwctx_dbg_buf requires the amd-xdna2 feature".to_string(),
+            ))
+        }
+    }
+
     #[allow(unsafe_code, clippy::all)]
     fn create_buffer(
         &self,
@@ -2176,9 +2288,12 @@ impl DirectSubmission for RealDirectSubmission {
 
     /// Wait for a previously submitted EXEC_CMD sequence number.
     ///
-    /// Issues `DRM_IOCTL_AMDXDNA_WAIT_CMD`. **Not** gated by
+    /// Issues `DRM_IOCTL_AMDXDNA_WAIT_CMD` (product default). **Not** gated by
     /// [`exec_cmd_is_enabled`] — cleanup / completion waits must remain
     /// usable; only submit is double-gated.
+    ///
+    /// Research path: see [`Self::wait_command_with_syncobj`] behind
+    /// `XDNA2_LAB_WAIT_VIA_SYNCOBJ=1` (default off).
     ///
     /// `timeout_ms == 0` is infinite in the driver; **refused** unless
     /// `XDNA2_WAIT_ALLOW_INFINITE=1` (lab policy — prefer finite timeouts /
@@ -2191,34 +2306,31 @@ impl DirectSubmission for RealDirectSubmission {
         seq: u64,
         timeout_ms: u32,
     ) -> Result<(), DirectError> {
-        check_wait_timeout_or_infinite_opt_in(timeout_ms)?;
-        #[cfg(feature = "amd-xdna2")]
-        {
-            let mut req = amdxdna_drm_wait_cmd {
-                hwctx,
-                timeout: timeout_ms,
-                seq,
-            };
+        self.wait_cmd_ioctl(hwctx, seq, timeout_ms)
+    }
 
-            let ret =
-                unsafe { ioctl::ioctl(self.fd, ioctl::DRM_IOCTL_AMDXDNA_WAIT_CMD, &raw mut req) };
-
-            match ret {
-                Ok(_) => Ok(()),
-                Err(e) => Err(DirectError::IoctlFailed(format!(
-                    "WAIT_CMD failed (hwctx={hwctx}, seq={seq}, timeout_ms={timeout_ms}, \
-                     request=0x{:x}): {e}",
-                    ioctl::DRM_IOCTL_AMDXDNA_WAIT_CMD
-                ))),
-            }
-        }
-
-        #[cfg(not(feature = "amd-xdna2"))]
-        {
-            let _ = (hwctx, seq, timeout_ms);
-            Err(DirectError::Unsupported(
-                "wait_command requires the amd-xdna2 feature".to_string(),
-            ))
+    /// Env-gated research wait: syncobj timeline when
+    /// `XDNA2_LAB_WAIT_VIA_SYNCOBJ=1` and `syncobj_handle != 0`; else WAIT_CMD.
+    ///
+    /// Fail-closed when research env is on and handle is 0 (no silent WAIT_CMD).
+    /// Soft honesty: error/detail tokens may include `wait_path=syncobj` or
+    /// `wait_path=wait_cmd`. **Not** live-proven; invent_pass=0.
+    #[allow(unsafe_code)]
+    fn wait_command_with_syncobj(
+        &self,
+        _fd: RawFd,
+        hwctx: u32,
+        seq: u64,
+        timeout_ms: u32,
+        syncobj_handle: u32,
+    ) -> Result<(), DirectError> {
+        match choose_lab_wait_path_from_env(syncobj_handle)? {
+            LabWaitPath::WaitCmd => self
+                .wait_cmd_ioctl(hwctx, seq, timeout_ms)
+                .map_err(|e| annotate_wait_path_error(e, "wait_cmd")),
+            LabWaitPath::SyncobjTimeline { handle } => self
+                .syncobj_timeline_wait_ioctl(handle, seq, timeout_ms)
+                .map_err(|e| annotate_wait_path_error(e, "syncobj")),
         }
     }
 
@@ -2739,7 +2851,103 @@ impl DirectSubmission for RealDirectSubmission {
     }
 }
 
-impl RealDirectSubmission {}
+impl RealDirectSubmission {
+    /// Product default: `DRM_IOCTL_AMDXDNA_WAIT_CMD`.
+    #[allow(unsafe_code)]
+    fn wait_cmd_ioctl(&self, hwctx: u32, seq: u64, timeout_ms: u32) -> Result<(), DirectError> {
+        check_wait_timeout_or_infinite_opt_in(timeout_ms)?;
+        #[cfg(feature = "amd-xdna2")]
+        {
+            let mut req = amdxdna_drm_wait_cmd {
+                hwctx,
+                timeout: timeout_ms,
+                seq,
+            };
+            let ret =
+                unsafe { ioctl::ioctl(self.fd, ioctl::DRM_IOCTL_AMDXDNA_WAIT_CMD, &raw mut req) };
+            match ret {
+                Ok(_) => Ok(()),
+                Err(e) => Err(DirectError::IoctlFailed(format!(
+                    "WAIT_CMD failed (hwctx={hwctx}, seq={seq}, timeout_ms={timeout_ms}, \
+                     wait_path=wait_cmd, request=0x{:x}): {e}",
+                    ioctl::DRM_IOCTL_AMDXDNA_WAIT_CMD
+                ))),
+            }
+        }
+        #[cfg(not(feature = "amd-xdna2"))]
+        {
+            let _ = (hwctx, seq, timeout_ms);
+            Err(DirectError::Unsupported(
+                "wait_command requires the amd-xdna2 feature".to_string(),
+            ))
+        }
+    }
+
+    /// Research: `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` with packed XRT-parity args.
+    ///
+    /// Not EXEC_CMD-gated. Default product path never calls this unless
+    /// `XDNA2_LAB_WAIT_VIA_SYNCOBJ=1` and handle ≠ 0.
+    #[allow(unsafe_code)]
+    fn syncobj_timeline_wait_ioctl(
+        &self,
+        syncobj_handle: u32,
+        seq: u64,
+        timeout_ms: u32,
+    ) -> Result<(), DirectError> {
+        check_wait_timeout_or_infinite_opt_in(timeout_ms)?;
+        #[cfg(feature = "amd-xdna2")]
+        {
+            let now = clock_monotonic_nsec();
+            let pack = super::silicon_contract::pack_syncobj_timeline_wait_ioctl(
+                syncobj_handle,
+                seq,
+                timeout_ms,
+                now,
+            )
+            .ok_or_else(|| {
+                DirectError::InvalidArgument(format!(
+                    "syncobj timeline wait pack refused (handle={syncobj_handle}, seq={seq}); \
+                     wait_path=syncobj pack_ok=0"
+                ))
+            })?;
+            let mut handle = pack.handle;
+            let mut point = pack.timepoint;
+            let mut req = drm_syncobj_timeline_wait {
+                // User pointers to single handle/point arrays (XRT parity count=1).
+                handles: std::ptr::from_mut(&mut handle) as u64,
+                points: std::ptr::from_mut(&mut point) as u64,
+                timeout_nsec: pack.timeout_nsec,
+                count_handles: pack.count_handles,
+                flags: pack.flags,
+                first_signaled: 0,
+                pad: 0,
+                deadline_nsec: 0,
+            };
+            let ret = unsafe {
+                ioctl::ioctl(
+                    self.fd,
+                    ioctl::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+                    &raw mut req,
+                )
+            };
+            match ret {
+                Ok(_) => Ok(()),
+                Err(e) => Err(DirectError::IoctlFailed(format!(
+                    "SYNCOBJ_TIMELINE_WAIT failed (handle={syncobj_handle}, seq={seq}, \
+                     timeout_ms={timeout_ms}, wait_path=syncobj, request=0x{:x}): {e}",
+                    ioctl::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+                ))),
+            }
+        }
+        #[cfg(not(feature = "amd-xdna2"))]
+        {
+            let _ = (syncobj_handle, seq, timeout_ms);
+            Err(DirectError::Unsupported(
+                "syncobj timeline wait requires the amd-xdna2 feature".to_string(),
+            ))
+        }
+    }
+}
 
 /// Core command types understood by the amdxdna driver (from the uAPI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2768,6 +2976,17 @@ pub struct HardwareContext {
     pub umq_bo: u32,
     /// The log buffer BO handle that was created for this context.
     pub log_buf_bo: u32,
+    /// DRM syncobj handle returned by `CREATE_HWCTX` (`amdxdna_drm_create_hwctx.syncobj_handle`).
+    ///
+    /// XRT prefers waiting this handle (timeline / drm_syncobj wait) when valid and
+    /// falls back to `WAIT_CMD` only when syncobj is invalid. Pure selection helper:
+    /// `should_wait_via_syncobj` / `select_wait_completion_path` (silicon_contract,
+    /// offline TDD). Product historically **logged then discarded** this field and
+    /// always used `WAIT_CMD`. Storing it is observability + parity prep; pure
+    /// selection is offline-tested but **not** live-wired into `wait_command` /
+    /// `submit_and_wait_command`. **Not** Pass / `ran_on_npu`. Zero means absent /
+    /// not recorded (`AMDXDNA_INVALID_FENCE_HANDLE`).
+    pub syncobj_handle: u32,
 }
 
 /// Quality of Service hints for a hardware context (directly from amdxdna uAPI).
@@ -3017,6 +3236,417 @@ pub fn pack_hwctx_param_config_cu(entries: &[(u32, u8)]) -> Result<Vec<u8>, Dire
     Ok(buf)
 }
 
+// === CONFIG_HWCTX debug BO (AIE2 value-mode; research-gated wire) ===
+
+/// Research gate env for CONFIG_HWCTX ASSIGN/REMOVE_DBG_BUF.
+///
+/// When **unset** (default): [`DirectSubmission::config_hwctx_dbg_buf`] refuses
+/// (fail-closed; no silent DBG_BUF in default tests). When set non-empty after
+/// trim: trait path may pack + issue CONFIG_HWCTX (Real) or record attempt (Stub).
+///
+/// This is **not** EXEC_CMD and does **not** require `XDNA2_ALLOW_EXEC_CMD`.
+/// Env alone ≠ Pass / ≠ C-ready / ≠ `ran_on_npu` / ≠ live unlock. Live lab shots
+/// still need an active `C_UNLOCK` for operator apply; this env only opens the
+/// research DBG_BUF config method.
+pub const ENV_LAB_RESEARCH_DEBUG_BO: &str = "XDNA2_LAB_RESEARCH_DEBUG_BO";
+
+/// AIE2/AIE2P CONFIG_HWCTX debug-buffer op (`ASSIGN_DBG_BUF` / `REMOVE_DBG_BUF`).
+///
+/// Strix host path: `param_val` carries the GEM **BO handle as a u64 value**
+/// (XRT `config_ctx_debug_bo` parity). Not the AIE4 metadata-BO pointer path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HwctxDbgBufOp {
+    /// `DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF` — attach debug BO to hwctx.
+    Assign,
+    /// `DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF` — detach debug BO from hwctx.
+    Remove,
+}
+
+impl HwctxDbgBufOp {
+    /// Public uAPI `param_type` enum value.
+    #[must_use]
+    pub const fn param_type(self) -> u32 {
+        match self {
+            Self::Assign => DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
+            Self::Remove => DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF,
+        }
+    }
+
+    /// Stable soft-token name (`assign` / `remove`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Assign => "assign",
+            Self::Remove => "remove",
+        }
+    }
+
+    /// Parse public param_type into an op (AIE2 assign/remove only).
+    #[must_use]
+    pub const fn from_param_type(param_type: u32) -> Option<Self> {
+        match param_type {
+            DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF => Some(Self::Assign),
+            DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF => Some(Self::Remove),
+            _ => None,
+        }
+    }
+}
+
+/// Parsed AIE2 debug-BO CONFIG_HWCTX request (pure; no ioctl).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HwctxDbgBufAie2Parsed {
+    /// Hardware context handle.
+    pub hwctx: u32,
+    /// Assign or remove.
+    pub op: HwctxDbgBufOp,
+    /// Debug BO GEM handle (low 32 bits of `param_val`).
+    pub bo_handle: u32,
+}
+
+/// Pack AIE2-style `amdxdna_drm_config_hwctx` for assign/remove debug BO.
+///
+/// Pure offline helper — **does not** issue ioctls. Layout matches public driver
+/// + XRT shim for AIE2:
+/// - `param_val = bo_handle as u64`
+/// - `param_val_size = 0`
+/// - `pad = 0`
+///
+/// Refuse zero BO handle (driver rejects invalid handles; fail closed).
+///
+/// # Errors
+///
+/// `bo_handle == 0` (invalid GEM handle).
+pub fn pack_config_hwctx_dbg_buf_aie2(
+    hwctx: u32,
+    op: HwctxDbgBufOp,
+    bo_handle: u32,
+) -> Result<amdxdna_drm_config_hwctx, DirectError> {
+    if bo_handle == 0 {
+        return Err(DirectError::InvalidArgument(
+            "pack_config_hwctx_dbg_buf_aie2 refuses bo_handle=0 (invalid GEM handle)".into(),
+        ));
+    }
+    Ok(amdxdna_drm_config_hwctx {
+        handle: hwctx,
+        param_type: op.param_type(),
+        param_val: u64::from(bo_handle),
+        param_val_size: 0,
+        pad: 0,
+    })
+}
+
+/// Validate an AIE2 value-mode debug-BO CONFIG_HWCTX pack (pure layout check).
+///
+/// Accepts only ASSIGN/REMOVE param_types, `pad=0`, `param_val_size=0`,
+/// `param_val` fits in u32 and is non-zero. Does **not** claim the BO exists
+/// or that firmware will accept attach.
+///
+/// # Errors
+///
+/// Wrong param_type, non-zero pad/size, out-of-range or zero BO handle.
+pub fn validate_config_hwctx_dbg_buf_aie2(
+    req: &amdxdna_drm_config_hwctx,
+) -> Result<HwctxDbgBufAie2Parsed, DirectError> {
+    let op = HwctxDbgBufOp::from_param_type(req.param_type).ok_or_else(|| {
+        DirectError::InvalidArgument(format!(
+            "validate_config_hwctx_dbg_buf_aie2: param_type={} is not ASSIGN/REMOVE_DBG_BUF",
+            req.param_type
+        ))
+    })?;
+    if req.pad != 0 {
+        return Err(DirectError::InvalidArgument(format!(
+            "validate_config_hwctx_dbg_buf_aie2: pad must be 0 (got {})",
+            req.pad
+        )));
+    }
+    if req.param_val_size != 0 {
+        return Err(DirectError::InvalidArgument(format!(
+            "validate_config_hwctx_dbg_buf_aie2: AIE2 value-mode requires param_val_size=0 (got {})",
+            req.param_val_size
+        )));
+    }
+    if req.param_val > u64::from(u32::MAX) {
+        return Err(DirectError::InvalidArgument(format!(
+            "validate_config_hwctx_dbg_buf_aie2: param_val 0x{:x} exceeds u32 BO handle",
+            req.param_val
+        )));
+    }
+    let bo_handle = u32::try_from(req.param_val).map_err(|_| {
+        DirectError::InvalidArgument(format!(
+            "validate_config_hwctx_dbg_buf_aie2: param_val 0x{:x} exceeds u32 BO handle",
+            req.param_val
+        ))
+    })?;
+    if bo_handle == 0 {
+        return Err(DirectError::InvalidArgument(
+            "validate_config_hwctx_dbg_buf_aie2: bo_handle=0 refused".into(),
+        ));
+    }
+    Ok(HwctxDbgBufAie2Parsed {
+        hwctx: req.handle,
+        op,
+        bo_handle,
+    })
+}
+
+/// True when `XDNA2_LAB_RESEARCH_DEBUG_BO` is set non-empty after trim.
+///
+/// Pure env read used as the research gate for
+/// [`DirectSubmission::config_hwctx_dbg_buf`] via
+/// [`research_debug_bo_config_is_enabled`]. Reading this function alone does
+/// **not** issue CONFIG_HWCTX, EXEC_CMD, or open L3. Set-alone ≠ Pass /
+/// ≠ C-ready / ≠ unlock / ≠ `ran_on_npu`.
+#[must_use]
+pub fn lab_research_debug_bo_env_requested() -> bool {
+    std::env::var(ENV_LAB_RESEARCH_DEBUG_BO).is_ok_and(|s| !s.trim().is_empty())
+}
+
+/// Research gate for CONFIG_HWCTX ASSIGN/REMOVE_DBG_BUF (fail-closed default).
+///
+/// Single source of truth with [`research_debug_bo_config_block_reason`].
+/// Requires [`ENV_LAB_RESEARCH_DEBUG_BO`]. Default tests leave it unset so
+/// trait calls refuse. Does **not** open EXEC_CMD or invent Pass.
+#[must_use]
+pub fn research_debug_bo_config_is_enabled() -> bool {
+    lab_research_debug_bo_env_requested()
+}
+
+/// Stable refuse message when [`research_debug_bo_config_is_enabled`] is false.
+#[must_use]
+pub fn research_debug_bo_config_block_reason() -> &'static str {
+    "CONFIG_HWCTX(DBG_BUF) blocked: set XDNA2_LAB_RESEARCH_DEBUG_BO=1 \
+     (research-only; invent_pass=0; not_c_ready; not_ran_on_npu; \
+     debug_bo_alone_not_pass=1; no silent DBG_BUF in default tests)"
+}
+
+/// Soft detail for pure AIE2 debug-BO **pack** (offline prep; never invents Pass).
+///
+/// `live_wired=0` here means the **pack helper** did not issue an ioctl. The
+/// research trait path uses [`format_research_debug_bo_config_detail`] instead.
+#[must_use]
+pub fn format_debug_bo_aie2_pack_detail(parsed: &HwctxDbgBufAie2Parsed) -> String {
+    format!(
+        "debug_bo_aie2 op={} param_type={} hwctx={} bo_handle={} \
+         param_val_is_bo_handle_value=1 param_val_size=0 live_wired=0 \
+         invent_pass=0 not_ran_on_npu=1 research_only=1",
+        parsed.op.as_str(),
+        parsed.op.param_type(),
+        parsed.hwctx,
+        parsed.bo_handle
+    )
+}
+
+/// Soft detail for research [`DirectSubmission::config_hwctx_dbg_buf`] outcomes.
+///
+/// Always honesty: `invent_pass=0 not_c_ready=1 not_ran_on_npu=1
+/// debug_bo_alone_not_pass=1 research_only=1`. `path` is a short label
+/// (`refused` / `stub` / `real` / `lab`). Attempt alone ≠ silicon Pass.
+#[must_use]
+pub fn format_research_debug_bo_config_detail(
+    op: HwctxDbgBufOp,
+    hwctx: u32,
+    bo_handle: u32,
+    gate_open: bool,
+    attempt_ok: bool,
+    path: &str,
+) -> String {
+    format!(
+        "debug_bo_config op={} param_type={} hwctx={} bo_handle={} \
+         gate_open={} attempt_ok={} path={} invent_pass=0 not_c_ready=1 \
+         not_ran_on_npu=1 debug_bo_alone_not_pass=1 research_only=1",
+        op.as_str(),
+        op.param_type(),
+        hwctx,
+        bo_handle,
+        u8::from(gate_open),
+        u8::from(attempt_ok),
+        path
+    )
+}
+
+/// One stub-recorded research DBG_BUF config attempt (unit observability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StubDbgBufOpRecord {
+    /// Hardware context handle.
+    pub hwctx: u32,
+    /// Assign or remove.
+    pub op: HwctxDbgBufOp,
+    /// Debug BO GEM handle.
+    pub bo_handle: u32,
+}
+
+/// Default research debug-BO size (bytes) for lab timed attach.
+///
+/// **Size:** one host page (`0x1000` = 4096). Matches XRT shim positive tests
+/// (`TEST_create_free_debug_bo` args `{ 0x1000 }` and large `{ 0x100000 }`).
+/// Public CONFIG_HWCTX uAPI is handle-only (AIE2 value-mode); size is CREATE_BO
+/// only. Live may still reject size at FW — document in last_apply; assign
+/// alone never invents Pass.
+pub const LAB_RESEARCH_DEBUG_BO_SIZE_BYTES: u64 = 4096;
+
+/// Research debug-BO CREATE type: **must** be [`BufferType::Dev`].
+///
+/// **Root cause (live `48da6e60`):** lab used Shmem 4096 → journal
+/// `aie2_hwctx_cfg_debug_bo: Get bo 2 failed` / Assign EINVAL. Public AIE2
+/// driver looks up the handle with
+/// `amdxdna_gem_get_obj(client, bo_hdl, AMDXDNA_BO_DEV)` and returns `-EINVAL`
+/// when the GEM is not `AMDXDNA_BO_DEV` (type filter in `amdxdna_gem_get_obj`).
+///
+/// **XRT parity:** `XRT_BO_FLAGS_CACHEABLE` + `XRT_BO_USE_DEBUG` maps to
+/// `AMDXDNA_BO_DEV` when the device has dev mem (`bo_flags_to_type` in
+/// xdna-driver shim `buffer.cpp`). CREATE_HWCTX already ensures DevHeap, so
+/// post-hwctx `CREATE_BO(Dev)` is valid.
+pub const LAB_RESEARCH_DEBUG_BO_TYPE: BufferType = BufferType::Dev;
+
+/// Soft token for research debug-BO CREATE type in last_apply / detail.
+///
+/// Always lowercase uAPI-ish name (`dev` / `shmem` / …). Used by
+/// [`LabResearchDebugBoAttach::detail_token`].
+#[must_use]
+pub fn lab_research_debug_bo_type_token(ty: BufferType) -> &'static str {
+    match ty {
+        BufferType::Shmem => "shmem",
+        BufferType::DevHeap => "dev_heap",
+        BufferType::Dev => "dev",
+        BufferType::Cmd => "cmd",
+    }
+}
+
+/// Pure recipe for research debug-BO CREATE (type + size).
+///
+/// Documents the post-`48da6e60` offline fix. Not Pass / not C-ready.
+#[must_use]
+pub fn lab_research_debug_bo_create_recipe() -> (BufferType, u64) {
+    (LAB_RESEARCH_DEBUG_BO_TYPE, LAB_RESEARCH_DEBUG_BO_SIZE_BYTES)
+}
+
+/// Result of optional lab research debug-BO attach (≠ Pass / ≠ `ran_on_npu`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabResearchDebugBoAttach {
+    /// GEM handle of the debug BO (keep alive for hwctx lifetime).
+    pub bo_handle: u32,
+    /// Allocation size in bytes (see [`LAB_RESEARCH_DEBUG_BO_SIZE_BYTES`]).
+    pub size_bytes: u64,
+    /// CREATE_BO type (must be [`BufferType::Dev`] for AIE2 Assign; see
+    /// [`LAB_RESEARCH_DEBUG_BO_TYPE`]).
+    pub bo_type: BufferType,
+    /// Hardware context that received ASSIGN_DBG_BUF.
+    pub hwctx: u32,
+}
+
+impl LabResearchDebugBoAttach {
+    /// Soft detail token for timed result / last_apply (always invent_pass=0).
+    #[must_use]
+    pub fn detail_token(&self) -> String {
+        let core = format_research_debug_bo_config_detail(
+            HwctxDbgBufOp::Assign,
+            self.hwctx,
+            self.bo_handle,
+            true,
+            true,
+            "lab",
+        );
+        format!(
+            "{core} debug_bo_size={} debug_bo_ty={} lab_debug_bo_attach=1",
+            self.size_bytes,
+            lab_research_debug_bo_type_token(self.bo_type)
+        )
+    }
+}
+
+/// Guard: REMOVE_DBG_BUF (best-effort) + GEM_CLOSE on drop.
+pub struct LabResearchDebugBoGuard<'a> {
+    submission: &'a dyn DirectSubmission,
+    hwctx: u32,
+    handle: Option<u32>,
+}
+
+impl std::fmt::Debug for LabResearchDebugBoGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LabResearchDebugBoGuard")
+            .field("hwctx", &self.hwctx)
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> LabResearchDebugBoGuard<'a> {
+    /// Track `handle` for remove + destroy on drop.
+    #[must_use]
+    pub fn new(submission: &'a dyn DirectSubmission, hwctx: u32, handle: u32) -> Self {
+        Self {
+            submission,
+            hwctx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Empty guard (no BO; env unset / no attach).
+    #[must_use]
+    pub fn empty(submission: &'a dyn DirectSubmission) -> Self {
+        Self {
+            submission,
+            hwctx: 0,
+            handle: None,
+        }
+    }
+}
+
+impl Drop for LabResearchDebugBoGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            // Best-effort remove (hwctx may already be destroyed on early exits).
+            let _ = self
+                .submission
+                .config_hwctx_dbg_buf(0, self.hwctx, HwctxDbgBufOp::Remove, h);
+            let _ = self.submission.destroy_buffer(0, h);
+        }
+    }
+}
+
+/// After CREATE_HWCTX (and optional CONFIG_CU): if research debug-BO env is set,
+/// CREATE a minimal **Dev** BO and CONFIG_HWCTX Assign.
+///
+/// - Env **unset** → `Ok(None)` (default lab path; no DBG_BUF; zero behavior change).
+/// - Env set → fail-closed on create/config errors (`Err`).
+/// - Type: [`LAB_RESEARCH_DEBUG_BO_TYPE`] = [`BufferType::Dev`] (driver + XRT
+///   parity; Shmem rejected by `aie2_hwctx_cfg_debug_bo` type filter — live
+///   `48da6e60`).
+/// - Size: [`LAB_RESEARCH_DEBUG_BO_SIZE_BYTES`] (4096 / one page; XRT shim test).
+/// - Soft detail via [`LabResearchDebugBoAttach::detail_token`] always invent_pass=0.
+/// - Never sets Pass / `ran_on_npu`.
+///
+/// # Errors
+///
+/// Create-buffer or CONFIG_HWCTX Assign failures when the research gate is open.
+pub fn try_lab_attach_research_debug_bo_from_env(
+    submission: &dyn DirectSubmission,
+    fd: RawFd,
+    hwctx: u32,
+) -> Result<Option<LabResearchDebugBoAttach>, DirectError> {
+    if !research_debug_bo_config_is_enabled() {
+        return Ok(None);
+    }
+    let (ty, size) = lab_research_debug_bo_create_recipe();
+    // AIE2 Assign requires AMDXDNA_BO_DEV (not Shmem). See LAB_RESEARCH_DEBUG_BO_TYPE.
+    let bo = submission.create_buffer(fd, size, ty)?;
+    if let Err(e) = submission.config_hwctx_dbg_buf(fd, hwctx, HwctxDbgBufOp::Assign, bo.0) {
+        let _ = submission.destroy_buffer(fd, bo.0);
+        return Err(DirectError::IoctlFailed(format!(
+            "lab research DEBUG_BO: CONFIG_HWCTX Assign failed \
+             (hwctx={hwctx} bo={} size={size} ty={}): {e}",
+            bo.0,
+            lab_research_debug_bo_type_token(ty)
+        )));
+    }
+    Ok(Some(LabResearchDebugBoAttach {
+        bo_handle: bo.0,
+        size_bytes: size,
+        bo_type: ty,
+        hwctx,
+    }))
+}
+
 /// Parse `XDNA2_LAB_CU_FUNC` (default 0). Fail-closed on non-u8.
 ///
 /// # Errors
@@ -3042,9 +3672,7 @@ pub fn lab_cu_func_from_env() -> Result<u8, DirectError> {
 /// True when `XDNA2_LAB_PDI_BLOB` is set (non-empty after trim) — lab should attempt CONFIG_CU.
 #[must_use]
 pub fn lab_pdi_blob_env_requested() -> bool {
-    std::env::var(ENV_LAB_PDI_BLOB)
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty())
+    std::env::var(ENV_LAB_PDI_BLOB).is_ok_and(|s| !s.trim().is_empty())
 }
 
 /// Result of optional lab CONFIG_CU attach (research; not Pass).
@@ -3724,6 +4352,108 @@ pub fn fill_cmd_bo_with_payload(
     submission.write_bo_bytes(fd, handle, 0, payload)
 }
 
+/// Lab research wait path selection (env + CREATE_HWCTX syncobj handle).
+///
+/// Product default is always [`LabWaitPath::WaitCmd`] when
+/// `XDNA2_LAB_WAIT_VIA_SYNCOBJ` is unset/false. Research env alone does **not**
+/// unlock live apply / Pass. invent_pass=0; not_live_proven until L8 live shot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabWaitPath {
+    /// `DRM_IOCTL_AMDXDNA_WAIT_CMD` (product default).
+    WaitCmd,
+    /// `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` research path (handle ≠ 0 + env on).
+    SyncobjTimeline {
+        /// CREATE_HWCTX syncobj handle.
+        handle: u32,
+    },
+}
+
+impl LabWaitPath {
+    /// Soft detail token: `wait_cmd` (default) or `syncobj` (research).
+    #[must_use]
+    pub const fn wait_path_token(self) -> &'static str {
+        match self {
+            Self::WaitCmd => "wait_cmd",
+            Self::SyncobjTimeline { .. } => "syncobj",
+        }
+    }
+}
+
+/// Pure: choose wait path from research env raw string + syncobj handle.
+///
+/// | env | handle | result |
+/// |-----|--------|--------|
+/// | off / unset | any | [`LabWaitPath::WaitCmd`] |
+/// | on | ≠ 0 | [`LabWaitPath::SyncobjTimeline`] |
+/// | on | 0 | **Err** fail-closed (no silent WAIT_CMD when research flag on) |
+///
+/// # Errors
+///
+/// [`DirectError::InvalidArgument`] when research env is enabled and handle is 0.
+pub fn choose_lab_wait_path(
+    env_raw: Option<&str>,
+    syncobj_handle: u32,
+) -> Result<LabWaitPath, DirectError> {
+    if !super::silicon_contract::lab_wait_via_syncobj_research_env_enabled(env_raw) {
+        return Ok(LabWaitPath::WaitCmd);
+    }
+    if !super::silicon_contract::should_wait_via_syncobj(syncobj_handle) {
+        return Err(DirectError::InvalidArgument(format!(
+            "XDNA2_LAB_WAIT_VIA_SYNCOBJ=1 requires non-zero CREATE_HWCTX syncobj_handle \
+             (got {syncobj_handle}); fail-closed research gate (no silent WAIT_CMD when \
+             research flag on); wait_path=syncobj pack_ok=0 invent_pass=0 not_live_proven=1"
+        )));
+    }
+    Ok(LabWaitPath::SyncobjTimeline {
+        handle: syncobj_handle,
+    })
+}
+
+/// Read process env `XDNA2_LAB_WAIT_VIA_SYNCOBJ` and choose path.
+///
+/// # Errors
+///
+/// Same as [`choose_lab_wait_path`].
+pub fn choose_lab_wait_path_from_env(syncobj_handle: u32) -> Result<LabWaitPath, DirectError> {
+    let raw = std::env::var(super::silicon_contract::ENV_LAB_WAIT_VIA_SYNCOBJ).ok();
+    choose_lab_wait_path(raw.as_deref(), syncobj_handle)
+}
+
+/// Annotate wait errors with `wait_path=` when missing (soft honesty token).
+fn annotate_wait_path_error(err: DirectError, path: &str) -> DirectError {
+    match err {
+        DirectError::IoctlFailed(msg) if !msg.contains("wait_path=") => {
+            DirectError::IoctlFailed(format!("{msg}; wait_path={path}"))
+        }
+        other => other,
+    }
+}
+
+/// CLOCK_MONOTONIC sample in nanoseconds (for abs timeout pack). Falls back to 0.
+#[allow(unsafe_code)]
+fn clock_monotonic_nsec() -> i64 {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // Safety: valid timespec out-param; CLOCK_MONOTONIC is always defined on Linux.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+        if rc != 0 {
+            return 0;
+        }
+        // Linux CLOCK_MONOTONIC timespec fields are already i64.
+        ts.tv_sec
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec)
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 /// Result of a gated EXEC_CMD + WAIT_CMD pair ([`submit_and_wait_command`]).
 ///
 /// **Honesty:** `seq` only proves the driver accepted the ioctl and wait
@@ -3731,10 +4461,13 @@ pub fn fill_cmd_bo_with_payload(
 /// ERT state from a mapped Cmd BO is a documented follow-up (not filled here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitWaitResult {
-    /// Sequence number returned by EXEC_CMD (passed to WAIT_CMD).
+    /// Sequence number returned by EXEC_CMD (passed to WAIT_CMD / syncobj point).
     pub seq: u64,
-    /// Timeout in milliseconds that was requested for WAIT_CMD.
+    /// Timeout in milliseconds that was requested for the wait.
     pub timeout_ms: u32,
+    /// Soft token: `wait_cmd` (default) or `syncobj` (research env + handle ≠ 0).
+    /// Not proof of live residual root; invent_pass=0; not_live_proven until L8.
+    pub wait_path: &'static str,
 }
 
 /// Submit one EXEC_CMD then WAIT_CMD with a **finite** timeout.
@@ -3771,8 +4504,50 @@ pub fn submit_and_wait_command(
     exec_cmd_requires_filled_cmd_bo(cmd)?;
 
     let seq = submission.submit_command(fd, cmd)?;
+    // Product default: WAIT_CMD only (does not consult research syncobj env).
     submission.wait_command(fd, cmd.hwctx_handle, seq, timeout_ms)?;
-    Ok(SubmitWaitResult { seq, timeout_ms })
+    Ok(SubmitWaitResult {
+        seq,
+        timeout_ms,
+        wait_path: LabWaitPath::WaitCmd.wait_path_token(),
+    })
+}
+
+/// Submit one EXEC_CMD then wait with optional research syncobj path.
+///
+/// Same EXEC_CMD gates as [`submit_and_wait_command`]. Wait path:
+/// - env `XDNA2_LAB_WAIT_VIA_SYNCOBJ` unset/off → WAIT_CMD (product default)
+/// - env on + `syncobj_handle != 0` → `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`
+/// - env on + handle 0 → fail-closed [`DirectError::InvalidArgument`]
+///
+/// Does **not** set `ran_on_npu`; invent_pass=0; L8 unlock not minted here.
+///
+/// # Errors
+///
+/// Same as [`submit_and_wait_command`], plus research-gate InvalidArgument.
+pub fn submit_and_wait_command_ex(
+    submission: &dyn DirectSubmission,
+    fd: RawFd,
+    cmd: &Command,
+    timeout_ms: u32,
+    syncobj_handle: u32,
+) -> Result<SubmitWaitResult, DirectError> {
+    if !exec_cmd_is_enabled() {
+        return Err(DirectError::Unsupported(
+            exec_cmd_block_reason().to_string(),
+        ));
+    }
+    check_finite_wait_timeout(timeout_ms)?;
+    exec_cmd_requires_filled_cmd_bo(cmd)?;
+
+    let path = choose_lab_wait_path_from_env(syncobj_handle)?;
+    let seq = submission.submit_command(fd, cmd)?;
+    submission.wait_command_with_syncobj(fd, cmd.hwctx_handle, seq, timeout_ms, syncobj_handle)?;
+    Ok(SubmitWaitResult {
+        seq,
+        timeout_ms,
+        wait_path: path.wait_path_token(),
+    })
 }
 
 /// Refuse empty payload or missing Cmd BO handle (2026-07-13 empty EXEC wedge class).
@@ -3864,8 +4639,9 @@ pub struct TimedOpResult {
     /// True when the submission backend is real ioctl (`RealDirectSubmission`).
     pub real_ioctl: bool,
     /// Stable machine status: `hwctx_ok`, `ok_submit_wait_envelope`,
-    /// `ok_submit_wait_with_inst_blob`, `submit_wait_failed`, `bo_roundtrip_ok`,
-    /// `bo_roundtrip_stub_ok`, …
+    /// `ok_submit_wait_with_inst_blob`, `submit_wait_failed`, `wait_timeout`,
+    /// `wait_cmd_einval` (WAIT EINVAL / os error 22; not a timed-out wait),
+    /// `bo_roundtrip_ok`, `bo_roundtrip_stub_ok`, …
     pub status: String,
     /// Human-readable detail (error text or notes).
     pub detail: String,
@@ -3990,12 +4766,26 @@ impl TimedOpResult {
 /// `payload_unsupported` for messages that look payload/txn related.
 /// Live 2026-07-16 lab: EIO + map_host → `exec_eio` (not payload_unsupported).
 ///
+/// **T3 honesty (2026-08-10):** Live WAIT_CMD error strings always embed the
+/// field name `timeout_ms=N`. That must **not** force status `wait_timeout`.
+/// Real EINVAL (`Invalid argument` / `os error 22`) → `wait_cmd_einval`.
+/// True timeouts use etimedout / timed out / remaining `timeout` tokens after
+/// neutralizing the `timeout_ms=` field name.
+///
 /// Kernel fingerprints (journal):
 /// - `MSG_OP_MAP_HOST_BUFFER (0x106)` / `aie2_map_host_buf` → heap UVA / map_host class
 /// - often surfaces as EXEC_CMD EIO (`os error 5`) — status `exec_eio`
 fn classify_submit_wait_error(err: &DirectError) -> &'static str {
     let s = err.to_string().to_ascii_lowercase();
-    if s.contains("timeout") || s.contains("etimedout") || s.contains("etime") {
+    // WAIT EINVAL before loose timeout: live messages always contain timeout_ms=.
+    // Payload/txn InvalidArgument Display is "invalid argument: …" — keep that class.
+    if submit_wait_message_is_einval(&s) {
+        if submit_wait_message_is_payload_class(&s) {
+            "payload_unsupported"
+        } else {
+            "wait_cmd_einval"
+        }
+    } else if submit_wait_message_is_true_timeout(&s) {
         "wait_timeout"
     } else if s.contains("eperm") || s.contains("permission denied") || s.contains("exec_cmd_allow")
     {
@@ -4008,16 +4798,38 @@ fn classify_submit_wait_error(err: &DirectError) -> &'static str {
         || s.contains("eio")
     {
         "exec_eio"
-    } else if s.contains("payload")
-        || s.contains("txn")
-        || s.contains("not implemented")
-        || s.contains("invalid argument")
-        || s.contains("einval")
-    {
+    } else if submit_wait_message_is_payload_class(&s) {
         "payload_unsupported"
     } else {
         "submit_wait_failed"
     }
+}
+
+/// True when the submit/wait error text indicates EINVAL (not a timed-out wait).
+#[must_use]
+fn submit_wait_message_is_einval(s: &str) -> bool {
+    s.contains("invalid argument") || s.contains("einval") || s.contains("os error 22")
+}
+
+/// Payload / txn / not-implemented class (reserve `payload_unsupported`).
+#[must_use]
+fn submit_wait_message_is_payload_class(s: &str) -> bool {
+    s.contains("payload") || s.contains("txn") || s.contains("not implemented")
+}
+
+/// True timeout residual — not the mere field name `timeout_ms=` in WAIT errors.
+///
+/// Live WAIT_CMD failures always format `timeout_ms=N` into the message even when
+/// the ioctl returns EINVAL immediately (`submit_wait_s≈0`). Matching bare
+/// `"timeout"` would mis-label those as `wait_timeout`.
+#[must_use]
+fn submit_wait_message_is_true_timeout(s: &str) -> bool {
+    if s.contains("etimedout") || s.contains("timed out") {
+        return true;
+    }
+    // Neutralize the budget field name so it cannot alone force wait_timeout.
+    let stripped = s.replace("timeout_ms=", "wait_budget_ms=");
+    stripped.contains("timeout") || stripped.contains("etime")
 }
 
 /// Format one GET_BO_INFO snapshot for timed-path `detail` (no secrets).
@@ -4551,6 +5363,8 @@ pub fn timed_matmul_direct(
     let diag_rela_mode_tok = std::cell::Cell::new("na");
     // Optional CONFIG_CU attach token (set after hwctx when XDNA2_LAB_PDI_BLOB used).
     let diag_config_cu = std::cell::RefCell::new(String::new());
+    // Optional research debug-BO attach token (XDNA2_LAB_RESEARCH_DEBUG_BO).
+    let diag_debug_bo = std::cell::RefCell::new(String::new());
     let stamp = |r: &mut TimedOpResult,
                  tiles: u32,
                  qos: &QosInfo,
@@ -4560,13 +5374,24 @@ pub fn timed_matmul_direct(
                  layout: &'static str,
                  kargs: usize,
                  write_la: bool| {
-        if let Ok(tok) = diag_config_cu.try_borrow() {
-            if !tok.is_empty() && !r.detail.contains("config_cu=") {
-                if r.detail.is_empty() {
-                    r.detail.clone_from(&tok);
-                } else {
-                    r.detail = format!("{tok}; {}", r.detail);
-                }
+        if let Ok(tok) = diag_config_cu.try_borrow()
+            && !tok.is_empty()
+            && !r.detail.contains("config_cu=")
+        {
+            if r.detail.is_empty() {
+                r.detail.clone_from(&tok);
+            } else {
+                r.detail = format!("{tok}; {}", r.detail);
+            }
+        }
+        if let Ok(tok) = diag_debug_bo.try_borrow()
+            && !tok.is_empty()
+            && !r.detail.contains("debug_bo_config")
+        {
+            if r.detail.is_empty() {
+                r.detail.clone_from(&tok);
+            } else {
+                r.detail = format!("{tok}; {}", r.detail);
             }
         }
         super::silicon_contract::finalize_lab_timed_result(
@@ -4621,6 +5446,26 @@ pub fn timed_matmul_direct(
         }
     };
 
+    // Progressive last_apply stamps (best-effort mid-path). Outer timeout kill
+    // (timeout(1) rc=124) previously left zero JSON because stamps only ran on
+    // normal Rust return. After CREATE_HWCTX / CONFIG_CU / pre-submit, overwrite
+    // the same pin path with honest partial status. Kill **during** a single
+    // ioctl can still lose that stage — progressive stamps only help when Rust
+    // regains control between stages. Always invent_pass=0 not_ran_on_npu=1.
+    if write_la_default {
+        let mut partial = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+        partial.total_s = t0.elapsed().as_secs_f64();
+        partial.host_prep_s = host_prep_s;
+        partial.hwctx_s = hwctx_s;
+        partial.ran_on_npu = false;
+        partial.status = super::silicon_contract::LAB_PARTIAL_STATUS_HWCTX_OK.to_string();
+        partial.detail = super::silicon_contract::format_lab_partial_detail(&format!(
+            "CREATE_HWCTX ok handle={} tiles={tiles} syncobj={}",
+            ctx.handle, ctx.syncobj_handle
+        ));
+        stamp(&mut partial, tiles, &qos, None, None, false, "na", 0, true);
+    }
+
     // Optional lab CONFIG_CU + opaque PDI (XDNA2_LAB_PDI_BLOB). Default off.
     // Research path change vs historical "never CONFIG_CU"; still ≠ Pass.
     let pdi_guard = match try_lab_attach_config_cu_from_env(submission, 0, ctx.handle) {
@@ -4628,6 +5473,21 @@ pub fn timed_matmul_direct(
         Ok(Some(att)) => {
             if let Ok(mut t) = diag_config_cu.try_borrow_mut() {
                 *t = att.detail_token();
+            }
+            // Progressive stamp after CONFIG_CU attach success (fail path stamps below).
+            if write_la_default {
+                let mut partial = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                partial.total_s = t0.elapsed().as_secs_f64();
+                partial.host_prep_s = host_prep_s;
+                partial.hwctx_s = hwctx_s;
+                partial.ran_on_npu = false;
+                partial.status = super::silicon_contract::LAB_PARTIAL_STATUS_CONFIG_CU.to_string();
+                partial.detail = super::silicon_contract::format_lab_partial_detail(&format!(
+                    "{} handle={}",
+                    att.detail_token(),
+                    ctx.handle
+                ));
+                stamp(&mut partial, tiles, &qos, None, None, false, "na", 0, true);
             }
             LabPdiBoGuard::new(submission, att.pdi_bo)
         }
@@ -4659,6 +5519,69 @@ pub fn timed_matmul_direct(
     };
     // Keep PDI BO alive for the rest of the function (drop at end of scope).
     let _pdi_guard = pdi_guard;
+
+    // Optional research debug-BO attach (XDNA2_LAB_RESEARCH_DEBUG_BO). Default off.
+    // CREATE minimal Dev BO + CONFIG_HWCTX Assign; REMOVE+destroy on guard drop.
+    // invent_pass=0 always; attach alone ≠ Pass / ≠ ran_on_npu.
+    let dbg_guard = match try_lab_attach_research_debug_bo_from_env(submission, 0, ctx.handle) {
+        Ok(None) => LabResearchDebugBoGuard::empty(submission),
+        Ok(Some(att)) => {
+            if let Ok(mut t) = diag_debug_bo.try_borrow_mut() {
+                *t = att.detail_token();
+            }
+            if write_la_default {
+                let mut partial = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                partial.total_s = t0.elapsed().as_secs_f64();
+                partial.host_prep_s = host_prep_s;
+                partial.hwctx_s = hwctx_s;
+                partial.ran_on_npu = false;
+                partial.status = "lab_partial_debug_bo".to_string();
+                partial.detail = super::silicon_contract::format_lab_partial_detail(&format!(
+                    "{} handle={}",
+                    att.detail_token(),
+                    ctx.handle
+                ));
+                stamp(&mut partial, tiles, &qos, None, None, false, "na", 0, true);
+            }
+            LabResearchDebugBoGuard::new(submission, att.hwctx, att.bo_handle)
+        }
+        Err(e) => {
+            destroy_hwctx_and_owned_bos(submission, &ctx);
+            let mut r = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+            r.total_s = t0.elapsed().as_secs_f64();
+            r.host_prep_s = host_prep_s;
+            r.hwctx_s = hwctx_s;
+            r.status = "debug_bo_failed".to_string();
+            r.detail = format!(
+                "XDNA2_LAB_RESEARCH_DEBUG_BO set but debug-BO attach failed (fail-closed; \
+                 invent_pass=0 not_ran_on_npu=1 debug_bo_alone_not_pass=1): {e}"
+            );
+            if let Ok(mut t) = diag_debug_bo.try_borrow_mut() {
+                *t = format_research_debug_bo_config_detail(
+                    HwctxDbgBufOp::Assign,
+                    ctx.handle,
+                    0,
+                    true,
+                    false,
+                    "lab",
+                );
+            }
+            stamp(
+                &mut r,
+                tiles,
+                &qos,
+                None,
+                None,
+                false,
+                "na",
+                0,
+                write_la_default,
+            );
+            attach_host_ref(&mut r, m, n, k, dtype);
+            return r;
+        }
+    };
+    let _dbg_guard = dbg_guard;
 
     // CRITICAL SAFETY: see exec_cmd_is_enabled() / docs/XDNA2_NEVER_AGAIN.md.
     let try_submit = exec_cmd_is_enabled();
@@ -4802,11 +5725,10 @@ pub fn timed_matmul_direct(
                 };
                 let is_elf = crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(&blob);
                 diag_aiebu = Some(is_elf);
-                if is_elf {
-                    if let Ok(relas) = crate::backends::amd_xdna2::txn::parse_elf32_rela_dyn(&blob)
-                    {
-                        diag_rela_count = Some(relas.len());
-                    }
+                if is_elf
+                    && let Ok(relas) = crate::backends::amd_xdna2::txn::parse_elf32_rela_dyn(&blob)
+                {
+                    diag_rela_count = Some(relas.len());
                 }
                 let stream_len = stream.len() as u64;
                 // XRT: instruction → AMDXDNA_BO_DEV (heap carve), not SHMEM.
@@ -5111,58 +6033,125 @@ pub fn timed_matmul_direct(
             match setup {
                 Ok(ios) => {
                     // IFM/WTS/OFM + optional CTRL paddr (count 3 or 4).
-                    // aiebu ELF: apply .rela.dyn with live paddrs into .ctrltext
-                    // (XRT patch_ctrl_code parity) before EXEC.
-                    if let (Some(h), Some(raw)) = (inst_handle, inst_blob_raw.as_ref()) {
-                        if crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(raw) {
-                            match crate::backends::amd_xdna2::txn::patch_aiebu_elf_ctrltext_with_bos_ex(
-                                raw,
-                                ios.ifm_addr,
-                                ios.wts_addr,
-                                ios.ofm_addr,
-                                ios.ctrl_addr,
-                                rela_mode,
-                            ) {
-                                Ok(patched) => {
-                                    // Zero-pad to BO alloc (page), not START_NPU size field.
-                                    let pad_len = inst_bo_alloc.max(1) as usize;
-                                    let mut padded = vec![0_u8; pad_len];
-                                    let copy_n = patched.len().min(padded.len());
-                                    padded[..copy_n].copy_from_slice(&patched[..copy_n]);
-                                    if let Err(e) = submission.write_bo_bytes(0, h, 0, &padded) {
-                                        super::lab_io::destroy_io_bos(submission, &ios);
-                                        let _ = submission.destroy_buffer(0, h);
-                                        fill_s = Some(fill0.elapsed().as_secs_f64());
-                                        host_prep_s += fill_s.unwrap_or(0.0);
-                                        destroy_hwctx_and_owned_bos(submission, &ctx);
-                                        let mut r = timed_op_base(
-                                            "matmul", m, n, k, dtype, real_ioctl, None,
-                                        );
-                                        r.total_s = t0.elapsed().as_secs_f64();
-                                        r.host_prep_s = host_prep_s;
-                                        r.hwctx_s = hwctx_s;
-                                        r.fill_s = fill_s;
-                                        r.status = "inst_blob_fill_failed".to_string();
-                                        r.detail =
-                                            format!("aiebu ELF rela patch write failed: {e}");
-                                        attach_host_ref(&mut r, m, n, k, dtype);
-                                        stamp(
-                                            &mut r,
-                                            tiles,
-                                            &qos,
-                                            diag_rela_count,
-                                            diag_aiebu,
-                                            diag_ert_error,
-                                            diag_layout,
-                                            diag_kernel_args_len,
-                                            write_la,
-                                        );
-                                        return r;
-                                    }
-                                    // Offline+live: refuse EXEC if classic walk breaks
-                                    // (staged mladf: 1688 B / 40 ops).
-                                    let expect_staged = patched.len() == 1688;
-                                    if let Err(e) = crate::backends::amd_xdna2::txn::validate_patched_ctrltext_classic(
+                    // aiebu ELF: apply .rela.dyn with **in-process** BO paddrs
+                    // into .ctrltext (XRT patch_ctrl_code parity) before EXEC.
+                    // Never default to aged disk last_apply UVAs (W10-B).
+                    if let (Some(h), Some(raw)) = (inst_handle, inst_blob_raw.as_ref())
+                        && crate::backends::amd_xdna2::txn::is_aiebu_elf_ctrltext(raw)
+                    {
+                        // W10-B: optional same-shot plan gate
+                        // (`XDNA2_LAB_SAME_SHOT_RELA=1`). Default off keeps
+                        // existing direct patch. When on, validate in-process
+                        // paddrs via pure plan (refuse zeros/MAX; never disk).
+                        let same_shot_env = crate::backends::amd_xdna2::silicon_contract::lab_same_shot_rela_env_requested();
+                        // Bases for pure-direct rela (in-process BO map only).
+                        // When SAME_SHOT env is set, validate via plan first.
+                        let (io_bases, same_shot_note): ((u64, u64, u64, u64), Option<String>) =
+                            if same_shot_env {
+                                let plan = crate::backends::amd_xdna2::silicon_contract::plan_same_shot_rela_from_io_paddrs(
+                                        ios.ifm_addr,
+                                        ios.wts_addr,
+                                        ios.ofm_addr,
+                                        ios.ctrl_addr,
+                                        true,
+                                    );
+                                // S2: loud same_shot_gate=1 + plan note for last_apply.
+                                let note = crate::backends::amd_xdna2::silicon_contract::format_same_shot_last_apply_detail(
+                                        &plan,
+                                    );
+                                if !plan.apply_ready {
+                                    super::lab_io::destroy_io_bos(submission, &ios);
+                                    let _ = submission.destroy_buffer(0, h);
+                                    fill_s = Some(fill0.elapsed().as_secs_f64());
+                                    host_prep_s += fill_s.unwrap_or(0.0);
+                                    destroy_hwctx_and_owned_bos(submission, &ctx);
+                                    let mut r =
+                                        timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                                    r.total_s = t0.elapsed().as_secs_f64();
+                                    r.host_prep_s = host_prep_s;
+                                    r.hwctx_s = hwctx_s;
+                                    r.fill_s = fill_s;
+                                    r.status = "same_shot_rela_plan_failed".to_string();
+                                    r.detail = format!(
+                                        "XDNA2_LAB_SAME_SHOT_RELA=1 but in-process BO paddrs \
+                                         invalid (never invent; refuse stale disk); {note}"
+                                    );
+                                    r.ran_on_npu = false;
+                                    attach_host_ref(&mut r, m, n, k, dtype);
+                                    stamp(
+                                        &mut r,
+                                        tiles,
+                                        &qos,
+                                        diag_rela_count,
+                                        diag_aiebu,
+                                        diag_ert_error,
+                                        diag_layout,
+                                        diag_kernel_args_len,
+                                        write_la,
+                                    );
+                                    return r;
+                                }
+                                let bases = plan.as_io_tuple().unwrap_or((
+                                    ios.ifm_addr,
+                                    ios.wts_addr,
+                                    ios.ofm_addr,
+                                    ios.ctrl_addr,
+                                ));
+                                (bases, Some(note))
+                            } else {
+                                (
+                                    (ios.ifm_addr, ios.wts_addr, ios.ofm_addr, ios.ctrl_addr),
+                                    None,
+                                )
+                            };
+                        match crate::backends::amd_xdna2::txn::patch_aiebu_elf_ctrltext_with_bos_ex(
+                            raw, io_bases.0, io_bases.1, io_bases.2, io_bases.3, rela_mode,
+                        ) {
+                            Ok(patched) => {
+                                // Zero-pad to BO alloc (page), not START_NPU size field.
+                                let pad_len = inst_bo_alloc.max(1) as usize;
+                                let mut padded = vec![0_u8; pad_len];
+                                let copy_n = patched.len().min(padded.len());
+                                padded[..copy_n].copy_from_slice(&patched[..copy_n]);
+                                if let Err(e) = submission.write_bo_bytes(0, h, 0, &padded) {
+                                    super::lab_io::destroy_io_bos(submission, &ios);
+                                    let _ = submission.destroy_buffer(0, h);
+                                    fill_s = Some(fill0.elapsed().as_secs_f64());
+                                    host_prep_s += fill_s.unwrap_or(0.0);
+                                    destroy_hwctx_and_owned_bos(submission, &ctx);
+                                    let mut r =
+                                        timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                                    r.total_s = t0.elapsed().as_secs_f64();
+                                    r.host_prep_s = host_prep_s;
+                                    r.hwctx_s = hwctx_s;
+                                    r.fill_s = fill_s;
+                                    r.status = "inst_blob_fill_failed".to_string();
+                                    // Gate-on fail arms append same_shot note so
+                                    // last_apply always greps same_shot_gate=.
+                                    let ss = same_shot_note
+                                        .as_deref()
+                                        .map(|n| format!("; {n}"))
+                                        .unwrap_or_default();
+                                    r.detail =
+                                        format!("aiebu ELF rela patch write failed: {e}{ss}");
+                                    attach_host_ref(&mut r, m, n, k, dtype);
+                                    stamp(
+                                        &mut r,
+                                        tiles,
+                                        &qos,
+                                        diag_rela_count,
+                                        diag_aiebu,
+                                        diag_ert_error,
+                                        diag_layout,
+                                        diag_kernel_args_len,
+                                        write_la,
+                                    );
+                                    return r;
+                                }
+                                // Offline+live: refuse EXEC if classic walk breaks
+                                // (staged mladf: 1688 B / 40 ops).
+                                let expect_staged = patched.len() == 1688;
+                                if let Err(e) = crate::backends::amd_xdna2::txn::validate_patched_ctrltext_classic(
                                         &patched,
                                         expect_staged,
                                     ) {
@@ -5179,8 +6168,12 @@ pub fn timed_matmul_direct(
                                         r.hwctx_s = hwctx_s;
                                         r.fill_s = fill_s;
                                         r.status = "inst_blob_load_failed".to_string();
+                                        let ss = same_shot_note
+                                            .as_deref()
+                                            .map(|n| format!("; {n}"))
+                                            .unwrap_or_default();
                                         r.detail = format!(
-                                            "aiebu post-patch classic walk refuse: {e}"
+                                            "aiebu post-patch classic walk refuse: {e}{ss}"
                                         );
                                         attach_host_ref(&mut r, m, n, k, dtype);
                                         stamp(
@@ -5196,74 +6189,81 @@ pub fn timed_matmul_direct(
                                         );
                                         return r;
                                     }
-                                    // START_NPU size: content (default) or BO alloc;
-                                    // content mode clamps to bo_alloc (never advertise
-                                    // DMA longer than written bytes).
-                                    let content_len =
-                                        u32::try_from(patched.len()).unwrap_or(u32::MAX);
-                                    if inst_bo_alloc == 0 {
-                                        inst_bo_alloc = content_len.max(4096);
-                                    }
-                                    let clamped = crate::backends::amd_xdna2::silicon_contract::instr_size_content_clamped(
+                                // START_NPU size: content (default) or BO alloc;
+                                // content mode clamps to bo_alloc (never advertise
+                                // DMA longer than written bytes).
+                                let content_len = u32::try_from(patched.len()).unwrap_or(u32::MAX);
+                                if inst_bo_alloc == 0 {
+                                    inst_bo_alloc = content_len.max(4096);
+                                }
+                                let clamped = crate::backends::amd_xdna2::silicon_contract::instr_size_content_clamped(
                                         content_len,
                                         inst_bo_alloc,
                                         instr_size_mode,
                                     );
-                                    inst_size = crate::backends::amd_xdna2::silicon_contract::resolve_start_npu_inst_size(
+                                inst_size = crate::backends::amd_xdna2::silicon_contract::resolve_start_npu_inst_size(
                                         content_len,
                                         inst_bo_alloc,
                                         instr_size_mode,
                                     );
-                                    let size_note = crate::backends::amd_xdna2::silicon_contract::format_instr_size_detail(
+                                let size_note = crate::backends::amd_xdna2::silicon_contract::format_instr_size_detail(
                                         instr_size_mode,
                                         content_len,
                                         inst_bo_alloc,
                                         inst_size,
                                     );
-                                    let clamp_note = if clamped {
-                                        " content_clamped_to_bo=1"
-                                    } else {
-                                        ""
-                                    };
-                                    aiebu_rela_applied = true;
-                                    blob_note = format!(
-                                        "{blob_note}; aiebu_rela_patched ctrltext={}B \
-                                         rela_mode={} {size_note}{clamp_note}",
-                                        patched.len(),
-                                        rela_mode.as_str(),
-                                    );
-                                }
-                                Err(e) => {
-                                    super::lab_io::destroy_io_bos(submission, &ios);
-                                    let _ = submission.destroy_buffer(0, h);
-                                    fill_s = Some(fill0.elapsed().as_secs_f64());
-                                    host_prep_s += fill_s.unwrap_or(0.0);
-                                    destroy_hwctx_and_owned_bos(submission, &ctx);
-                                    let mut r =
-                                        timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
-                                    r.total_s = t0.elapsed().as_secs_f64();
-                                    r.host_prep_s = host_prep_s;
-                                    r.hwctx_s = hwctx_s;
-                                    r.fill_s = fill_s;
-                                    r.status = "inst_blob_load_failed".to_string();
-                                    r.detail = format!(
-                                        "aiebu ELF rela patch failed (need aiebu-asm ELF, \
-                                         not raw txn): {e}"
-                                    );
-                                    attach_host_ref(&mut r, m, n, k, dtype);
-                                    stamp(
-                                        &mut r,
-                                        tiles,
-                                        &qos,
-                                        diag_rela_count,
-                                        diag_aiebu,
-                                        diag_ert_error,
-                                        diag_layout,
-                                        diag_kernel_args_len,
-                                        write_la,
-                                    );
-                                    return r;
-                                }
+                                let clamp_note = if clamped {
+                                    " content_clamped_to_bo=1"
+                                } else {
+                                    ""
+                                };
+                                aiebu_rela_applied = true;
+                                let same_shot_tok = same_shot_note
+                                    .as_deref()
+                                    .map(|n| format!("; {n}"))
+                                    .unwrap_or_default();
+                                blob_note = format!(
+                                    "{blob_note}; aiebu_rela_patched ctrltext={}B \
+                                         rela_mode={} {size_note}{clamp_note}{same_shot_tok}",
+                                    patched.len(),
+                                    rela_mode.as_str(),
+                                );
+                            }
+                            Err(e) => {
+                                super::lab_io::destroy_io_bos(submission, &ios);
+                                let _ = submission.destroy_buffer(0, h);
+                                fill_s = Some(fill0.elapsed().as_secs_f64());
+                                host_prep_s += fill_s.unwrap_or(0.0);
+                                destroy_hwctx_and_owned_bos(submission, &ctx);
+                                let mut r =
+                                    timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                                r.total_s = t0.elapsed().as_secs_f64();
+                                r.host_prep_s = host_prep_s;
+                                r.hwctx_s = hwctx_s;
+                                r.fill_s = fill_s;
+                                r.status = "inst_blob_load_failed".to_string();
+                                // Gate-on: append same_shot note on patch fail too.
+                                let ss = same_shot_note
+                                    .as_deref()
+                                    .map(|n| format!("; {n}"))
+                                    .unwrap_or_default();
+                                r.detail = format!(
+                                    "aiebu ELF rela patch failed (need aiebu-asm ELF, \
+                                         not raw txn): {e}{ss}"
+                                );
+                                attach_host_ref(&mut r, m, n, k, dtype);
+                                stamp(
+                                    &mut r,
+                                    tiles,
+                                    &qos,
+                                    diag_rela_count,
+                                    diag_aiebu,
+                                    diag_ert_error,
+                                    diag_layout,
+                                    diag_kernel_args_len,
+                                    write_la,
+                                );
+                                return r;
                             }
                         }
                     }
@@ -5465,11 +6465,15 @@ pub fn timed_matmul_direct(
                     }
                     fill_s = Some(fill0.elapsed().as_secs_f64());
                     host_prep_s += fill_s.unwrap_or(0.0);
+                    // O1 P5: pre-EXEC fail — no ERT header read possible.
+                    let post_fail_ert = super::silicon_contract::format_post_fail_ert_detail_tokens(
+                        None, /*read_attempted=*/ false, /*cmd_bo_valid=*/ false,
+                    );
                     (
                         "cmd_bo_fill_failed".to_string(),
                         format!(
                             "refusing EXEC_CMD: host fill of Cmd BO failed (handle={}): {e}. \
-                             Empty Cmd BO is the 2026-07-13 wedge class.",
+                             Empty Cmd BO is the 2026-07-13 wedge class. {post_fail_ert}",
                             handle.0
                         ),
                         false,
@@ -5484,20 +6488,58 @@ pub fn timed_matmul_direct(
                         cmd_bo_handle: Some(handle.0),
                         arg_bo_handles,
                     };
+                    // Progressive last_apply immediately before submit_and_wait so
+                    // outer kill during EXEC/WAIT still leaves pre-submit evidence.
+                    // Kill mid-ioctl can still lose this stage if the process dies
+                    // before the write returns.
+                    if write_la {
+                        let mut partial = timed_op_base("matmul", m, n, k, dtype, real_ioctl, None);
+                        partial.total_s = t0.elapsed().as_secs_f64();
+                        partial.host_prep_s = host_prep_s;
+                        partial.hwctx_s = hwctx_s;
+                        partial.fill_s = fill_s;
+                        partial.ran_on_npu = false;
+                        partial.status =
+                            super::silicon_contract::LAB_PARTIAL_STATUS_PRE_SUBMIT.to_string();
+                        partial.detail = super::silicon_contract::format_lab_partial_detail(
+                            &format!(
+                                "pre_submit handle={} cmd_bo={} timeout_ms={timeout_ms} {blob_note}",
+                                ctx.handle, handle.0
+                            ),
+                        );
+                        stamp(
+                            &mut partial,
+                            tiles,
+                            &qos,
+                            diag_rela_count,
+                            diag_aiebu,
+                            diag_ert_error,
+                            diag_layout,
+                            diag_kernel_args_len,
+                            true,
+                        );
+                    }
                     let d0 = Instant::now();
-                    let sw = submit_and_wait_command(submission, 0, &cmd, timeout_ms);
+                    let sw = submit_and_wait_command_ex(
+                        submission,
+                        0,
+                        &cmd,
+                        timeout_ms,
+                        ctx.syncobj_handle,
+                    );
                     let ds = d0.elapsed().as_secs_f64();
                     submit_wait_s = Some(ds);
                     // Read ERT state **before** GEM_CLOSE of Cmd BO (driver writes
                     // COMPLETED/ERROR into header after FW response).
-                    let ert_state: Option<u32> = submission
-                        .read_bo_bytes_no_sync(0, handle.0, 0, 4)
-                        .ok()
-                        .and_then(|bytes| {
-                            parse_amdxdna_cmd_header_from_bytes(&bytes)
-                                .ok()
-                                .map(|f| f.state)
-                        });
+                    // Local facts for post-fail tokens (do not hard-code at format site).
+                    let cmd_bo_valid_for_ert = true; // handle still open; not destroyed yet
+                    let ert_header_read = submission.read_bo_bytes_no_sync(0, handle.0, 0, 4);
+                    let ert_read_attempted = true; // read issued while BO was valid
+                    let ert_state: Option<u32> = ert_header_read.ok().and_then(|bytes| {
+                        parse_amdxdna_cmd_header_from_bytes(&bytes)
+                            .ok()
+                            .map(|f| f.state)
+                    });
                     let ert_note = ert_state.map_or_else(
                         || "ert_state=unread".to_string(),
                         |s| format!("ert_state={s}({})", ert_cmd_state_name(s)),
@@ -5518,9 +6560,8 @@ pub fn timed_matmul_direct(
                             let mut ofm_allclose_failed = false;
                             let mut ofm_decide_error = false;
                             let mut detail = format!(
-                                "EXEC_CMD+WAIT seq={} timeout_ms={} {ert_note}; {blob_note}; \
-                                 ran_on_npu=false (no numerical verify). Destroying hwctx.",
-                                r.seq, r.timeout_ms
+                                "EXEC_CMD+WAIT seq={} timeout_ms={} wait_path={} {ert_note};                                  {blob_note}; ran_on_npu=false (no numerical verify).                                  Destroying hwctx.",
+                                r.seq, r.timeout_ms, r.wait_path
                             );
                             if lab_ofm {
                                 if let Some(ref ios) = io_set {
@@ -5713,13 +6754,21 @@ pub fn timed_matmul_direct(
                                 let _ = submission.destroy_buffer(0, h);
                             }
                             let st = classify_submit_wait_error(&e);
+                            // O1 P5: greppable post-fail ERT from local read facts
+                            // above (WAIT Err → present|unread only). Research ≠ Pass.
+                            let post_fail_ert =
+                                super::silicon_contract::format_post_fail_ert_detail_tokens(
+                                    ert_state,
+                                    ert_read_attempted,
+                                    cmd_bo_valid_for_ert,
+                                );
                             (
                                 st.to_string(),
                                 format!(
-                                    "hwctx ok (handle={}) Cmd BO host-filled ({blob_note}) but \
-                                     submit_and_wait failed ({st}): {e}. {ofm_note}; \
+                                    "hwctx ok (handle={} syncobj={}) Cmd BO host-filled ({blob_note}) but \
+                                     submit_and_wait failed ({st}): {e}. {post_fail_ert}; {ofm_note}; \
                                      bo_diag=[{bo_diag}]",
-                                    ctx.handle
+                                    ctx.handle, ctx.syncobj_handle
                                 ),
                                 false,
                             )
@@ -5736,9 +6785,13 @@ pub fn timed_matmul_direct(
                 }
                 fill_s = Some(fill0.elapsed().as_secs_f64());
                 host_prep_s += fill_s.unwrap_or(0.0);
+                // O1 P5: CREATE_BO(Cmd) failed — no Cmd BO, no ERT read.
+                let post_fail_ert = super::silicon_contract::format_post_fail_ert_detail_tokens(
+                    None, /*read_attempted=*/ false, /*cmd_bo_valid=*/ false,
+                );
                 (
                     "cmd_bo_failed".to_string(),
-                    format!("CREATE_BO(Cmd) failed after hwctx success: {e}"),
+                    format!("CREATE_BO(Cmd) failed after hwctx success: {e}. {post_fail_ert}"),
                     false,
                 )
             }
@@ -6038,6 +7091,33 @@ pub trait DirectSubmission {
         ))
     }
 
+    /// Assign or remove a firmware debug BO on a hwctx (`CONFIG_HWCTX` +
+    /// `ASSIGN_DBG_BUF` / `REMOVE_DBG_BUF`).
+    ///
+    /// **Research-gated:** refuse unless [`research_debug_bo_config_is_enabled`]
+    /// (`XDNA2_LAB_RESEARCH_DEBUG_BO` set). Default tests leave the env unset so
+    /// this never silently CONFIG_HWCTX. AIE2 value-mode pack via
+    /// [`pack_config_hwctx_dbg_buf_aie2`]. Real issues ioctl; Stub records the
+    /// attempt when the gate is open.
+    ///
+    /// Success **≠** Pass / **≠** `ran_on_npu` / **≠** C-ready. Not EXEC_CMD
+    /// (does not require `XDNA2_ALLOW_EXEC_CMD`). Default: unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Gate closed, zero BO handle, pack/validate failure, or ioctl/driver failure.
+    fn config_hwctx_dbg_buf(
+        &self,
+        _fd: RawFd,
+        _hwctx: u32,
+        _op: HwctxDbgBufOp,
+        _bo_handle: u32,
+    ) -> Result<(), DirectError> {
+        Err(DirectError::Unsupported(
+            "config_hwctx_dbg_buf not implemented for this submission backend".to_string(),
+        ))
+    }
+
     /// Destroy a buffer object.
     fn destroy_buffer(&self, _fd: RawFd, _handle: u32) -> Result<(), DirectError> {
         Err(DirectError::Unsupported(
@@ -6085,6 +7165,32 @@ pub trait DirectSubmission {
         Err(DirectError::Unsupported(
             "wait_command not implemented for this submission backend".to_string(),
         ))
+    }
+
+    /// Wait with optional research syncobj path (env-gated, default off).
+    ///
+    /// Default: WAIT_CMD via [`Self::wait_command`] when env off; Unsupported
+    /// if env selects syncobj without a Real/Stub override. Real issues
+    /// `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`.
+    ///
+    /// # Errors
+    ///
+    /// Research env on + handle 0 → [`DirectError::InvalidArgument`].
+    fn wait_command_with_syncobj(
+        &self,
+        fd: RawFd,
+        hwctx: u32,
+        seq: u64,
+        timeout_ms: u32,
+        syncobj_handle: u32,
+    ) -> Result<(), DirectError> {
+        match choose_lab_wait_path_from_env(syncobj_handle)? {
+            LabWaitPath::WaitCmd => self.wait_command(fd, hwctx, seq, timeout_ms),
+            LabWaitPath::SyncobjTimeline { .. } => Err(DirectError::Unsupported(
+                "wait_command_with_syncobj syncobj path not implemented for this submission backend"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Sync a buffer (direction to/from device).
@@ -6306,6 +7412,8 @@ pub struct StubDirectSubmission {
     next_handle: std::sync::atomic::AtomicU32,
     /// GEM handles closed via [`DirectSubmission::destroy_buffer`] (test observability).
     destroyed_bos: std::sync::Mutex<Vec<u32>>,
+    /// Research DBG_BUF config attempts when gate open (unit observability).
+    dbg_buf_ops: std::sync::Mutex<Vec<StubDbgBufOpRecord>>,
 }
 
 impl Default for StubDirectSubmission {
@@ -6323,6 +7431,7 @@ impl StubDirectSubmission {
             bo_bytes: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_handle: std::sync::atomic::AtomicU32::new(42),
             destroyed_bos: std::sync::Mutex::new(Vec::new()),
+            dbg_buf_ops: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -6330,6 +7439,15 @@ impl StubDirectSubmission {
     #[must_use]
     pub fn destroyed_bo_handles(&self) -> Vec<u32> {
         self.destroyed_bos
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Recorded research DBG_BUF config attempts (unit tests).
+    #[must_use]
+    pub fn dbg_buf_op_records(&self) -> Vec<StubDbgBufOpRecord> {
+        self.dbg_buf_ops
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default()
@@ -6356,12 +7474,17 @@ impl DirectSubmission for StubDirectSubmission {
             map.insert(umq, vec![0u8; 4096]);
             map.insert(log, vec![0u8; 4096]);
         }
+        // Fake syncobj so offline tests prove CREATE records the field (not dropped).
+        let syncobj = self
+            .next_handle
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(HardwareContext {
             handle: 1,
             num_tiles,
             mem_size,
             umq_bo: umq,
             log_buf_bo: log,
+            syncobj_handle: syncobj,
         })
     }
 
@@ -6377,6 +7500,32 @@ impl DirectSubmission for StubDirectSubmission {
     ) -> Result<(), DirectError> {
         // Offline unit path: validate pack only; no ioctl.
         let _ = pack_hwctx_param_config_cu(cu_entries)?;
+        Ok(())
+    }
+
+    fn config_hwctx_dbg_buf(
+        &self,
+        _fd: RawFd,
+        hwctx: u32,
+        op: HwctxDbgBufOp,
+        bo_handle: u32,
+    ) -> Result<(), DirectError> {
+        // Same research gate as Real: refuse when env unset (default tests).
+        if !research_debug_bo_config_is_enabled() {
+            return Err(DirectError::Unsupported(
+                research_debug_bo_config_block_reason().to_string(),
+            ));
+        }
+        // Pack + validate only; record attempt for unit observability (no ioctl).
+        let req = pack_config_hwctx_dbg_buf_aie2(hwctx, op, bo_handle)?;
+        let _ = validate_config_hwctx_dbg_buf_aie2(&req)?;
+        if let Ok(mut v) = self.dbg_buf_ops.lock() {
+            v.push(StubDbgBufOpRecord {
+                hwctx,
+                op,
+                bo_handle,
+            });
+        }
         Ok(())
     }
 
@@ -6448,6 +7597,20 @@ impl DirectSubmission for StubDirectSubmission {
         // Wait is not EXEC_CMD-gated (see trait docs). Same infinite-timeout
         // lab policy as Real. Stub pretends success so unit tests can exercise
         // submit_and_wait gate logic without hardware.
+        check_wait_timeout_or_infinite_opt_in(timeout_ms)?;
+        Ok(())
+    }
+
+    fn wait_command_with_syncobj(
+        &self,
+        _fd: RawFd,
+        _hwctx: u32,
+        _seq: u64,
+        timeout_ms: u32,
+        syncobj_handle: u32,
+    ) -> Result<(), DirectError> {
+        // Research gate only — no real ioctl. Env on + handle 0 fail-closed.
+        let _path = choose_lab_wait_path_from_env(syncobj_handle)?;
         check_wait_timeout_or_infinite_opt_in(timeout_ms)?;
         Ok(())
     }
@@ -6582,6 +7745,9 @@ mod tests {
         );
         assert_eq!(AMDXDNA_DRM_CONFIG_HWCTX_SIZE, 24);
         assert_eq!(DRM_AMDXDNA_HWCTX_CONFIG_CU, 0);
+        // Public amdxdna_accel.h enum order: CONFIG_CU, ASSIGN_DBG_BUF, REMOVE_DBG_BUF.
+        assert_eq!(DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF, 1);
+        assert_eq!(DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF, 2);
         assert_eq!(AMDXDNA_CONFIG_HWCTX_PARAM_VAL_MAX, 4096);
     }
 
@@ -6612,6 +7778,390 @@ mod tests {
     fn pack_hwctx_param_config_cu_refuses_empty() {
         let e = pack_hwctx_param_config_cu(&[]).unwrap_err();
         assert!(e.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn pack_config_hwctx_dbg_buf_aie2_assign_remove_layout() {
+        let assign = pack_config_hwctx_dbg_buf_aie2(7, HwctxDbgBufOp::Assign, 99).expect("assign");
+        assert_eq!(assign.handle, 7);
+        assert_eq!(assign.param_type, DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF);
+        assert_eq!(assign.param_val, 99);
+        assert_eq!(assign.param_val_size, 0);
+        assert_eq!(assign.pad, 0);
+        let parsed = validate_config_hwctx_dbg_buf_aie2(&assign).expect("validate assign");
+        assert_eq!(parsed.hwctx, 7);
+        assert_eq!(parsed.op, HwctxDbgBufOp::Assign);
+        assert_eq!(parsed.bo_handle, 99);
+        assert_eq!(parsed.op.as_str(), "assign");
+
+        let remove = pack_config_hwctx_dbg_buf_aie2(3, HwctxDbgBufOp::Remove, 42).expect("remove");
+        assert_eq!(remove.param_type, DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF);
+        assert_eq!(remove.param_val, 42);
+        let parsed_r = validate_config_hwctx_dbg_buf_aie2(&remove).expect("validate remove");
+        assert_eq!(parsed_r.op, HwctxDbgBufOp::Remove);
+        assert_eq!(parsed_r.bo_handle, 42);
+        assert_eq!(parsed_r.op.as_str(), "remove");
+
+        let detail = format_debug_bo_aie2_pack_detail(&parsed);
+        assert!(detail.contains("op=assign"));
+        assert!(detail.contains("bo_handle=99"));
+        assert!(detail.contains("live_wired=0"));
+        assert!(detail.contains("invent_pass=0"));
+        assert!(detail.contains("research_only=1"));
+        assert!(!detail.contains("invent_pass=1"));
+    }
+
+    #[test]
+    fn pack_config_hwctx_dbg_buf_aie2_refuses_zero_bo() {
+        let e = pack_config_hwctx_dbg_buf_aie2(1, HwctxDbgBufOp::Assign, 0).unwrap_err();
+        assert!(e.to_string().contains("bo_handle=0"));
+    }
+
+    #[test]
+    fn validate_config_hwctx_dbg_buf_aie2_refuses_bad_layout() {
+        // CONFIG_CU param_type is not a debug-BO op.
+        let cu = amdxdna_drm_config_hwctx {
+            handle: 1,
+            param_type: DRM_AMDXDNA_HWCTX_CONFIG_CU,
+            param_val: 5,
+            param_val_size: 0,
+            pad: 0,
+        };
+        assert!(validate_config_hwctx_dbg_buf_aie2(&cu).is_err());
+
+        // Non-zero size (pointer mode) refused for AIE2 value path.
+        let sized = amdxdna_drm_config_hwctx {
+            handle: 1,
+            param_type: DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
+            param_val: 5,
+            param_val_size: 8,
+            pad: 0,
+        };
+        let e = validate_config_hwctx_dbg_buf_aie2(&sized).unwrap_err();
+        assert!(e.to_string().contains("param_val_size"));
+
+        // Non-zero pad refused.
+        let pad = amdxdna_drm_config_hwctx {
+            handle: 1,
+            param_type: DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
+            param_val: 5,
+            param_val_size: 0,
+            pad: 1,
+        };
+        assert!(validate_config_hwctx_dbg_buf_aie2(&pad).is_err());
+
+        // BO handle above u32 range refused.
+        let wide = amdxdna_drm_config_hwctx {
+            handle: 1,
+            param_type: DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF,
+            param_val: u64::from(u32::MAX) + 1,
+            param_val_size: 0,
+            pad: 0,
+        };
+        assert!(validate_config_hwctx_dbg_buf_aie2(&wide).is_err());
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn lab_research_debug_bo_env_is_intent_only() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_RESEARCH_DEBUG_BO);
+        // SAFETY: held under lab_pdi_env_test_lock (serializes env mutation).
+        unsafe {
+            std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO);
+        }
+        assert!(!lab_research_debug_bo_env_requested());
+        assert!(!research_debug_bo_config_is_enabled());
+        unsafe {
+            std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, "1");
+        }
+        assert!(lab_research_debug_bo_env_requested());
+        assert!(research_debug_bo_config_is_enabled());
+        // restore
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, v),
+                None => std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn config_hwctx_dbg_buf_refuses_when_research_env_unset() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_RESEARCH_DEBUG_BO);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO);
+        }
+        assert!(!research_debug_bo_config_is_enabled());
+        let stub = StubDirectSubmission::new(-1);
+        let err = stub
+            .config_hwctx_dbg_buf(0, 1, HwctxDbgBufOp::Assign, 99)
+            .expect_err("gate closed");
+        match err {
+            DirectError::Unsupported(msg) => {
+                assert_eq!(msg, research_debug_bo_config_block_reason());
+                assert!(msg.contains("XDNA2_LAB_RESEARCH_DEBUG_BO"));
+            }
+            other => panic!("expected Unsupported gate refuse, got {other:?}"),
+        }
+        assert_eq!(stub.dbg_buf_op_records(), [] as [StubDbgBufOpRecord; 0]);
+        // Real path with fake fd must refuse the same way (no ioctl without gate).
+        let real = RealDirectSubmission::new(-1);
+        let err_r = real
+            .config_hwctx_dbg_buf(0, 1, HwctxDbgBufOp::Assign, 99)
+            .expect_err("real gate closed");
+        match err_r {
+            DirectError::Unsupported(msg) => {
+                assert_eq!(msg, research_debug_bo_config_block_reason());
+            }
+            other => panic!("expected Unsupported gate refuse, got {other:?}"),
+        }
+        let detail = format_research_debug_bo_config_detail(
+            HwctxDbgBufOp::Assign,
+            1,
+            99,
+            false,
+            false,
+            "refused",
+        );
+        assert!(detail.contains("invent_pass=0"));
+        assert!(detail.contains("not_c_ready=1"));
+        assert!(detail.contains("not_ran_on_npu=1"));
+        assert!(detail.contains("debug_bo_alone_not_pass=1"));
+        assert!(detail.contains("gate_open=0"));
+        assert!(detail.contains("path=refused"));
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, v),
+                None => std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn config_hwctx_dbg_buf_stub_records_when_research_env_set() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_RESEARCH_DEBUG_BO);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, "1");
+        }
+        assert!(research_debug_bo_config_is_enabled());
+        let stub = StubDirectSubmission::new(-1);
+        stub.config_hwctx_dbg_buf(0, 7, HwctxDbgBufOp::Assign, 55)
+            .expect("stub assign under gate");
+        stub.config_hwctx_dbg_buf(0, 7, HwctxDbgBufOp::Remove, 55)
+            .expect("stub remove under gate");
+        let rec = stub.dbg_buf_op_records();
+        assert_eq!(rec.len(), 2);
+        assert_eq!(
+            rec[0],
+            StubDbgBufOpRecord {
+                hwctx: 7,
+                op: HwctxDbgBufOp::Assign,
+                bo_handle: 55,
+            }
+        );
+        assert_eq!(rec[1].op, HwctxDbgBufOp::Remove);
+        // Zero BO still fail-closed even when gate open.
+        let z = stub.config_hwctx_dbg_buf(0, 1, HwctxDbgBufOp::Assign, 0);
+        assert!(z.is_err());
+        assert_eq!(stub.dbg_buf_op_records().len(), 2);
+        let detail = format_research_debug_bo_config_detail(
+            HwctxDbgBufOp::Assign,
+            7,
+            55,
+            true,
+            true,
+            "stub",
+        );
+        assert!(detail.contains("gate_open=1"));
+        assert!(detail.contains("attempt_ok=1"));
+        assert!(detail.contains("path=stub"));
+        assert!(detail.contains("invent_pass=0"));
+        assert!(!detail.contains("invent_pass=1"));
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, v),
+                None => std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_lab_attach_research_debug_bo_unset_is_none() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_RESEARCH_DEBUG_BO);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO);
+        }
+        let stub = StubDirectSubmission::new(-1);
+        let r = try_lab_attach_research_debug_bo_from_env(&stub, 0, 1).expect("ok");
+        assert!(r.is_none(), "env unset must not create/assign debug BO");
+        assert!(
+            stub.dbg_buf_op_records().is_empty(),
+            "env unset → no assign recorded"
+        );
+        // timed_matmul default path also must not touch DBG_BUF.
+        let tr = timed_matmul_direct(&stub, 1, 1, 1, "f32");
+        assert!(
+            stub.dbg_buf_op_records().is_empty(),
+            "timed_matmul without research env must not assign debug BO"
+        );
+        assert!(!tr.detail.contains("debug_bo_config"));
+        assert!(!tr.ran_on_npu);
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, v),
+                None => std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_lab_attach_research_debug_bo_stub_records_assign() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_RESEARCH_DEBUG_BO);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, "1");
+        }
+        assert!(research_debug_bo_config_is_enabled());
+        let stub = StubDirectSubmission::new(-1);
+        let att = try_lab_attach_research_debug_bo_from_env(&stub, 0, 9)
+            .expect("attach ok")
+            .expect("some when gate open");
+        assert_eq!(att.hwctx, 9);
+        assert_eq!(att.size_bytes, LAB_RESEARCH_DEBUG_BO_SIZE_BYTES);
+        assert_eq!(att.bo_type, LAB_RESEARCH_DEBUG_BO_TYPE);
+        assert_eq!(att.bo_type, BufferType::Dev);
+        assert_ne!(att.bo_handle, 0);
+        let rec = stub.dbg_buf_op_records();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].op, HwctxDbgBufOp::Assign);
+        assert_eq!(rec[0].hwctx, 9);
+        assert_eq!(rec[0].bo_handle, att.bo_handle);
+        let tok = att.detail_token();
+        assert!(tok.contains("invent_pass=0"));
+        assert!(tok.contains("not_c_ready=1"));
+        assert!(tok.contains("not_ran_on_npu=1"));
+        assert!(tok.contains("debug_bo_alone_not_pass=1"));
+        assert!(tok.contains("path=lab"));
+        assert!(tok.contains("lab_debug_bo_attach=1"));
+        assert!(tok.contains(&format!("debug_bo_size={LAB_RESEARCH_DEBUG_BO_SIZE_BYTES}")));
+        assert!(
+            tok.contains("debug_bo_ty=dev"),
+            "post-48da6e60 recipe must record Dev type: {tok}"
+        );
+        assert!(
+            !tok.contains("debug_bo_ty=shmem"),
+            "Shmem is the spent failed recipe: {tok}"
+        );
+        // Guard: Remove + destroy on drop.
+        {
+            let _g = LabResearchDebugBoGuard::new(&stub, att.hwctx, att.bo_handle);
+        }
+        let rec2 = stub.dbg_buf_op_records();
+        assert_eq!(rec2.len(), 2);
+        assert_eq!(rec2[1].op, HwctxDbgBufOp::Remove);
+        assert_eq!(rec2[1].bo_handle, att.bo_handle);
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, v),
+                None => std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO),
+            }
+        }
+    }
+
+    #[test]
+    fn lab_research_debug_bo_create_recipe_is_dev_page() {
+        // Offline fix after live 48da6e60: Shmem failed driver type filter.
+        let (ty, size) = lab_research_debug_bo_create_recipe();
+        assert_eq!(ty, BufferType::Dev);
+        assert_eq!(ty, LAB_RESEARCH_DEBUG_BO_TYPE);
+        assert_eq!(size, 4096);
+        assert_eq!(size, LAB_RESEARCH_DEBUG_BO_SIZE_BYTES);
+        assert_eq!(lab_research_debug_bo_type_token(BufferType::Dev), "dev");
+        assert_eq!(lab_research_debug_bo_type_token(BufferType::Shmem), "shmem");
+        // Spent live recipe (do not re-use under CONSUMED unlock): Shmem+4096.
+        assert_ne!(
+            LAB_RESEARCH_DEBUG_BO_TYPE,
+            BufferType::Shmem,
+            "driver aie2_hwctx_cfg_debug_bo requires AMDXDNA_BO_DEV"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn timed_matmul_lab_research_debug_bo_records_assign_on_stub() {
+        let _guard = lab_pdi_env_test_lock();
+        let prev = std::env::var_os(ENV_LAB_RESEARCH_DEBUG_BO);
+        // SAFETY: held under lab_pdi_env_test_lock.
+        unsafe {
+            std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, "1");
+        }
+        let stub = StubDirectSubmission::new(-1);
+        let r = timed_matmul_direct(&stub, 1, 1, 1, "f32");
+        assert!(
+            !r.ran_on_npu,
+            "debug-BO attach must never invent ran_on_npu"
+        );
+        assert!(
+            r.detail.contains("debug_bo_config") || r.detail.contains("lab_debug_bo_attach=1"),
+            "detail must carry research debug-BO tokens: {}",
+            r.detail
+        );
+        assert!(r.detail.contains("invent_pass=0"));
+        assert!(!r.detail.contains("invent_pass=1"));
+        let rec = stub.dbg_buf_op_records();
+        // Assign during path + Remove on guard drop at end of timed_matmul.
+        assert!(
+            rec.iter().any(|x| x.op == HwctxDbgBufOp::Assign),
+            "timed path must record Assign when research env set: {rec:?}"
+        );
+        assert!(
+            rec.iter().any(|x| x.op == HwctxDbgBufOp::Remove),
+            "guard drop must record Remove: {rec:?}"
+        );
+        // SAFETY: restore under same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_LAB_RESEARCH_DEBUG_BO, v),
+                None => std::env::remove_var(ENV_LAB_RESEARCH_DEBUG_BO),
+            }
+        }
+    }
+
+    #[test]
+    fn lab_research_debug_bo_attach_detail_token_honesty() {
+        let a = LabResearchDebugBoAttach {
+            bo_handle: 42,
+            size_bytes: LAB_RESEARCH_DEBUG_BO_SIZE_BYTES,
+            bo_type: LAB_RESEARCH_DEBUG_BO_TYPE,
+            hwctx: 3,
+        };
+        let t = a.detail_token();
+        assert!(t.contains("invent_pass=0"));
+        assert!(t.contains("not_c_ready=1"));
+        assert!(t.contains("not_ran_on_npu=1"));
+        assert!(t.contains("debug_bo_alone_not_pass=1"));
+        assert!(t.contains("path=lab"));
+        assert!(t.contains("lab_debug_bo_attach=1"));
+        assert!(t.contains("debug_bo_ty=dev"));
+        assert!(t.contains(&format!("debug_bo_size={LAB_RESEARCH_DEBUG_BO_SIZE_BYTES}")));
+        assert!(!t.contains("invent_pass=1"));
+        assert!(!t.contains("debug_bo_ty=shmem"));
     }
 
     #[test]
@@ -6722,6 +8272,28 @@ mod tests {
 
         assert_eq!(ctx.num_tiles, 4);
         assert_eq!(ctx.mem_size, 1024 * 1024);
+    }
+
+    /// P1 offline: CREATE_HWCTX `syncobj_handle` is retained on `HardwareContext`
+    /// (was log-only then discarded). No live wait-path change; invent_pass=0.
+    #[test]
+    fn create_hwctx_records_syncobj_handle_in_context() {
+        let stub = StubDirectSubmission::new(-1);
+        let ctx = stub
+            .create_hwctx(0, 4, 1024, None)
+            .expect("stub create_hwctx");
+        // Stub allocates a non-zero fake syncobj so the field is not silently zeroed.
+        assert_ne!(
+            ctx.syncobj_handle, 0,
+            "CREATE must record syncobj_handle on HardwareContext"
+        );
+        assert_ne!(ctx.umq_bo, 0);
+        assert_ne!(ctx.log_buf_bo, 0);
+        // Distinct from UMQ/log handles.
+        assert_ne!(ctx.syncobj_handle, ctx.umq_bo);
+        assert_ne!(ctx.syncobj_handle, ctx.log_buf_bo);
+        // Structural: field is part of the public context surface.
+        let _ = ctx.syncobj_handle;
     }
 
     #[test]
@@ -7476,13 +9048,14 @@ mod tests {
         assert_eq!(classify_submit_wait_error(&perm), "exec_cmd_perm");
         let to = DirectError::IoctlFailed("WAIT_CMD etimedout".into());
         assert_eq!(classify_submit_wait_error(&to), "wait_timeout");
-        // payload / txn / EINVAL class
+        // payload / txn class (not bare EINVAL — that is wait_cmd_einval below)
         let pay = DirectError::InvalidArgument("payload txn not implemented".into());
         assert_eq!(classify_submit_wait_error(&pay), "payload_unsupported");
+        // Bare EINVAL on the submit/wait path is wait_cmd_einval (honest residual).
         let einval =
             DirectError::IoctlFailed("ioctl failed: Invalid argument (os error 22)".into());
-        assert_eq!(classify_submit_wait_error(&einval), "payload_unsupported");
-        // priority: timeout wins over eio-looking text when both present
+        assert_eq!(classify_submit_wait_error(&einval), "wait_cmd_einval");
+        // priority: true timeout wins over eio-looking text when both present
         let to_first = DirectError::IoctlFailed("timeout after map_host eio".into());
         assert_eq!(classify_submit_wait_error(&to_first), "wait_timeout");
         // priority: eperm before eio
@@ -7491,6 +9064,51 @@ mod tests {
         // generic fallback
         let other = DirectError::IoctlFailed("unexpected firmware reject 0xdead".into());
         assert_eq!(classify_submit_wait_error(&other), "submit_wait_failed");
+    }
+
+    /// T3 honesty: live WAIT_CMD always embeds `timeout_ms=N` in the error string.
+    /// That field name must **not** force `wait_timeout` when the real errno is EINVAL.
+    #[test]
+    fn classify_submit_wait_error_live_wait_einval_not_timeout() {
+        // Live-shaped (2026-08-10 stock CONFIG_CU under C_UNLOCK=11bc9016):
+        // submit_wait_s≈0, os error 22 — not a real 5s wait timeout.
+        let live = DirectError::IoctlFailed(
+            "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000, request=0xc0106449): \
+             Invalid argument (os error 22)"
+                .into(),
+        );
+        assert_eq!(
+            classify_submit_wait_error(&live),
+            "wait_cmd_einval",
+            "timeout_ms= field must not steal EINVAL into wait_timeout"
+        );
+
+        // True timeouts still wait_timeout (tokens, not only the field name).
+        let etimedout = DirectError::IoctlFailed(
+            "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000): etimedout".into(),
+        );
+        assert_eq!(classify_submit_wait_error(&etimedout), "wait_timeout");
+        let timed_out = DirectError::IoctlFailed(
+            "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000): Connection timed out".into(),
+        );
+        assert_eq!(classify_submit_wait_error(&timed_out), "wait_timeout");
+        let etime = DirectError::IoctlFailed("WAIT_CMD ETIME after budget".into());
+        assert_eq!(classify_submit_wait_error(&etime), "wait_timeout");
+        let bare_timeout = DirectError::IoctlFailed("WAIT_CMD timeout".into());
+        assert_eq!(classify_submit_wait_error(&bare_timeout), "wait_timeout");
+
+        // Only the field name timeout_ms=… and no real timeout/einval signal →
+        // must not force wait_timeout (generic submit_wait_failed is OK).
+        let field_only = DirectError::IoctlFailed(
+            "WAIT_CMD failed (hwctx=1, seq=0, timeout_ms=5000, request=0xc0106449): \
+             unexpected firmware reject 0xdead"
+                .into(),
+        );
+        assert_eq!(
+            classify_submit_wait_error(&field_only),
+            "submit_wait_failed",
+            "timeout_ms= alone must not classify as wait_timeout"
+        );
     }
 
     #[test]
@@ -7756,6 +9374,7 @@ mod tests {
                 r.status == "payload_unsupported"
                     || r.status == "submit_wait_failed"
                     || r.status == "wait_timeout"
+                    || r.status == "wait_cmd_einval"
                     || r.status == "exec_cmd_perm"
                     || r.status == "ok_submit_wait_envelope"
                     || r.status == "ok_submit_wait_with_inst_blob"
@@ -7775,7 +9394,7 @@ mod tests {
                 r.detail
             );
         }
-        assert!(!r.status.is_empty());
+        assert_ne!(r.status, "");
         let v = r.to_json_value();
         assert_eq!(v["schema_version"], crate::TIMED_OP_JSON_SCHEMA_VERSION);
         assert_eq!(v["op"], "matmul");
@@ -8175,6 +9794,130 @@ mod tests {
         let stub = StubDirectSubmission::new(-1);
         let payload = build_ert_start_npu_cmd_bo(0, 0, &[], 0x1).expect("envelope");
         fill_cmd_bo_with_payload(&stub, 0, 42, &payload).expect("stub fill");
+    }
+
+    /// Serialize research wait-env mutations (parallel lib tests).
+    fn lab_wait_via_syncobj_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn choose_lab_wait_path_env_gate_and_handle() {
+        // Default off → WAIT_CMD for any handle.
+        assert_eq!(choose_lab_wait_path(None, 0).unwrap(), LabWaitPath::WaitCmd);
+        assert_eq!(choose_lab_wait_path(None, 7).unwrap(), LabWaitPath::WaitCmd);
+        assert_eq!(
+            choose_lab_wait_path(Some("0"), 9).unwrap(),
+            LabWaitPath::WaitCmd
+        );
+        // Research on + handle 0 → fail-closed.
+        let err = choose_lab_wait_path(Some("1"), 0).unwrap_err();
+        assert!(
+            matches!(err, DirectError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        let s = err.to_string();
+        assert!(
+            s.contains("syncobj_handle") || s.contains("wait_path=syncobj"),
+            "err={s}"
+        );
+        assert!(s.contains("invent_pass=0"), "err={s}");
+        // Research on + non-zero → syncobj path.
+        assert_eq!(
+            choose_lab_wait_path(Some("true"), 3).unwrap(),
+            LabWaitPath::SyncobjTimeline { handle: 3 }
+        );
+        assert_eq!(LabWaitPath::WaitCmd.wait_path_token(), "wait_cmd");
+        assert_eq!(
+            LabWaitPath::SyncobjTimeline { handle: 1 }.wait_path_token(),
+            "syncobj"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn stub_wait_command_with_syncobj_env_gate_no_hw() {
+        let _guard = lab_wait_via_syncobj_env_lock();
+        // Env unset: WAIT_CMD path succeeds on stub without EXEC_CMD.
+        let prev = std::env::var_os("XDNA2_LAB_WAIT_VIA_SYNCOBJ");
+        // SAFETY: test-only env isolation; restored in finally-style below.
+        unsafe {
+            std::env::remove_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ");
+        }
+        let stub = StubDirectSubmission::new(-1);
+        stub.wait_command_with_syncobj(0, 1, 0, 100, 0)
+            .expect("default wait_cmd path");
+        stub.wait_command_with_syncobj(0, 1, 0, 100, 5)
+            .expect("env off ignores non-zero handle");
+        // Env on + handle 0 fail-closed.
+        unsafe {
+            std::env::set_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ", "1");
+        }
+        let err = stub.wait_command_with_syncobj(0, 1, 0, 100, 0).unwrap_err();
+        assert!(matches!(err, DirectError::InvalidArgument(_)), "{err:?}");
+        // Env on + handle ≠ 0 succeeds on stub (no ioctl).
+        stub.wait_command_with_syncobj(0, 1, 7, 100, 9)
+            .expect("stub syncobj path");
+        // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ", v),
+                None => std::env::remove_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ"),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn real_wait_command_with_syncobj_fake_fd_not_exec_gated() {
+        let _guard = lab_wait_via_syncobj_env_lock();
+        // Fake fd: research path may IoctlFailed; must not use EXEC_CMD gate message.
+        assert!(!exec_cmd_is_enabled());
+        let prev = std::env::var_os("XDNA2_LAB_WAIT_VIA_SYNCOBJ");
+        unsafe {
+            std::env::set_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ", "1");
+        }
+        let real = RealDirectSubmission::new(42);
+        let result = real.wait_command_with_syncobj(0, 1, 99, 10, 7);
+        match &result {
+            Ok(()) => {}
+            Err(DirectError::IoctlFailed(s)) => {
+                assert!(
+                    s.contains("wait_path=syncobj") || s.contains("SYNCOBJ"),
+                    "err={s}"
+                );
+            }
+            Err(DirectError::Unsupported(msg)) => {
+                assert!(
+                    !msg.contains("EXEC_CMD disabled")
+                        && !msg.contains("XDNA2_ALLOW_EXEC_CMD")
+                        && msg.as_str() != exec_cmd_block_reason(),
+                    "wait must not use EXEC_CMD gate message: {msg}"
+                );
+            }
+            Err(other) => {
+                let s = other.to_string();
+                assert_ne!(s, exec_cmd_block_reason());
+            }
+        }
+        // Env on + handle 0 → research InvalidArgument (no ioctl).
+        let err0 = real.wait_command_with_syncobj(0, 1, 0, 10, 0).unwrap_err();
+        assert!(matches!(err0, DirectError::InvalidArgument(_)), "{err0:?}");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ", v),
+                None => std::env::remove_var("XDNA2_LAB_WAIT_VIA_SYNCOBJ"),
+            }
+        }
+    }
+
+    #[test]
+    fn drm_syncobj_timeline_wait_struct_and_ioctl_layout() {
+        assert_eq!(core::mem::size_of::<drm_syncobj_timeline_wait>(), 48);
+        assert_eq!(ioctl::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xc030_64ca);
     }
 
     #[test]

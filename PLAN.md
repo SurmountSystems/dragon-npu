@@ -1,4 +1,18 @@
-# DragonNPU Rust Rewrite Plan
+## Development status (2026-10-12)
+
+This product is Earth Dragon NPU. The package and the command are `earth-dragon-npu`. The library crate is `earth_dragon_npu`.
+
+The Rust minimum for this crate is 1.99. `cargo update` and `cargo audit` were run on the stable 1.99 toolchain. The audit loaded 1307 security advisories from the RustSec database, scanned Cargo.lock (159 crate dependencies), and exited 0. No advisory warning remained. The earlier anymap2 advisory (RUSTSEC-2026-0319) closed because tract-onnx is now 0.23.8 and that line no longer pulls in liquid or anymap2. That was an upgrade. It was not an audit ignore.
+
+Product Pass is still no. invent_pass stays 0. ran_on_npu stays false. The first unlock line remains `2c9c12e8` consumed. Do not mint a new unlock. Do not reopen a consumed one.
+
+An IRON catalog child PASS is an external runner. It is not `decide_ran_on_npu`. That function, in `src/backends/amd_xdna2/numerical.rs`, is a pure check. It returns true only when the host golden and the device buffer are both non-empty, the host golden is not all zeros, the caller recorded a real gated submit-and-wait, an instruction blob was present, the path was a real ioctl, and the float values match within the relative and absolute tolerances. A length mismatch, a NaN, or an infinity fails the match. The function does not open a device and does not submit work. `XDNA2_LAB_ALLOW_ZERO_GOLDEN` does not override the all-zero golden refusal.
+
+`testdata/xdna2_cmd/external_known_good/` holds research peels (300, 660, 2592, and 4512 bytes). Those peels are not a load-accepted lab matmul. The 1688-byte file `testdata/xdna2_cmd/silicon_lab/lab_instr.bin` is the unpatched lab body.
+
+The hardware outcome still open is one matmul this crate submits, the device finishes, and the output matches `decide_ran_on_npu`.
+
+# Earth Dragon NPU Rust Rewrite Plan
 
 ## Latest (docs — plain language + no empty implement loops)
 
@@ -1900,7 +1914,7 @@ Latest Turn: Enhanced `OnnxModelLoader` to also extract graph-level inputs/outpu
 
 ## Overview
 
-This document outlines the strategy for rewriting the DragonNPU framework as a production-quality pure Rust library (Python code in `dragon_npu/` is kept only as reference for API parity and behavior; there are no Python bindings or Nix support). The Python implementation remains intact and is never deleted. The Rust version (`dragon-npu` crate) will be a drop-in capable library-first implementation supporting the same core capabilities: NPU status checking, model compilation for various backends (AMD XDNA, simulation, etc.), inference execution, error handling, and CLI.
+This document outlines the strategy for rewriting Earth Dragon NPU as a production-quality pure Rust library (Python code in `dragon_npu/` is kept only as reference for API parity and behavior; there are no Python bindings or Nix support). The Python implementation remains intact and is never deleted. The Rust package is `earth-dragon-npu`. The library crate is `earth_dragon_npu`. It is a library-first implementation supporting the same core capabilities: NPU status checking, model compilation for various backends (AMD XDNA, simulation, etc.), inference execution, error handling, and a command.
 
 The rewrite follows an **incremental TDD (Test-Driven Development)** approach. We prioritize:
 - Writing tests *before* implementation.
@@ -1912,7 +1926,7 @@ All work happens on the `rust` branch. The original Python docs are preserved in
 
 ## Strategy
 
-- **Library-first**: The crate is `[[lib]]` only initially. No `[[bin]]` until core is solid. Later we can add `dragon-npu` CLI binary. (Edition 2024, no pinned rust-version.)
+- **Library-first**: The crate is `[[lib]]` only initially. No `[[bin]]` until core is solid. The command is `earth-dragon-npu`. (Edition 2024, no pinned rust-version.)
 - **Incremental**: Small, verifiable steps. Each phase ends with passing `cargo test` + clean `cargo clippy -- -D warnings`.
 - **Reference, Don't Copy Blindly**: Study `dragon_npu/dragon_npu_core.py`, `dragon_npu/dragon_npu_compiler.py`, `dragon_npu/backends/amd_xdna_backend.py`, etc., to match public API surface (e.g., `status()`, `compile_model()`, `run()`).
 - **Production Ready**: 

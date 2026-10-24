@@ -40,17 +40,46 @@ INSTALL_SRC=""
 INSTALL_NAME=""
 VALIDATE_PATH=""
 
-# Basenames that loaders refuse as "external known-good" (local oracles).
+# Basenames that loaders refuse as "external known-good" (local oracles + VE2).
+# Return 0 = refuse. Applied to source and install NAME.
 refuse_basename() {
-  local b
+  local b bl
   b="$(basename "$1")"
   case "$b" in
     instr_post_patch.bin|instr_vendor_post_patch.bin|ctrl_post_patch.bin|\
-    instr_raw_txn.bin|instr_vendor_txn_bin.bin|lab_instr.bin|lab_instr.elf)
+    instr_raw_txn.bin|instr_vendor_txn_bin.bin|lab_instr.bin|lab_instr.elf|\
+    validate.xclbin)
+      return 0
+      ;;
+  esac
+  bl="$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')"
+  case "$bl" in
+    *ve2*|*not_aie2*)
       return 0
       ;;
   esac
   return 1
+}
+
+# Install NAME must be a single safe path component (no traversal / absolute).
+# Return 0 = safe. Fail-closed for empty, slash, backslash, . / .. / leading -.
+safe_install_name() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    return 1
+  fi
+  # Single component only: no absolute, no relative escape, no separators.
+  if [[ "$name" == /* || "$name" == *'/'* || "$name" == *'\'* ]]; then
+    return 1
+  fi
+  if [[ "$name" == "." || "$name" == ".." || "$name" == *..* ]]; then
+    return 1
+  fi
+  # Allow plain basenames only (start alnum; then alnum . _ -).
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    return 1
+  fi
+  return 0
 }
 
 bag_bins() {
@@ -74,30 +103,34 @@ Goal: one non-empty post-patch ctrltext file under
 plus PROVENANCE capture table filled. Research only — not Pass.
 
 Steps:
-  1) Baseline: exec_cmd_allow must be 0/N when idle
-       cat /sys/module/amdxdna/parameters/exec_cmd_allow
-  2) Open execute-allow ONLY for a known-working public path (Ryzen AI / XRT /
-     DynamicDispatch / eepy VitisAI that actually hits the NPU). Restore to 0
-     immediately after.
-  3) Capture the instruction image that went to the instr BO after host
+  1) Unlock / privilege: parse first C_UNLOCK= in RESIDUAL.md (active only if
+     that line has no CONSUMED). On this stock host exec_cmd_allow is often
+     missing — stock config-cu-run needs no sudo L3. Hardened hosts only:
+     baseline allow=0/N when idle; temporary flip only for a known-working
+     public stack, then restore immediately.
+       cat /sys/module/amdxdna/parameters/exec_cmd_allow  # may be missing
+  2) Capture the instruction image that went to the instr BO after host
      peel/patch (ctrltext), or aiebu ELF and document the peel.
-  4) Install into the capture dir with a clear name:
-       bash tools/operator_external_capture.sh --install /path/to/captured.bin working_stack_ctrltext.bin
-  5) Edit PROVENANCE capture table (date, source stack, sha256, CONFIG_CU?).
-  6) Soft compare:
+  3) Install into the capture dir (single-component name only):
+       bash tools/pass_unblock_once.sh --ingest /path/to/captured.bin
+       # or: bash tools/operator_external_capture.sh --install … working_stack_ctrltext.bin
+  4) Edit PROVENANCE capture table (date, source stack, sha256, CONFIG_CU?).
+  5) Soft compare:
        bash tools/operator_external_capture.sh --compare
-  7) Paste output to the agent. Match ≠ residual closed ≠ Pass.
+  6) Paste output to the agent. Match ≠ residual closed ≠ Pass.
 
-Refuse as external known-good (local oracles):
+Refuse as external known-good (local oracles / wrong platform):
   instr_post_patch.bin, instr_vendor_post_patch.bin, ctrl_post_patch.bin,
-  instr_raw_txn.bin, instr_vendor_txn_bin.bin, lab_instr.bin/.elf
+  instr_raw_txn.bin, instr_vendor_txn_bin.bin, lab_instr.bin/.elf,
+  validate.xclbin, *ve2*, *NOT_AIE2*; install NAME with / or ..
 
 Related path A (CONFIG_CU machinery, offline):
   bash tools/dump_xclbin_pdi.sh --print-env
-  # then lab apply with XDNA2_LAB_PDI_BLOB set (needs new C_UNLOCK + L3 sandwich)
+  # live needs active C_UNLOCK in RESIDUAL.md + stock config-cu-run (no sudo
+  # on stock host). Do not invent unlock or Pass.
 
-Unlock C_UNLOCK=b17b0119 is CONSUMED. Further live apply needs a new unlock
-after a real path delta — do not reopen under the old stamp.
+Unlock SSoT: first C_UNLOCK= line in RESIDUAL.md (currently all CONSUMED —
+2ae69036 flexml, 97f38307, 11bc9016, 3a70fabf, b17b0119). Do not reopen.
 EOF
 }
 
@@ -163,14 +196,8 @@ validate_one() {
     return 2
   fi
   if refuse_basename "$p"; then
-    echo "ERROR: refused basename (local oracle): $(basename "$p")" >&2
-    echo "  pick a name like working_stack_ctrltext.bin" >&2
-    return 2
-  fi
-  local b
-  b=$(basename "$p")
-  if [[ "$b" == *ve2* || "$b" == *NOT_AIE2* ]]; then
-    echo "ERROR: VE2 / NOT_AIE2 name refused as AIE2 known-good" >&2
+    echo "ERROR: refused basename (local oracle / wrong platform): $(basename "$p")" >&2
+    echo "  pick a name like working_stack_ctrltext.bin (not validate.xclbin / ve2 / post_patch)" >&2
     return 2
   fi
   echo "VALIDATE_OK path=$p bytes=$(wc -c <"$p" | tr -d ' ') sha256=$(sha256sum "$p" | awk '{print $1}')"
@@ -182,16 +209,35 @@ install_one() {
   local src="$1"
   local name="${2:-working_stack_ctrltext.bin}"
   validate_one "$src" || return $?
+  if ! safe_install_name "$name"; then
+    echo "ERROR: install NAME must be a single safe path component (no / \\ ..): $name" >&2
+    return 2
+  fi
   if refuse_basename "$name"; then
     echo "ERROR: install basename refused: $name" >&2
     return 2
   fi
   mkdir -p "$BAG_DIR"
-  local dest="$BAG_DIR/$name"
-  if [[ -e "$dest" ]]; then
+  local bag_abs dest
+  bag_abs="$(cd "$BAG_DIR" && pwd -P)"
+  dest="${bag_abs}/${name}"
+  # Fail-closed confinement: dest must be a direct child of the bag root.
+  if [[ "$(dirname -- "$dest")" != "$bag_abs" ]]; then
+    echo "ERROR: install dest escaped capture dir (confinement): $dest" >&2
+    return 2
+  fi
+  case "$dest" in
+    "${bag_abs}"/*) ;;
+    *)
+      echo "ERROR: install dest not under bag root: $dest" >&2
+      return 2
+      ;;
+  esac
+  if [[ -e "$dest" || -L "$dest" ]]; then
     echo "ERROR: refuse clobber $dest (remove or pick another basename)" >&2
     return 2
   fi
+  # -n: never clobber; --: no option injection from paths
   cp -n -- "$src" "$dest"
   chmod 0644 "$dest" || true
   echo "INSTALLED $dest"

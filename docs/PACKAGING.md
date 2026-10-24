@@ -34,10 +34,11 @@ selected by `DragonNpu::new`.
 
 ## MSRV
 
-- `Cargo.toml` sets `rust-version = "1.87"`.
+- `Cargo.toml` sets `rust-version = "1.99"`.
   - Edition 2024 alone needs ≥1.85.
   - This crate uses APIs stabilized in 1.87 (`usize::is_multiple_of`,
-    integer `cast_unsigned`), so the honest floor is **1.87**.
+    integer `cast_unsigned`). The documented floor is **1.99**, the
+    stable this crate is built and tested on.
 - CI / lab may use a newer stable; MSRV is the documented floor.
 - Bump MSRV only with a deliberate changelog note.
 
@@ -84,8 +85,11 @@ See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (software-only):
 | Job | Role |
 |-----|------|
 | `fmt` | `cargo fmt -- --check` on stable |
-| `msrv` | `rust-toolchain@1.87` — `cargo test --lib` + `check --features amd-xdna2` |
+| `msrv` | `rust-toolchain@1.99` — `cargo test --lib` and `cargo test --lib --features amd-xdna2` |
 | `clippy-test` | matrix of features; `clippy --all-targets -D warnings` + `test --lib` |
+| `exec-gate` | clippy and `test --lib` with `amd-xdna2,xdna2-dangerous-exec-cmd`; `XDNA2_ALLOW_EXEC_CMD` stays unset |
+| `offline-gates` | `bash tools/run_offline_gates.sh` (soft assets; not C-ready; no execute allow) |
+| `lab-script` | `bash -n` on lab and extract scripts, plus dry-run refuses; never `--apply` |
 | `bin` | `build --bin dragon-npu`; clippy bins with `amd-xdna2`; `bench --no-run` |
 
 PATH: steps use `PATH="/usr/bin:$PATH"` (prepend only) so cargo/rustup from the

@@ -1,4 +1,4 @@
-/// Core NPU types and pluggable backend abstraction for DragonNPU.
+/// Core NPU types and pluggable backend abstraction for Earth Dragon NPU.
 ///
 /// This module contains the main `DragonNpu` handle, `CompiledModel`,
 /// `NpuStatus`, and delegation through the `Backend` trait.
@@ -25,7 +25,7 @@ pub struct DragonNpu {
 }
 
 impl DragonNpu {
-    /// Create a new DragonNPU instance.
+    /// Create a new Earth Dragon NPU instance.
     ///
     /// Detects available NPUs and selects the best backend.
     /// Prefers the XDNA2 backend (real detection or realistic simulation) when the
@@ -36,6 +36,7 @@ impl DragonNpu {
     ///   `IntelVpuBackend` / `QualcommHexagonBackend` explicitly if needed
     ///   (`docs/SECONDARY_BACKENDS.md`).
     /// - `xrt-bridge` research stub — never a production default.
+    /// - `external-runner` (IRON/eepy wrap) — [`Self::with_backend`] only.
     ///
     /// # Errors
     ///
@@ -53,11 +54,19 @@ impl DragonNpu {
         }
 
         // Default path (no amd-xdna2 feature): high-fidelity simulation.
-        // intel-vpu / qualcomm-hexagon / xrt-bridge are opt-in types only.
-        // Reference: dragon_npu/dragon_npu_core.py
+        // intel-vpu / qualcomm-hexagon / xrt-bridge / external-runner are
+        // opt-in types only. Reference: dragon_npu/dragon_npu_core.py
         Ok(Self {
             backend: Arc::new(SimulationBackend::new()),
         })
+    }
+
+    /// Wrap an explicit backend. Does **not** change [`Self::new`].
+    ///
+    /// Use this for [`crate::backends::external_runner::ExternalRunnerBackend`].
+    #[must_use]
+    pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
+        Self { backend }
     }
 
     /// Returns the current NPU status / capabilities.
@@ -450,8 +459,8 @@ mod tests {
         let status = npu.status().expect("status should succeed");
         assert!(status.available);
         // Updated to exercise new fields matching dragon_npu_core.py
-        assert!(!status.driver_version.is_empty());
-        assert!(!status.supported_dtypes.is_empty());
+        assert_ne!(status.driver_version, "");
+        assert_ne!(status.supported_dtypes, [] as [String; 0]);
     }
 
     #[test]

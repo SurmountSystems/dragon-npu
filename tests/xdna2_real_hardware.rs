@@ -37,8 +37,8 @@ mod feature_not_enabled {
 
 #[cfg(feature = "amd-xdna2")]
 mod real_xdna2_on_target_platform {
-    use dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
-    use dragon_npu::backends::{Backend, probe_accel_devices};
+    use earth_dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
+    use earth_dragon_npu::backends::{Backend, probe_accel_devices};
 
     /// Helper: returns true only when this machine has a live amdxdna XDNA2 device
     /// that our probe recognizes (the "correct platform").
@@ -207,7 +207,7 @@ mod real_xdna2_on_target_platform {
             timed.status, timed.ran_on_npu, timed.real_ioctl, timed.total_s, timed.detail,
         );
         assert_eq!(timed.op, "matmul");
-        assert!(!timed.status.is_empty());
+        assert_ne!(timed.status, "");
         // Phase 3: never claim NPU GEMM Pass without numerical verify.
         assert!(
             !timed.ran_on_npu,
@@ -291,14 +291,14 @@ mod real_xdna2_on_target_platform {
         let model = backend
             .compile_model("any_real_model.onnx", 2, "bf16")
             .expect("Real arm compile_model must succeed (host ModelCompiler)");
-        assert!(!model.ops().is_empty());
+        assert_ne!(model.ops(), [] as [String; 0]);
 
         // Pin FailClosed so shell XDNA2_REAL_SUBMIT_MODE cannot flake this boundary test.
         let submit_err = backend
             .submit_and_run_with_mode(
                 &model,
                 &[0.0f32; 4],
-                dragon_npu::backends::amd_xdna2::RealSubmitMode::FailClosed,
+                earth_dragon_npu::backends::amd_xdna2::RealSubmitMode::FailClosed,
             )
             .expect_err("FailClosed Real submit must be RealSubmitNotReady");
         let msg = format!("{submit_err:?}");

@@ -26,27 +26,35 @@ use std::fs;
 use std::io::Read;
 #[cfg(feature = "amd-xdna2")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "amd-xdna2")]
 use std::process::ExitCode;
 
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::amd_xdna2::{
+use earth_dragon_npu::backends::amd_xdna2::{
     AXLF_FIRST_SECTION_HEADER_ABS_OFFSET, AXLF_SECTION_HEADER_SIZE, C2ExpectPaddrs,
     ENV_LAB_EXTERNAL_CTRLTEXT, JournalFwStatusPair, MAX_MLADF_LAB_FILE_BYTES,
-    c2_live_cmdlist_msg_words_embedded, c2_live_io_paddrs_locked,
+    audit_io_page_fault_vs_lab_map, c2_live_cmdlist_msg_words_embedded, c2_live_io_paddrs_locked,
     check_external_known_good_bag_drop, classify_last_apply_residual_ex,
-    compare_external_ctrltext_to_lab_export, cross_check_c2_cmdlist_fill_locked,
-    decode_c2_live_cmdbuf_vs_pure_rebuild, default_last_apply_path,
-    export_ctrltext_fingerprint_research, format_app_load_offline_checklist,
-    format_app_load_offline_checklist_ex, format_c2_cmdlist_msg_research_note,
-    format_external_known_good_operator_extract_checklist, format_silicon_residual_class_note,
+    classify_material_residual_match, compare_external_ctrltext_to_lab_export,
+    cross_check_c2_cmdlist_fill_locked, decode_c2_live_cmdbuf_vs_pure_rebuild,
+    default_last_apply_path, export_ctrltext_fingerprint_research, external_known_good_lab_root,
+    extract_live_paddrs_from_last_apply_json, fingerprint_capture_material_dir_research,
+    format_app_load_offline_checklist, format_app_load_offline_checklist_ex,
+    format_c2_cmdlist_msg_research_note, format_completed_on_this_fw_note,
+    format_external_known_good_operator_extract_checklist,
+    format_l1b_readiness_checklist_from_extract, format_l1b_soft_score_tokens,
+    format_last_apply_rich_tokens_note, format_live_paddrs_research_note,
+    format_material_residual_match_checklist, format_material_residual_match_note,
+    format_post_fail_ert_research_soft, format_research_pdi_preflight_note,
+    format_silicon_residual_class_note, format_wait_cmd_einval_axes_note,
+    format_wait_cmd_einval_driver_axes_note, format_wait_path_syncobj_research_soft,
     last_apply_bo_gt_content, last_apply_config_cu_present, last_apply_has_rela_evidence,
     last_apply_load_path_is_allowed, last_apply_start_npu_matches_content, last_apply_temp_root,
     load_external_ctrltext_for_compare, load_external_ctrltext_from_env,
-    merge_last_apply_status_config_cu, parse_journal_fw_status_pair,
-    parse_last_apply_detail_signals, profile_instr_payload_after_rela_c2_locked,
-    read_external_known_good_provenance_text, read_lab_file_capped,
-    rebuild_c2_live_start_npu_cmd_bo, reconfirm_app_load_tracks_a_n_closed,
+    map_wait_cmd_einval_driver_axes, merge_last_apply_status_config_cu,
+    parse_completed_on_this_fw_from_provenance, parse_journal_fw_status_pair,
+    parse_last_apply_detail_signals, parse_last_apply_rich_tokens, parse_wait_cmd_einval_axes,
+    profile_instr_payload_after_rela_c2_locked, read_external_known_good_provenance_text,
+    read_lab_file_capped, rebuild_c2_live_start_npu_cmd_bo, reconfirm_app_load_tracks_a_n_closed,
     research_app_load_bag_feed_dry_run_scorecard_ex, research_app_load_e2e_fixture_path,
     research_app_load_extract_bag_scorecard_pipeline_ex,
     research_app_load_offline_progress_scorecard, research_app_load_partition_id_field_map,
@@ -54,7 +62,8 @@ use dragon_npu::backends::amd_xdna2::{
     research_construction_path_lab_vs_public, research_cu_pdi_necessity_for_app_load,
     research_cu_pdi_section_identity_from_text,
     research_external_ctrltext_compare_dry_run_from_lab_feed_ex,
-    research_lab_export_fingerprint_feed, research_xclbin_cu_pdi_section_body_bounds,
+    research_external_vs_lab_structural_distance, research_lab_export_fingerprint_feed,
+    research_pdi_identity_from_last_apply_signals, research_xclbin_cu_pdi_section_body_bounds,
     research_xclbin_cu_pdi_section_offset_map, research_xclbin_extract_dry_run,
     research_xclbin_extract_ve2_fixture_refused, scan_external_public_pdi_evidence,
     scan_public_pdi_partition_evidence, validate_external_known_good_provenance_text,
@@ -67,11 +76,13 @@ use dragon_npu::backends::amd_xdna2::{
 const SOFT_AXLF_SECTION_WALK: usize = 16;
 
 /// Cap for optional `XDNA2_LAB_JOURNAL_TEXT` paste (research; not a file path).
+#[cfg(feature = "amd-xdna2")]
 const MAX_LAB_JOURNAL_TEXT_BYTES: usize = 256 * 1024;
 
 /// True when env value is an explicit enable (`1` / `true`, case-insensitive).
+#[cfg(feature = "amd-xdna2")]
 fn env_flag_truthy(key: &str) -> bool {
-    env::var(key).ok().is_some_and(|v| {
+    env::var(key).is_ok_and(|v| {
         let t = v.trim();
         t == "1" || t.eq_ignore_ascii_case("true")
     })
@@ -81,7 +92,7 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "amd-xdna2"))]
     {
         eprintln!("classify_last_apply requires --features amd-xdna2");
-        return ExitCode::from(2);
+        ExitCode::from(2)
     }
     #[cfg(feature = "amd-xdna2")]
     {
@@ -163,6 +174,7 @@ fn run() -> Result<(), u8> {
         detail,
         sig.as_ref(),
         &note,
+        &text,
     );
     Ok(())
 }
@@ -173,17 +185,17 @@ fn merge_sig(
     detail: Option<&str>,
     rela_count_field: Option<usize>,
     status: Option<&str>,
-) -> Option<dragon_npu::backends::amd_xdna2::LastApplyDetailSignals> {
+) -> Option<earth_dragon_npu::backends::amd_xdna2::LastApplyDetailSignals> {
     let mut sig = detail.map(parse_last_apply_detail_signals);
     if let Some(ref mut s) = sig {
-        if !last_apply_has_rela_evidence(s) {
-            if let Some(n) = rela_count_field.filter(|&n| n > 0) {
-                s.rela_count = Some(n);
-            }
+        if !last_apply_has_rela_evidence(s)
+            && let Some(n) = rela_count_field.filter(|&n| n > 0)
+        {
+            s.rela_count = Some(n);
         }
         merge_last_apply_status_config_cu(status, s);
     } else if let Some(n) = rela_count_field.filter(|&n| n > 0) {
-        let mut s = dragon_npu::backends::amd_xdna2::LastApplyDetailSignals {
+        let mut s = earth_dragon_npu::backends::amd_xdna2::LastApplyDetailSignals {
             rela_count: Some(n),
             ..Default::default()
         };
@@ -193,7 +205,7 @@ fn merge_sig(
         .map(str::trim)
         .is_some_and(|s| s.eq_ignore_ascii_case("config_cu_failed"))
     {
-        let mut s = dragon_npu::backends::amd_xdna2::LastApplyDetailSignals::default();
+        let mut s = earth_dragon_npu::backends::amd_xdna2::LastApplyDetailSignals::default();
         merge_last_apply_status_config_cu(status, &mut s);
         sig = Some(s);
     }
@@ -225,9 +237,10 @@ fn resolve_lab_journal_text() -> Option<String> {
 
 #[cfg(feature = "amd-xdna2")]
 fn print_sig_detail(
-    class: dragon_npu::backends::amd_xdna2::SiliconResidualClass,
-    s: &dragon_npu::backends::amd_xdna2::LastApplyDetailSignals,
+    class: earth_dragon_npu::backends::amd_xdna2::SiliconResidualClass,
+    s: &earth_dragon_npu::backends::amd_xdna2::LastApplyDetailSignals,
     journal: Option<&str>,
+    detail: Option<&str>,
 ) {
     if let Some(st) = s.ert_state {
         println!("ert_state={st}");
@@ -257,6 +270,15 @@ fn print_sig_detail(
     }
     if let Some(n) = s.pdi_bytes {
         println!("pdi_bytes={n}");
+    }
+    // T3c: research PDI identity honesty (default dump ≠ product known-good matmul).
+    // Soft only; attach measured ≠ Pass; wrong overlay may still fault / APP_LOAD.
+    {
+        let id = research_pdi_identity_from_last_apply_signals(s, None, None);
+        println!(
+            "research_pdi_identity={}",
+            format_research_pdi_preflight_note(&id)
+        );
     }
     if let Some(f) = s.cu_func {
         println!("cu_func={f}");
@@ -302,6 +324,10 @@ fn print_sig_detail(
         );
         let pair = parse_journal_fw_status_pair(jt);
         println!("journal_fw_pair_soft={}", pair.format_soft_note());
+        // T3b: IO_PAGE_FAULT vs bo_diag map audit (soft only; invent_pass=0).
+        // Journal alone still classifies faults; bo_diag needs full detail string.
+        let map_audit = audit_io_page_fault_vs_lab_map(detail.unwrap_or(""), Some(jt), None);
+        println!("io_page_fault_map_audit={}", map_audit.format_soft_note());
     } else {
         println!("{}", format_app_load_offline_checklist(class, s));
     }
@@ -326,7 +352,7 @@ fn print_sig_detail(
 /// `journal_text` — never invent from detail alone).
 #[cfg(feature = "amd-xdna2")]
 fn print_c2_cmdbuf_research_optional(
-    class: dragon_npu::backends::amd_xdna2::SiliconResidualClass,
+    class: earth_dragon_npu::backends::amd_xdna2::SiliconResidualClass,
     journal_text: Option<&str>,
     detail: Option<&str>,
 ) {
@@ -432,8 +458,9 @@ fn print_construction_path_research_optional() {
 /// userspace green or drop journal). FW residual for necessity/axes opens from
 /// locked class **or** C2 journal pair (same dual residual honesty as Track L).
 #[cfg(feature = "amd-xdna2")]
+#[allow(clippy::too_many_lines)] // research soft-token PRINT surface catalog
 fn print_ctrltext_fingerprint_export_optional(
-    class: dragon_npu::backends::amd_xdna2::SiliconResidualClass,
+    class: earth_dragon_npu::backends::amd_xdna2::SiliconResidualClass,
     journal_text: Option<&str>,
     detail: Option<&str>,
     userspace_content_ok: bool,
@@ -502,6 +529,18 @@ fn print_ctrltext_fingerprint_export_optional(
     }
     let cmp = compare_external_ctrltext_to_lab_export(&exp, external.as_deref());
     println!("external_ctrltext_compare={}", cmp.format_soft_note());
+    // Route B: multi-axis structural distance when external bytes present (soft only).
+    // Distance / size-class mismatch ≠ Pass (always invent_pass=0 distance_alone_not_pass=1).
+    if let Some(ref ext_bytes) = external {
+        let dist = research_external_vs_lab_structural_distance(&exp, ext_bytes);
+        println!(
+            "external_vs_lab_structural_distance={}",
+            dist.format_soft_note()
+        );
+    }
+    // Route B: multi-file capture dir fingerprint under external_known_good (soft).
+    let bag_fp = fingerprint_capture_material_dir_research(&external_known_good_lab_root());
+    println!("capture_material_fingerprint={}", bag_fp.format_soft_note());
     // Compare dry-run via auto-feed (stamp d2e287ab; prior dry-run 6033158a surface).
     // Residual class is not invented here — dry-run is research surface only.
     print_external_ctrltext_compare_dry_run_optional(
@@ -568,7 +607,7 @@ fn print_ctrltext_fingerprint_export_optional(
 /// Residual class is **not** invented here — research surface only. Match ≠ Pass.
 #[cfg(feature = "amd-xdna2")]
 fn print_external_ctrltext_compare_dry_run_optional(
-    feed: &dragon_npu::backends::amd_xdna2::LabExportFingerprintFeed,
+    feed: &earth_dragon_npu::backends::amd_xdna2::LabExportFingerprintFeed,
     external: Option<&[u8]>,
     external_load_refused: bool,
 ) {
@@ -628,13 +667,15 @@ fn print_external_ctrltext_compare_dry_run_optional(
 #[cfg(feature = "amd-xdna2")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // research soft print: bag + feed + dry-run composition
 fn print_app_load_e2e_and_bag_drop_optional(
-    class: dragon_npu::backends::amd_xdna2::SiliconResidualClass,
+    class: earth_dragon_npu::backends::amd_xdna2::SiliconResidualClass,
     journal_text: Option<&str>,
     detail: Option<&str>,
     env_bytes_present: bool,
-    external_compare: Option<&dragon_npu::backends::amd_xdna2::ExternalCtrltextCompareResearch>,
+    external_compare: Option<
+        &earth_dragon_npu::backends::amd_xdna2::ExternalCtrltextCompareResearch,
+    >,
     external_load_refused: bool,
-    feed: &dragon_npu::backends::amd_xdna2::LabExportFingerprintFeed,
+    feed: &earth_dragon_npu::backends::amd_xdna2::LabExportFingerprintFeed,
     external: Option<&[u8]>,
 ) {
     use std::path::PathBuf;
@@ -647,10 +688,24 @@ fn print_app_load_e2e_and_bag_drop_optional(
             "external_known_good_provenance_check={}",
             chk.format_soft_note()
         );
+        // W7-3: completed_on_this_fw soft research (yes ≠ Pass / residual / load_accepted).
+        let cotf = parse_completed_on_this_fw_from_provenance(text);
+        println!(
+            "completed_on_this_fw_research={}",
+            format_completed_on_this_fw_note(&cotf)
+        );
     } else {
         println!(
             "external_known_good_provenance_check=absent invent_pass=0 not_c_ready=1 \
              not_ran_on_npu=1 product_known_good=0"
+        );
+        println!(
+            "completed_on_this_fw_research=completed_on_this_fw_research \
+             completed_on_this_fw=absent residual_matched_claim=0 load_accepted_claim=0 \
+             product_known_good=0 invent_pass=0 not_c_ready=1 not_ran_on_npu=1 \
+             field_alone_not_pass=1 field_alone_not_load_accepted=1 \
+             field_alone_not_residual_matched=1 product_pass_requires_live_decide=1 \
+             raw=absent detail=completed_on_this_fw_absent"
         );
     }
 
@@ -806,11 +861,11 @@ fn print_app_load_e2e_and_bag_drop_optional(
 #[cfg(feature = "amd-xdna2")]
 fn soft_xclbin_extract_for_pipeline(
     platform_claim: Option<&str>,
-) -> dragon_npu::backends::amd_xdna2::XclbinExtractResearchDryRun {
+) -> earth_dragon_npu::backends::amd_xdna2::XclbinExtractResearchDryRun {
     const MAX_SECTION_TEXT: usize = 64 * 1024;
     let claim = platform_claim.unwrap_or("").trim();
     if !claim.is_empty()
-        && dragon_npu::backends::amd_xdna2::platform_claim_is_not_aie2_known_good(claim)
+        && earth_dragon_npu::backends::amd_xdna2::platform_claim_is_not_aie2_known_good(claim)
     {
         return research_xclbin_extract_ve2_fixture_refused(&[], None);
     }
@@ -841,7 +896,7 @@ fn soft_xclbin_extract_for_pipeline(
 /// Returns `(present, first_basename, first_path)`.
 #[cfg(feature = "amd-xdna2")]
 fn soft_probe_bag_resident_ctrltext() -> (bool, Option<String>, Option<PathBuf>) {
-    use dragon_npu::backends::amd_xdna2::{
+    use earth_dragon_npu::backends::amd_xdna2::{
         external_ctrltext_extension_ok, external_known_good_lab_root,
         is_refused_local_post_patch_as_known_good,
     };
@@ -1224,15 +1279,16 @@ fn print_instr_pdi_load_research_optional() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn print_report(
     path: &Path,
-    class: dragon_npu::backends::amd_xdna2::SiliconResidualClass,
+    class: earth_dragon_npu::backends::amd_xdna2::SiliconResidualClass,
     status: Option<&str>,
     aiebu: Option<bool>,
     ert_error: Option<bool>,
     rela_count_field: Option<usize>,
     ran_field: Option<bool>,
     detail: Option<&str>,
-    sig: Option<&dragon_npu::backends::amd_xdna2::LastApplyDetailSignals>,
+    sig: Option<&earth_dragon_npu::backends::amd_xdna2::LastApplyDetailSignals>,
     note: &str,
+    last_apply_text: &str,
 ) {
     println!("=== classify_last_apply (offline residual; soft report) ===");
     println!("path={}", path.display());
@@ -1257,11 +1313,26 @@ fn print_report(
     let journal_owned = resolve_lab_journal_text();
     let journal = journal_owned.as_deref();
     if let Some(s) = sig {
-        print_sig_detail(class, s, journal);
+        print_sig_detail(class, s, journal, detail);
     }
     if let Some(r) = ran_field {
         println!("json_ran_on_npu={r}");
     }
+    // WAIT_CMD EINVAL lab-classic axes + driver axis map + material residual-match
+    // inventory (soft; always invent_pass=0; dig / inventory alone ≠ Pass / ≠
+    // C-ready / ≠ ran_on_npu).
+    print_wait_cmd_einval_axes_soft(status, detail);
+    print_wait_cmd_einval_driver_axes_soft(status, detail);
+    // P1-B: greppable syncobj / wait_path + pure wait-path research decision
+    // (always invent_pass=0; research alone ≠ Pass ≠ unlock ≠ residual root).
+    print_wait_path_syncobj_research_soft(status, detail);
+    // O1 P5: post-fail ERT / Cmd BO dump after wait_cmd_einval (always invent_pass=0;
+    // present vs unread vs missing; research alone ≠ Pass ≠ unlock).
+    print_post_fail_ert_research_soft(status, detail);
+    print_material_residual_match_soft(detail);
+    // W10-soft: L1b readiness / wall tokens (always-on soft; invent_pass=0;
+    // unlock_active offline=false → l1b_live_justified=0; ≠ Pass ≠ C-ready).
+    print_l1b_readiness_soft(last_apply_text);
     print_c2_cmdbuf_research_optional(class, journal, detail);
     println!("note={note}");
     println!("not_c_ready=1");
@@ -1269,6 +1340,121 @@ fn print_report(
     println!(
         "CLASSIFY_SOFT_OK residual={} (report only; ≠ C-ready ≠ ran_on_npu)",
         class.as_str()
+    );
+}
+
+/// Soft L1b readiness + material wall tokens from last_apply JSON (W10-soft).
+///
+/// Always invent_pass=0. Offline unlock_active=false so `l1b_live_justified=0`.
+/// Presence of paddrs alone is not unlock mint / not Pass / not residual_matched.
+#[cfg(feature = "amd-xdna2")]
+fn print_l1b_readiness_soft(last_apply_text: &str) {
+    let extract = extract_live_paddrs_from_last_apply_json(last_apply_text);
+    println!(
+        "live_paddrs_extract={}",
+        format_live_paddrs_research_note(&extract)
+    );
+    // Offline prep: unlock_active=false via _from_extract convenience.
+    println!(
+        "l1b_readiness={}",
+        format_l1b_readiness_checklist_from_extract(&extract)
+    );
+    println!("l1b_soft_score={}", format_l1b_soft_score_tokens(&extract));
+}
+
+/// Soft WAIT_CMD EINVAL axes when status or detail is present (always invent_pass=0).
+#[cfg(feature = "amd-xdna2")]
+fn print_wait_cmd_einval_axes_soft(status: Option<&str>, detail: Option<&str>) {
+    let status_present = status.map(str::trim).is_some_and(|s| !s.is_empty());
+    let detail_present = detail.map(str::trim).is_some_and(|s| !s.is_empty());
+    if !status_present && !detail_present {
+        return;
+    }
+    let axes = parse_wait_cmd_einval_axes(status, detail);
+    println!(
+        "wait_cmd_einval_axes={}",
+        format_wait_cmd_einval_axes_note(&axes)
+    );
+}
+
+/// Soft driver WAIT axes map when status or detail is present (always invent_pass=0).
+///
+/// Maps product wait_cmd_einval vs wait_timeout onto driver axes (hwctx miss /
+/// fence·syncobj·seq miss / ETIME). No journal arg here — detail-only; journal
+/// can be folded into detail by the operator. Map alone ≠ Pass.
+#[cfg(feature = "amd-xdna2")]
+fn print_wait_cmd_einval_driver_axes_soft(status: Option<&str>, detail: Option<&str>) {
+    let status_present = status.map(str::trim).is_some_and(|s| !s.is_empty());
+    let detail_present = detail.map(str::trim).is_some_and(|s| !s.is_empty());
+    if !status_present && !detail_present {
+        return;
+    }
+    let m = map_wait_cmd_einval_driver_axes(status, detail, None);
+    println!(
+        "wait_cmd_einval_driver_axes={}",
+        format_wait_cmd_einval_driver_axes_note(&m)
+    );
+}
+
+/// Soft wait-path / CREATE syncobj research (P1-B observability).
+///
+/// Surfaces greppable `syncobj=` / `wait_path=` from detail plus pure XRT-parity
+/// decision note. Always invent_pass=0. Research alone ≠ Pass ≠ unlock.
+#[cfg(feature = "amd-xdna2")]
+fn print_wait_path_syncobj_research_soft(status: Option<&str>, detail: Option<&str>) {
+    let status_present = status.map(str::trim).is_some_and(|s| !s.is_empty());
+    let detail_present = detail.map(str::trim).is_some_and(|s| !s.is_empty());
+    if !status_present && !detail_present {
+        return;
+    }
+    let rich = parse_last_apply_rich_tokens(status, detail);
+    println!(
+        "last_apply_rich_tokens={}",
+        format_last_apply_rich_tokens_note(&rich)
+    );
+    println!(
+        "wait_path_syncobj_research={}",
+        format_wait_path_syncobj_research_soft(status, detail)
+    );
+}
+
+/// Soft post-fail ERT research (O1 P5 observability).
+///
+/// Surfaces greppable `ert_post_fail=` / `ert_state=` after wait_cmd_einval so
+/// the next justified live last_apply can split present vs unread vs historical
+/// missing. Always invent_pass=0. Research alone ≠ Pass ≠ unlock.
+#[cfg(feature = "amd-xdna2")]
+fn print_post_fail_ert_research_soft(status: Option<&str>, detail: Option<&str>) {
+    let status_present = status.map(str::trim).is_some_and(|s| !s.is_empty());
+    let detail_present = detail.map(str::trim).is_some_and(|s| !s.is_empty());
+    if !status_present && !detail_present {
+        return;
+    }
+    println!(
+        "post_fail_ert_research={}",
+        format_post_fail_ert_research_soft(status, detail)
+    );
+}
+
+/// Soft material residual-match inventory from detail content/start sizes when
+/// useful; always print checklist once with invent_pass=0 honesty.
+#[cfg(feature = "amd-xdna2")]
+fn print_material_residual_match_soft(detail: Option<&str>) {
+    // Prefer content_size / start_npu_size from detail for length-only classify.
+    let len = detail.and_then(|d| {
+        let sig = parse_last_apply_detail_signals(d);
+        sig.content_size_b
+            .or(sig.start_npu_size_b)
+            .map(|n| n as usize)
+    });
+    let inv = classify_material_residual_match(len, None);
+    println!(
+        "material_residual_match={}",
+        format_material_residual_match_note(&inv)
+    );
+    println!(
+        "material_residual_match_checklist={}",
+        format_material_residual_match_checklist()
     );
 }
 
@@ -1402,6 +1588,12 @@ fn newest_temp_last_apply() -> Option<PathBuf> {
 fn print_help() {
     eprintln!(
         "classify_last_apply — soft offline residual class from last_apply.json\n\
+         \n\
+         Always soft-prints L1b readiness wall tokens (W10-soft):\n\
+           live_paddrs_extract= / l1b_readiness= / l1b_soft_score=\n\
+           (true_post_patch_missing / oracle_sha16 / INSTR_BO_LIMIT /\n\
+            paddr_evidence_ready / l1b_live_justified=0 offline / invent_pass=0).\n\
+           Checklist alone ≠ unlock mint ≠ Pass ≠ residual_matched.\n\
          \n\
          Usage:\n\
            cargo run --features amd-xdna2 --example classify_last_apply -- [path.json]\n\

@@ -1,0 +1,36 @@
+silicon_lab_preflight: dir=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab require_pass_assets=0
+  (offline only — no L3 / no EXEC / ≠ ran_on_npu)
+OK: instr path=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/lab_instr.elf size=32264 (aiebu ELF — preferred for EXEC/rela patch)
+OK: WTS   path:     /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/wts.bin   size:     174080   nonzero:  149120 
+OK: CTRL   path:     /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/lab_ctrl.bin   size:     29664   nonzero:  12899 
+OK: meta path=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/lab_ctrl_meta.json
+OK: OFM golden   path:     /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/ofm_golden.bin   size:     512 (bf16 LE for m=1 n=256)   nonzero:  512 
+
+READINESS: instr=1 wts=1 ctrl=1 golden=1 meta=1
+DRY_RUN_READY=1  # 1=instr+ctrl present (soft plan ok); 0=incomplete stage
+  note: soft exit 0 always prints plan — use --require-pass-assets for Pass asset gate
+  note: DRY_RUN_READY ≠ ran_on_npu; golden/WTS may still be missing
+OK: soft preflight complete (exit 0 = report only; check DRY_RUN_READY / --require-pass-assets)
+
+# --- env recipe (export in your shell; dry-run first) ---
+export XDNA2_INSTRUCTION_BLOB=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/lab_instr.elf
+export XDNA2_LAB_OFM=1
+export XDNA2_LAB_PACK=mladf_a16w4
+export XDNA2_LAB_MLADF_KEY='mladfmatmulbias_prmptflat_mladf_2x4x4_flat_a16fw4acc16f_1_1152_256_128'
+export XDNA2_LAB_MLADF_META=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/lab_ctrl_meta.json
+export XDNA2_LAB_WTS_PACKED=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/wts.bin
+export XDNA2_LAB_CTRL_PACKED=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/lab_ctrl.bin
+export XDNA2_LAB_REQUIRE_NONZERO_WTS=1
+export XDNA2_LAB_REQUIRE_CTRL=1
+export XDNA2_LAB_CTRL_AUTO_PATCH=1
+export XDNA2_LAB_OFM_GOLDEN=/home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/silicon_lab/ofm_golden.bin
+
+# Dry-run lab window (no L3 open):
+bash scripts/lab_exec_once.sh --silicon-mladf --blob "$XDNA2_INSTRUCTION_BLOB"
+# Pass asset gate:
+# bash tools/silicon_lab_preflight.sh --require-pass-assets --print-env
+
+# Apply only after dry-run OK + operator risk accept (HITL):
+# bash scripts/lab_exec_once.sh --silicon-mladf --apply --i-accept-wedge-risk --blob "$XDNA2_INSTRUCTION_BLOB"
+# Honesty: apply exit 4 if !ran_on_npu is common; restore traps still clear gates.
+# Soft dry-run exit 0 / DRY_RUN_READY ≠ ran_on_npu. Never leave exec_cmd_allow=1.

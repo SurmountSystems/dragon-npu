@@ -4,13 +4,13 @@
 # IMPL de4d9fa4: C2 live blocked on operator sudo when L3 closed.
 # Unlock SSoT: first C_UNLOCK=… line in RESIDUAL.md (soft NOTE only — never
 # hard-blocks prep/print/apply). Active stamp is whatever RESIDUAL first-match
-# presents without CONSUMED on that line (P4: C_UNLOCK=3a70fabf one-shot for
-# CONFIG_CU sandwich). When the first match is marked CONSUMED (or stamp appears
-# CONSUMED elsewhere), printed sandwich L3/apply lines are comment-only
-# HISTORICAL (non-executable); further C needs a **new** agent unlock + offline
-# delta. Historical b17b0119 (operator C2 2026-07-18) remains CONSUMED mid-file.
-# Never invent a stamp. CONSUMED never hard-blocks --apply-if-l3-open (standing
-# soft-NOTE policy; operator still owns L3).
+# presents without CONSUMED on that line (plan S1: host-minted one-shot for
+# CONFIG_CU + PDI sandwich, outer ≥120s). When the first match is marked
+# CONSUMED (or that stamp appears CONSUMED elsewhere), printed sandwich
+# L3/apply lines are comment-only HISTORICAL (non-executable); further C needs
+# a **new** agent unlock + offline delta. Historical 3a70fabf / b17b0119 remain
+# CONSUMED mid-file — do not reopen. Never invent a stamp. CONSUMED never
+# hard-blocks --apply-if-l3-open (standing soft-NOTE policy; operator owns L3).
 #
 # What this does (default = safe offline prep, NO L3 open, NO EXEC):
 #   1) Soft NOTE if RESIDUAL has C_UNLOCK= (active vs CONSUMED)
@@ -50,7 +50,7 @@
 #   # bash tools/c4_pass_check.sh              # soft; C4_SKIP without PassCandidate
 #   bash tools/run_offline_gates.sh
 #   # paste last_apply / journal for agent C3 / offline PassCandidate audit (≠ product Pass)
-#   # Mark C_UNLOCK=3a70fabf CONSUMED only if sandwich actually ran (new last_apply)
+#   # Mark active unlock used in RESIDUAL only after a real sandwich (new last_apply)
 #
 # Exit:
 #   0  prep/print ok (or rare Pass path via hitl_c when L3 open)
@@ -228,8 +228,9 @@ export PATH="/usr/bin:\${HOME}/.local/bin:\${PATH}"
 # honesty: attach alone ≠ Pass ≠ ran_on_npu
 
 # ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
+# Outer ≥120s for CONFIG_CU silicon (default 30s killed prior shot)
 sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+bash tools/hitl_c_pass_apply.sh --assume-l3-already-open --timeout-s=120
 sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 EOF
@@ -248,8 +249,9 @@ set -gx PATH /usr/bin \$HOME/.local/bin \$PATH
 # honesty: attach alone ≠ Pass ≠ ran_on_npu
 
 # ${_c_unlock_comment}; restore L3; ≠ ran_on_npu until Pass
+# Outer ≥120s for CONFIG_CU silicon (default 30s killed prior shot)
 sudo sh -c 'echo 1 > /sys/module/amdxdna/parameters/exec_cmd_allow'
-bash tools/hitl_c_pass_apply.sh --assume-l3-already-open
+bash tools/hitl_c_pass_apply.sh --assume-l3-already-open --timeout-s=120
 sudo sh -c 'echo 0 > /sys/module/amdxdna/parameters/exec_cmd_allow'
 cat /sys/module/amdxdna/parameters/exec_cmd_allow   # must be 0 or N
 EOF

@@ -1,10 +1,10 @@
 [package]
-name = "dragon-npu"
+name = "earth-dragon-npu"
 version = "0.1.0"
 edition = "2024"
 # Edition 2024 needs ≥1.85; this crate also uses 1.87 APIs (`is_multiple_of`, `cast_unsigned`).
-# Lab/CI toolchains are newer; pin MSRV to the real language floor, not edition-only.
-rust-version = "1.87"
+# Documented floor is 1.99, the stable this crate is built and tested on.
+rust-version = "1.99"
 authors = ["Dragonfire Project <contact@dragonfire.ai>"]
 description = "Production-quality Rust library for vendor-agnostic NPU acceleration on Linux (AMD XDNA2 primary, simulation default; Intel/Hexagon honest stubs). Library-first rewrite with strict error handling."
 license = "MIT"
@@ -48,10 +48,10 @@ exclude = [
 ]
 
 [lib]
-name = "dragon_npu"
+name = "earth_dragon_npu"
 
 [[bin]]
-name = "dragon-npu"
+name = "earth-dragon-npu"
 path = "src/bin/dragon_npu.rs"
 doc = false
 
@@ -75,9 +75,10 @@ serde_json = "1.0"
 # heuristics with real model loading (shapes, dtypes, weights, topology).
 # See session research subagent output for alternatives (rten-onnx, oxionnx-proto) if we
 # later want a leaner custom decoder.
-tract-onnx = "0.22.1"
-# prost is used for decoding the raw ONNX ModelProto (transitive from tract-onnx; pinned for reproducibility)
-prost = "0.11"
+# 0.23 drops liquid/anymap2 (RUSTSEC-2026-0319, unmaintained, no patched 0.22).
+tract-onnx = "0.23.8"
+# Must match tract-onnx 0.23, which generates pb types with prost 0.14.
+prost = "0.14"
 
 # Used only for the lightweight direct amdxdna driver path (under the amd-xdna2 feature).
 # This keeps the direct implementation minimal and avoids pulling in heavier runtimes.

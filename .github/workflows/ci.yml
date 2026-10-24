@@ -22,12 +22,12 @@ jobs:
         # Prefer system paths without wiping cargo/rustup from the runner PATH.
         run: PATH="/usr/bin:$PATH" cargo fmt -- --check
 
-  # Enforce Cargo.toml rust-version (1.87) so MSRV does not silently drift.
+  # Enforce Cargo.toml rust-version (1.99) so MSRV does not silently drift.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87
+      - uses: dtolnay/rust-toolchain@1.99
       - name: cargo test --lib (MSRV default features)
         run: PATH="/usr/bin:$PATH" cargo test --lib
       - name: cargo test --lib amd-xdna2 (MSRV)
@@ -316,8 +316,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: build dragon-npu binary
-        run: PATH="/usr/bin:$PATH" cargo build --bin dragon-npu
+      - name: build earth-dragon-npu binary
+        run: PATH="/usr/bin:$PATH" cargo build --bin earth-dragon-npu
       - name: clippy bins with amd-xdna2
         run: PATH="/usr/bin:$PATH" cargo clippy --bins --features amd-xdna2 -- -D warnings
       - name: bench compile only (default + amd-xdna2)

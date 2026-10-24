@@ -14,7 +14,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
+use earth_dragon_npu::backends::amd_xdna2::AmdXdna2Backend;
 
 fn xdna2_status_path(c: &mut Criterion) {
     c.bench_function("xdna2_new_with_real_stub_status", |b| {

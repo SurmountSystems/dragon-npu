@@ -24,7 +24,13 @@ export PATH="/usr/bin:${HOME}/.local/bin:${PATH}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Prefer flexml STX overlays first when present (PDI fingerprints DIFF vs prior
+# CVML research baseline 283840 / a1e65d04add3422c). Still research-only — not
+# product matmul known-good; dump ≠ Pass ≠ ran_on_npu.
 DEFAULT_XCLBIN_CANDIDATES=(
+  "${HOME}/Projects/ai/ryzen-ai-install/venv/lib/python3.12/site-packages/flexml/flexml_extras/data/ryzen-ai/stx/unified-2x4x4.xclbin"
+  "${HOME}/Projects/ai/ryzen-ai-install/venv/lib/python3.12/site-packages/flexml/flexml_extras/data/ryzen-ai/stx/llm-2x4x4.xclbin"
+  "${HOME}/Projects/ai/ryzen-ai-install/venv/lib/python3.12/site-packages/flexml/flexml_extras/data/ryzen-ai/stx/unified-4x4.xclbin"
   "${HOME}/Projects/ai/RyzenAI-SW/Ryzen-AI-CVML-Library/linux/onnx/ryzen14/AMD_AIE2P_4x4_Overlay.xclbin"
   "${HOME}/Projects/ai/RyzenAI-SW/Ryzen-AI-CVML-Library/linux/onnx/ryzen14/AMD_AIE2P_4x4_Overlay_CFG0.xclbin"
   "${HOME}/Projects/ai/RyzenAI-SW/Ryzen-AI-CVML-Library/linux/onnx/ryzen14/AMD_AIE2P_8x4x1_Overlay.xclbin"
@@ -67,13 +73,25 @@ done
 
 if [[ "$LIST_ONLY" -eq 1 ]]; then
   echo "=== Default xclbin candidates (exist?) ==="
+  echo "NOTE: flexml STX first when present, then CVML/AIE2P — research only"
+  echo "NOTE: research_pdi_not_product_known_good=1 invent_pass=0 not_ran_on_npu=1"
+  echo "NOTE: dump ≠ product matmul known-good PDI; attach ≠ Pass"
+  echo "NOTE: flexml PDI fingerprint DIFF vs prior CVML baseline still ≠ Pass"
+  i=0
   for c in "${DEFAULT_XCLBIN_CANDIDATES[@]}"; do
+    i=$((i + 1))
     if [[ -f "$c" ]]; then
-      echo "EXISTS  $c  ($(wc -c <"$c") bytes)"
+      echo "CANDIDATE_${i} EXISTS  $c  ($(wc -c <"$c") bytes)"
+      echo "  # research only — export after dump:"
+      echo "  #   bash tools/dump_xclbin_pdi.sh --xclbin \"$c\" --print-env"
     else
-      echo "MISSING $c"
+      echo "CANDIDATE_${i} MISSING $c"
     fi
   done
+  echo "A/B without CONFIG_CU (no PDI blob):"
+  echo "  unset XDNA2_LAB_PDI_BLOB"
+  echo "  export XDNA2_LAB_SKIP_CONFIG_CU=1"
+  echo "  # or: bash tools/hitl_config_cu_once.sh prep-skip-pdi"
   exit 0
 fi
 
@@ -135,14 +153,22 @@ if [[ "$BYTES" -eq 0 ]]; then
 fi
 
 SHA=$(sha256sum "$OUT" | awk '{print $1}')
+SHA16="${SHA:0:16}"
 echo "PDI_OK bytes=$BYTES sha256=$SHA"
-echo "NOTE: opaque research blob only — invent_pass=0 not_ran_on_npu=1 product_known_good=0"
+echo "pdi_fp len=$BYTES sha16=$SHA16"
+echo "NOTE: opaque research blob only — research_pdi_not_product_known_good=1"
+echo "NOTE: invent_pass=0 not_ran_on_npu=1 product_known_good=0"
+echo "NOTE: CVML/AIE2P dump ≠ product matmul known-good; attach ≠ Pass"
+echo "NOTE: wrong overlay may still IO_PAGE_FAULT / APP_LOAD"
 
 if [[ "$PRINT_ENV" -eq 1 ]]; then
   echo
-  echo "# --- paste for lab CONFIG_CU path (still needs EXEC double-gate + L3 for live) ---"
+  echo "# --- paste for lab CONFIG_CU path (research only; still needs EXEC gates for live) ---"
   echo "export XDNA2_LAB_PDI_BLOB=$OUT"
   echo "export XDNA2_LAB_CU_FUNC=0   # optional; default 0"
+  echo "# A/B skip CONFIG_CU (no research blob):"
+  echo "#   unset XDNA2_LAB_PDI_BLOB"
+  echo "#   export XDNA2_LAB_SKIP_CONFIG_CU=1"
   echo "# fish:"
   echo "set -gx XDNA2_LAB_PDI_BLOB $OUT"
   echo "set -gx XDNA2_LAB_CU_FUNC 0"

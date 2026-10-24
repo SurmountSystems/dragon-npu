@@ -1,4 +1,4 @@
-//! Thin argv helpers for the `dragon-npu` binary (library-testable).
+//! Thin argv helpers for the `earth-dragon-npu` binary (library-testable).
 //!
 //! Parsing is pure and free of hardware side effects so unit tests never open
 //! `/dev/accel` or enable EXEC_CMD. The binary (`src/bin/dragon_npu.rs`) owns
@@ -21,13 +21,17 @@ pub const EXIT_USAGE: i32 = 2;
 /// 16 Mi elements ≈ 64 MiB of f32 — enough for small/medium demos, not multi-GB tensors.
 pub const MAX_INPUT_ELEMENTS: usize = 16_777_216;
 
-/// Parsed top-level subcommand for `dragon-npu`.
+/// Parsed top-level subcommand for `earth-dragon-npu`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Print NPU / backend status.
     Status {
         /// Emit a single JSON object instead of human text.
         json: bool,
+        /// Optional absolute external-runner program (`--external-runner`).
+        external_runner: Option<String>,
+        /// Optional child working directory.
+        external_cwd: Option<String>,
     },
     /// Compile a model path (ONNX / JSON / heuristic); no inference.
     Compile {
@@ -39,6 +43,10 @@ pub enum Command {
         quant: String,
         /// JSON summary output.
         json: bool,
+        /// Optional absolute external-runner program (status of wrap only).
+        external_runner: Option<String>,
+        /// Optional child working directory.
+        external_cwd: Option<String>,
     },
     /// Compile + run with zeros or file input (host/sim path for this CLI).
     Run {
@@ -54,6 +62,21 @@ pub enum Command {
         input_len: usize,
         /// JSON summary output.
         json: bool,
+        /// Optional absolute external-runner program (opt-in wrap).
+        external_runner: Option<String>,
+        /// Extra argv for the child (`--external-arg`, repeatable).
+        external_args: Vec<String>,
+        /// Optional absolute working directory for the child.
+        external_cwd: Option<String>,
+        /// Named IRON catalog kernel (`--iron NAME`). Mutually exclusive with
+        /// `--host-graph` and raw `--external-runner`.
+        iron_kernel: Option<String>,
+        /// Opt-in export-only collect (`--iron-export`). Creates a this-run
+        /// `--aot-dir` for `vector_add` only. Not the default run wrap.
+        /// Child `PASS!` is not expected on this path.
+        iron_export: bool,
+        /// Host linear graph (`--host-graph`). Host math only, not NPU.
+        host_graph: bool,
     },
     /// Probe-ish diagnostics (requires `amd-xdna2` at runtime; never EXEC_CMD).
     Probe {
@@ -70,6 +93,45 @@ pub const DEFAULT_OPT_LEVEL: u8 = 2;
 pub const DEFAULT_QUANT: &str = "fp32";
 /// Default zero-vector length for `run` without `--input`.
 pub const DEFAULT_INPUT_LEN: usize = 16;
+/// Parse placeholder when `--iron` has no positional model. `--iron` does **not**
+/// compile this path (see [`run_iron_without_host_model`]).
+pub const DEFAULT_IRON_MODEL: &str = "tests/fixtures/host_matmul_relu.json";
+/// Default model when `--host-graph` is used without a positional path.
+pub const DEFAULT_HOST_GRAPH_MODEL: &str = "tests/fixtures/host_matmul_relu_add.json";
+/// Default host-graph activation when `--input` is omitted (`[-1, 2]`).
+pub const DEFAULT_HOST_GRAPH_INPUT: [f32; 2] = [-1.0, 2.0];
+/// Hard-coded host-graph honesty line. Not product Pass.
+pub const HOST_GRAPH_HONESTY_TOKENS: &str = "execution=host ran_on_npu=false invent_pass=0";
+
+/// CLI flag wins; else env `DRAGON_NPU_EXTERNAL_RUNNER` (opt-in; default off).
+#[must_use]
+pub fn resolve_external_runner_program(flag: Option<&str>) -> Option<String> {
+    if let Some(p) = flag {
+        let t = p.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    std::env::var(crate::backends::external_runner::ENV_EXTERNAL_RUNNER)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// CLI flag wins; else env `DRAGON_NPU_EXTERNAL_CWD`.
+#[must_use]
+pub fn resolve_external_cwd(flag: Option<&str>) -> Option<String> {
+    if let Some(p) = flag {
+        let t = p.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    std::env::var(crate::backends::external_runner::ENV_EXTERNAL_CWD)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// Parse argv **after** the program name (same shape as `std::env::args().skip(1)`).
 ///
@@ -83,72 +145,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let cmd = args[0].as_str();
     match cmd {
         "help" | "-h" | "--help" => Ok(Command::Help),
-        "status" => {
-            let json = has_flag(&args[1..], "--json");
-            refuse_unknown_flags(&args[1..], &["--json"])?;
-            Ok(Command::Status { json })
-        }
-        "compile" => {
-            let rest = &args[1..];
-            let model = first_positional(rest).ok_or_else(|| {
-                "usage: dragon-npu compile <model> [-O|--opt N] [-q|--quantization QUANT] [--json]"
-                    .to_string()
-            })?;
-            let opt = parse_opt_flag(rest, DEFAULT_OPT_LEVEL)?;
-            let quant = parse_string_flag(rest, "-q", DEFAULT_QUANT.to_string())?;
-            let quant = parse_string_flag(rest, "--quantization", quant)?;
-            let json = has_flag(rest, "--json");
-            refuse_unknown_flags(rest, &["-O", "--opt", "-q", "--quantization", "--json"])?;
-            Ok(Command::Compile {
-                model,
-                opt,
-                quant,
-                json,
-            })
-        }
-        "run" => {
-            let rest = &args[1..];
-            let model = first_positional(rest).ok_or_else(|| {
-                "usage: dragon-npu run <model> [-O|--opt N] [-q|--quantization QUANT] \
-                 [--input|-i PATH] [--input-len N] [--json]"
-                    .to_string()
-            })?;
-            let opt = parse_opt_flag(rest, DEFAULT_OPT_LEVEL)?;
-            let quant = parse_string_flag(rest, "-q", DEFAULT_QUANT.to_string())?;
-            let quant = parse_string_flag(rest, "--quantization", quant)?;
-            let input = match parse_optional_string_flag(rest, "--input")? {
-                Some(v) => Some(v),
-                None => parse_optional_string_flag(rest, "-i")?,
-            };
-            let input_len = parse_usize_flag(rest, "--input-len", DEFAULT_INPUT_LEN)?;
-            if input_len > MAX_INPUT_ELEMENTS {
-                return Err(format!(
-                    "--input-len {input_len} exceeds max {MAX_INPUT_ELEMENTS} elements"
-                ));
-            }
-            let json = has_flag(rest, "--json");
-            refuse_unknown_flags(
-                rest,
-                &[
-                    "-O",
-                    "--opt",
-                    "-q",
-                    "--quantization",
-                    "--input",
-                    "-i",
-                    "--input-len",
-                    "--json",
-                ],
-            )?;
-            Ok(Command::Run {
-                model,
-                opt,
-                quant,
-                input,
-                input_len,
-                json,
-            })
-        }
+        "status" => parse_status_args(&args[1..]),
+        "compile" => parse_compile_args(&args[1..]),
+        "run" => parse_run_args(&args[1..]),
         "probe" => {
             let json = has_flag(&args[1..], "--json");
             refuse_unknown_flags(&args[1..], &["--json"])?;
@@ -160,25 +159,188 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_status_args(rest: &[String]) -> Result<Command, String> {
+    let json = has_flag(rest, "--json");
+    let external_runner = parse_optional_string_flag(rest, "--external-runner")?;
+    let external_cwd = parse_optional_string_flag(rest, "--external-cwd")?;
+    refuse_unknown_flags(rest, &["--json", "--external-runner", "--external-cwd"])?;
+    Ok(Command::Status {
+        json,
+        external_runner,
+        external_cwd,
+    })
+}
+
+fn parse_compile_args(rest: &[String]) -> Result<Command, String> {
+    let model = first_positional(rest).ok_or_else(|| {
+        "usage: earth-dragon-npu compile <model> [-O|--opt N] [-q|--quantization QUANT] [--json] \
+         [--external-runner PATH] [--external-cwd DIR]"
+            .to_string()
+    })?;
+    let opt = parse_opt_flag(rest, DEFAULT_OPT_LEVEL)?;
+    let quant = parse_string_flag(rest, "-q", DEFAULT_QUANT.to_string())?;
+    let quant = parse_string_flag(rest, "--quantization", quant)?;
+    let json = has_flag(rest, "--json");
+    let external_runner = parse_optional_string_flag(rest, "--external-runner")?;
+    let external_cwd = parse_optional_string_flag(rest, "--external-cwd")?;
+    refuse_unknown_flags(
+        rest,
+        &[
+            "-O",
+            "--opt",
+            "-q",
+            "--quantization",
+            "--json",
+            "--external-runner",
+            "--external-cwd",
+        ],
+    )?;
+    Ok(Command::Compile {
+        model,
+        opt,
+        quant,
+        json,
+        external_runner,
+        external_cwd,
+    })
+}
+
+fn parse_run_args(rest: &[String]) -> Result<Command, String> {
+    let iron_kernel = parse_optional_string_flag(rest, "--iron")?;
+    if let Some(name) = iron_kernel.as_deref() {
+        crate::backends::iron_kernel::iron_kernel_spec(name)?;
+    }
+    let host_graph = has_flag(rest, "--host-graph");
+    if iron_kernel.is_some() && host_graph {
+        return Err(
+            "do not mix --iron and --host-graph (named IRON wrap vs host linear)".to_string(),
+        );
+    }
+    let model = match first_positional(rest) {
+        Some(m) => m,
+        None if host_graph => DEFAULT_HOST_GRAPH_MODEL.to_string(),
+        None if iron_kernel.is_some() => DEFAULT_IRON_MODEL.to_string(),
+        None => {
+            return Err(
+                "usage: earth-dragon-npu run <model> [-O|--opt N] [-q|--quantization QUANT] \
+                 [--input|-i PATH] [--input-len N] [--json] \
+                 [--iron NAME] [--host-graph] \
+                 [--external-runner PATH] [--external-arg ARG]... [--external-cwd DIR]"
+                    .to_string(),
+            );
+        }
+    };
+    let opt = parse_opt_flag(rest, DEFAULT_OPT_LEVEL)?;
+    let quant = parse_string_flag(rest, "-q", DEFAULT_QUANT.to_string())?;
+    let quant = parse_string_flag(rest, "--quantization", quant)?;
+    let input = match parse_optional_string_flag(rest, "--input")? {
+        Some(v) => Some(v),
+        None => parse_optional_string_flag(rest, "-i")?,
+    };
+    let input_len = parse_usize_flag(rest, "--input-len", DEFAULT_INPUT_LEN)?;
+    if input_len > MAX_INPUT_ELEMENTS {
+        return Err(format!(
+            "--input-len {input_len} exceeds max {MAX_INPUT_ELEMENTS} elements"
+        ));
+    }
+    let json = has_flag(rest, "--json");
+    let iron_export = has_flag(rest, "--iron-export");
+    let external_runner = parse_optional_string_flag(rest, "--external-runner")?;
+    let external_args = collect_repeatable_flag(rest, "--external-arg")?;
+    let external_cwd = parse_optional_string_flag(rest, "--external-cwd")?;
+    if iron_export && iron_kernel.is_none() {
+        return Err(
+            "--iron-export requires --iron NAME (export-only collect; no child PASS! expected)"
+                .to_string(),
+        );
+    }
+    if iron_kernel.is_some() && external_runner.is_some() {
+        return Err(
+            "do not mix --iron and --external-runner (use --iron NAME or raw runner, not both)"
+                .to_string(),
+        );
+    }
+    if host_graph && external_runner.is_some() {
+        return Err("do not mix --host-graph and --external-runner".to_string());
+    }
+    refuse_unknown_flags(
+        rest,
+        &[
+            "-O",
+            "--opt",
+            "-q",
+            "--quantization",
+            "--input",
+            "-i",
+            "--input-len",
+            "--json",
+            "--iron",
+            "--iron-export",
+            "--host-graph",
+            "--external-runner",
+            "--external-arg",
+            "--external-cwd",
+        ],
+    )?;
+    Ok(Command::Run {
+        model,
+        opt,
+        quant,
+        input,
+        input_len,
+        json,
+        external_runner,
+        external_args,
+        external_cwd,
+        iron_kernel,
+        iron_export,
+        host_graph,
+    })
+}
+
 /// Human-readable help for the binary (printed to stderr by the CLI).
 #[must_use]
 pub fn help_text() -> String {
     format!(
         "\
-dragon-npu — DragonNPU library CLI (host/sim run; optional amd-xdna2 detect/probe)
+earth-dragon-npu — Earth Dragon NPU library CLI (host/sim run; optional amd-xdna2 detect/probe)
 
 USAGE:
-  dragon-npu status [--json]
-  dragon-npu compile <model> [-O|--opt 0..3] [-q|--quantization QUANT] [--json]
-  dragon-npu run <model> [-O|--opt 0..3] [-q|--quantization QUANT]
+  just npu-relu                      # named IRON ReLU (also npu-iron / npu-gelu / npu-silu / npu-mul / npu-swiglu / npu-scale-shift)
+  just npu-iron                      # run+verify wrap for vector_add (no --aot-dir)
+  just npu-iron-export               # export-only collect (writes artifacts; no child PASS! expected)
+  earth-dragon-npu run --iron relu         # catalog: vector_add eltwise relu softmax gelu silu eltwise_mul swiglu scale_shift
+  earth-dragon-npu run --host-graph        # host linear on tests/fixtures/host_matmul_relu_add.json
+  earth-dragon-npu status [--json] [--external-runner PATH] [--external-cwd DIR]
+  earth-dragon-npu compile <model> [-O|--opt 0..3] [-q|--quantization QUANT] [--json]
+                             [--external-runner PATH] [--external-cwd DIR]
+  earth-dragon-npu run <model> [-O|--opt 0..3] [-q|--quantization QUANT]
                          [--input|-i PATH] [--input-len N] [--json]
-  dragon-npu probe [--json]          # requires --features amd-xdna2
-  dragon-npu help
+                         [--iron NAME] [--iron-export] [--host-graph]
+                         [--external-runner PATH] [--external-arg ARG]...
+                         [--external-cwd DIR]
+  earth-dragon-npu probe [--json]          # requires --features amd-xdna2
+  earth-dragon-npu help
 
 NOTES:
-  - compile/run use DragonNpu::new() + ModelCompiler / Backend::run (host path).
+  - compile/run use DragonNpu::new() + ModelCompiler / Backend::run (host path)
+    unless --iron, --external-runner, or env DRAGON_NPU_EXTERNAL_RUNNER is set.
+  - --iron NAME is the named IRON catalog (vector_add, eltwise, relu, softmax,
+    gelu, silu, eltwise_mul, swiglu, scale_shift). Resolves mlir-aie without
+    $MLIR_AIE. Prefer `just npu-relu` / `just npu-iron` (and siblings).
+    Does not compile a dummy host model. Child PASS! is not product ran_on_npu.
+    invent_pass=0. Default vector_add is the run+verify wrap (no --aot-dir).
+    --iron-export / `just npu-iron-export` is export-only: writes this-run
+    artifacts then returns. No child PASS! expected on the export path.
+  - --host-graph runs evaluate_host_graph on the fixture (host math, not NPU).
+    Default model is tests/fixtures/host_matmul_relu_add.json; default input [-1, 2].
+    Requires --features amd-xdna2. execution=host ran_on_npu=false invent_pass=0.
+  - --external-runner PATH is the raw opt-in wrap. Absolute program only.
+    Repeat --external-arg for argv. Never sh -c. JSON/text print
+    execution=external_runner and ran_on_npu=false even if the child prints PASS!.
+  - Do not mix --iron, --host-graph, and --external-runner.
   - With --features amd-xdna2, status may report hardware detection (simulated=false)
-    while CLI run() still uses the Simulation execution arm (AmdXdna2Backend::new).
+    while default CLI run() still uses the Simulation execution arm (AmdXdna2Backend::new).
     Silicon GEMM / ran_on_npu is never claimed from this CLI.
   - --input-len max is {MAX_INPUT_ELEMENTS} elements (~64 MiB f32 zeros).
   - This CLI never enables EXEC_CMD (no XDNA2_ALLOW_EXEC_CMD; no dangerous flags).
@@ -212,7 +374,16 @@ fn first_positional(args: &[String]) -> Option<String> {
             // flags that take a value
             if matches!(
                 a,
-                "-O" | "--opt" | "-q" | "--quantization" | "--input" | "-i" | "--input-len"
+                "-O" | "--opt"
+                    | "-q"
+                    | "--quantization"
+                    | "--input"
+                    | "-i"
+                    | "--input-len"
+                    | "--iron"
+                    | "--external-runner"
+                    | "--external-arg"
+                    | "--external-cwd"
             ) {
                 i += 2;
                 continue;
@@ -252,6 +423,26 @@ fn parse_string_flag(args: &[String], flag: &str, default: String) -> Result<Str
 
 fn parse_optional_string_flag(args: &[String], flag: &str) -> Result<Option<String>, String> {
     flag_value(args, flag)
+}
+
+/// All values for a repeatable flag (e.g. `--external-arg`).
+///
+/// The next token is taken literally, including child flags such as `--dev`.
+fn collect_repeatable_flag(args: &[String], flag: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            match args.get(i + 1) {
+                None => return Err(format!("flag {flag} requires a value")),
+                Some(v) => out.push(v.clone()),
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(out)
 }
 
 fn parse_usize_flag(args: &[String], flag: &str, default: usize) -> Result<usize, String> {
@@ -295,13 +486,23 @@ fn refuse_unknown_flags(args: &[String], known: &[&str]) -> Result<(), String> {
             // value-taking flags consume next token
             if matches!(
                 a,
-                "-O" | "--opt" | "-q" | "--quantization" | "--input" | "-i" | "--input-len"
+                "-O" | "--opt"
+                    | "-q"
+                    | "--quantization"
+                    | "--input"
+                    | "-i"
+                    | "--input-len"
+                    | "--iron"
+                    | "--external-runner"
+                    | "--external-arg"
+                    | "--external-cwd"
             ) {
                 if i + 1 >= args.len() {
                     return Err(format!("flag {a} requires a value"));
                 }
                 let v = args[i + 1].as_str();
-                if looks_like_flag(v) {
+                // Child argv may be `--dev`; only `--external-arg` accepts a flag-like value.
+                if looks_like_flag(v) && a != "--external-arg" {
                     return Err(format!("flag {a} requires a value (got '{v}')"));
                 }
                 i += 2;
@@ -415,11 +616,133 @@ pub fn load_input_f32(path: Option<&str>, zero_len: usize) -> Result<Vec<f32>, S
     let n = bytes.len() / 4;
     check_input_len(n, &format!("raw f32 input '{path}'"))?;
     let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(4) {
-        let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        out.push(f32::from_le_bytes(arr));
+    for chunk in bytes.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
+}
+
+/// Hard-coded host-graph honesty tokens. Not product Pass.
+#[must_use]
+pub fn format_host_graph_honesty_tokens() -> &'static str {
+    HOST_GRAPH_HONESTY_TOKENS
+}
+
+/// Resolve a CLI model path: absolute file, else cwd, else crate root.
+///
+/// Used so `run --host-graph` finds `tests/fixtures/...` when cwd is not
+/// the checkout. `--iron` does not compile a host model.
+///
+/// # Errors
+///
+/// File missing under cwd and crate root.
+pub fn resolve_cli_model_path_from(
+    model: &str,
+    cwd: &std::path::Path,
+    crate_root: &std::path::Path,
+) -> Result<String, String> {
+    let p = std::path::Path::new(model);
+    if p.is_absolute() {
+        if p.is_file() {
+            return Ok(model.to_string());
+        }
+        return Err(format!("model not found: {model}"));
+    }
+    let from_cwd = cwd.join(p);
+    if from_cwd.is_file() {
+        return Ok(from_cwd.to_string_lossy().into_owned());
+    }
+    let from_root = crate_root.join(p);
+    if from_root.is_file() {
+        return Ok(from_root.to_string_lossy().into_owned());
+    }
+    Err(format!("model '{model}' not found under cwd or crate root"))
+}
+
+/// Resolve `model` from process cwd, then this crate's manifest dir.
+///
+/// # Errors
+///
+/// File missing, or cwd unreadable.
+pub fn resolve_cli_model_path(model: &str) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    resolve_cli_model_path_from(model, &cwd, crate_root)
+}
+
+/// `--iron` child without compiling a dummy host model. Not product Pass.
+#[derive(Debug, Clone)]
+pub struct IronChildOutcome {
+    /// [`EXIT_OK`] when the child exit is 0.
+    pub exit: i32,
+    /// Always [`crate::backends::external_runner::RAN_ON_NPU`] (`false`).
+    pub ran_on_npu: bool,
+    /// Always [`crate::backends::external_runner::INVENT_PASS`] (`0`).
+    pub invent_pass: u8,
+    /// Informational: child stdout mentioned `PASS!`.
+    pub child_said_pass: bool,
+    /// Parsed numbers (empty when the child printed none). Never invented.
+    pub parsed: Vec<f32>,
+    /// Always false: this path never calls `compile_model`.
+    pub compiled_host_model: bool,
+    /// Child report when spawn succeeded.
+    pub report: Option<crate::backends::external_runner::ExternalRunnerReport>,
+    /// Spawn / runner error text when [`Self::report`] is `None`.
+    pub error: Option<String>,
+}
+
+/// Spawn the IRON wrap. Does **not** compile `tests/fixtures/host_matmul_relu.json`.
+///
+/// Honesty fields are constants. Child `PASS!` is not `ran_on_npu`.
+#[must_use]
+pub fn run_iron_without_host_model(
+    backend: &crate::backends::external_runner::ExternalRunnerBackend,
+) -> IronChildOutcome {
+    use crate::backends::external_runner::{INVENT_PASS, RAN_ON_NPU};
+    match backend.run_external() {
+        Ok(report) => {
+            let parsed = backend.parsed_output(&report);
+            let ok = report.child_exit_ok();
+            IronChildOutcome {
+                exit: if ok { EXIT_OK } else { EXIT_ERROR },
+                ran_on_npu: RAN_ON_NPU,
+                invent_pass: INVENT_PASS,
+                child_said_pass: report.child_said_pass,
+                parsed,
+                compiled_host_model: false,
+                report: Some(report),
+                error: None,
+            }
+        }
+        Err(e) => IronChildOutcome {
+            exit: EXIT_ERROR,
+            ran_on_npu: RAN_ON_NPU,
+            invent_pass: INVENT_PASS,
+            child_said_pass: false,
+            parsed: Vec::new(),
+            compiled_host_model: false,
+            report: None,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+/// Host linear: compile `model_path` then [`crate::backends::amd_xdna2::evaluate_host_graph`].
+///
+/// Not product Pass. Label execution as host. Requires `amd-xdna2`.
+/// Resolves a cwd-relative default fixture from the crate root.
+///
+/// # Errors
+///
+/// Feature missing, compile fail, or host-graph refuse.
+#[cfg(feature = "amd-xdna2")]
+pub fn evaluate_cli_host_graph(model_path: &str, input: &[f32]) -> Result<Vec<f32>, String> {
+    let resolved = resolve_cli_model_path(model_path)?;
+    let npu = crate::DragonNpu::new().map_err(|e| e.to_string())?;
+    let compiled = npu
+        .compile_model(&resolved, DEFAULT_OPT_LEVEL, DEFAULT_QUANT)
+        .map_err(|e| e.to_string())?;
+    crate::backends::amd_xdna2::evaluate_host_graph(&compiled, input).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -440,7 +763,11 @@ mod tests {
     fn parse_status_json() {
         assert_eq!(
             parse_args(&s(&["status", "--json"])).unwrap(),
-            Command::Status { json: true }
+            Command::Status {
+                json: true,
+                external_runner: None,
+                external_cwd: None,
+            }
         );
     }
 
@@ -453,11 +780,15 @@ mod tests {
                 opt,
                 quant,
                 json,
+                external_runner,
+                external_cwd,
             } => {
                 assert_eq!(model, "m.json");
                 assert_eq!(opt, 3);
                 assert_eq!(quant, "int8");
                 assert!(!json);
+                assert!(external_runner.is_none());
+                assert!(external_cwd.is_none());
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -629,11 +960,435 @@ mod tests {
         assert!(h.contains("--quantization"));
         assert!(h.contains("-i"));
         assert!(h.contains("Simulation execution arm") || h.contains("host path"));
+        assert!(h.contains("--external-runner"));
+        assert!(h.contains("just npu-iron"));
+        assert!(h.contains("execution=external_runner"));
+        assert!(h.contains("ran_on_npu=false"));
+    }
+
+    #[test]
+    fn parse_run_external_runner_args() {
+        let c = parse_args(&s(&[
+            "run",
+            "m.json",
+            "--external-runner",
+            "/usr/bin/python3",
+            "--external-arg",
+            "vector_scalar_add.py",
+            "--external-arg",
+            "--dev",
+            "--external-arg",
+            "npu2",
+            "--external-cwd",
+            "/tmp",
+            "--json",
+        ]))
+        .unwrap();
+        match c {
+            Command::Run {
+                external_runner,
+                external_args,
+                external_cwd,
+                json,
+                ..
+            } => {
+                assert_eq!(external_runner.as_deref(), Some("/usr/bin/python3"));
+                assert_eq!(
+                    external_args,
+                    vec![
+                        "vector_scalar_add.py".to_string(),
+                        "--dev".to_string(),
+                        "npu2".to_string()
+                    ]
+                );
+                assert_eq!(external_cwd.as_deref(), Some("/tmp"));
+                assert!(json);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_external_runner_missing_value_is_usage() {
+        let err = parse_args(&s(&["run", "m.json", "--external-runner"])).unwrap_err();
+        assert!(err.contains("requires a value"), "{err}");
     }
 
     #[test]
     fn schema_version_matches_crate_root() {
         // Default-feature: feature-disabled JSON emitters must share this constant.
         assert_eq!(crate::TIMED_OP_JSON_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn parse_run_iron_relu_and_siblings() {
+        for (name, suffix, argv_head) in [
+            (
+                "vector_add",
+                "programming_examples/basic/vector_scalar_add",
+                "vector_scalar_add.py",
+            ),
+            ("eltwise", "programming_examples/ml/eltwise", "eltwise.py"),
+            (
+                "relu",
+                "programming_examples/ml/eltwise_unary",
+                "eltwise_unary.py",
+            ),
+            ("softmax", "programming_examples/ml/softmax", "softmax.py"),
+            (
+                "gelu",
+                "programming_examples/ml/eltwise_unary",
+                "eltwise_unary.py",
+            ),
+            (
+                "silu",
+                "programming_examples/ml/eltwise_unary",
+                "eltwise_unary.py",
+            ),
+            (
+                "eltwise_mul",
+                "programming_examples/ml/eltwise",
+                "eltwise.py",
+            ),
+            ("swiglu", "programming_examples/ml/swiglu", "swiglu.py"),
+            (
+                "scale_shift",
+                "programming_examples/ml/scale_shift",
+                "scale_shift.py",
+            ),
+        ] {
+            let c = parse_args(&s(&["run", "m.json", "--iron", name]))
+                .unwrap_or_else(|e| panic!("--iron {name}: {e}"));
+            match c {
+                Command::Run {
+                    iron_kernel,
+                    host_graph,
+                    external_runner,
+                    ..
+                } => {
+                    assert_eq!(iron_kernel.as_deref(), Some(name));
+                    assert!(!host_graph);
+                    assert!(external_runner.is_none());
+                    let spec =
+                        crate::backends::iron_kernel::iron_kernel_spec(name).expect("catalog name");
+                    assert_eq!(spec.cwd_suffix, suffix);
+                    assert_eq!(spec.argv[0], argv_head);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_run_iron_export_is_opt_in_not_default() {
+        let default = parse_args(&s(&["run", "--iron", "vector_add"])).expect("default wrap");
+        match default {
+            Command::Run {
+                iron_kernel,
+                iron_export,
+                ..
+            } => {
+                assert_eq!(iron_kernel.as_deref(), Some("vector_add"));
+                assert!(!iron_export, "default --iron is the run wrap, not export");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let export = parse_args(&s(&["run", "--iron", "vector_add", "--iron-export"]))
+            .expect("opt-in export");
+        match export {
+            Command::Run {
+                iron_kernel,
+                iron_export,
+                ..
+            } => {
+                assert_eq!(iron_kernel.as_deref(), Some("vector_add"));
+                assert!(iron_export, "--iron-export must set the export flag");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let err = parse_args(&s(&["run", "m.json", "--iron-export"]))
+            .expect_err("--iron-export without --iron must refuse");
+        assert!(
+            err.contains("--iron-export") && err.contains("--iron"),
+            "export without --iron must mention both, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_iron_unknown_fails_closed() {
+        let err = parse_args(&s(&["run", "m.json", "--iron", "not-a-kernel"]))
+            .expect_err("unknown --iron name must refuse");
+        assert!(
+            err.contains("unknown") && err.contains("not-a-kernel"),
+            "expected unknown-name refuse, got: {err}"
+        );
+        assert!(
+            err.contains("vector_add") && err.contains("relu"),
+            "error should list known names, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_host_graph_flag() {
+        let c = parse_args(&s(&[
+            "run",
+            "tests/fixtures/host_matmul_relu_add.json",
+            "--host-graph",
+        ]))
+        .expect("--host-graph");
+        match c {
+            Command::Run {
+                host_graph,
+                iron_kernel,
+                model,
+                ..
+            } => {
+                assert!(host_graph);
+                assert!(iron_kernel.is_none());
+                assert_eq!(model, "tests/fixtures/host_matmul_relu_add.json");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_iron_and_host_graph_are_exclusive() {
+        let err = parse_args(&s(&["run", "m.json", "--iron", "relu", "--host-graph"]))
+            .expect_err("must refuse mixing --iron and --host-graph");
+        assert!(
+            err.contains("--iron") && err.contains("--host-graph"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_iron_and_external_runner_are_exclusive() {
+        let err = parse_args(&s(&[
+            "run",
+            "m.json",
+            "--iron",
+            "relu",
+            "--external-runner",
+            "/usr/bin/true",
+        ]))
+        .expect_err("must refuse mixing --iron and --external-runner");
+        assert!(
+            err.contains("--iron") && err.contains("--external-runner"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_host_graph_and_external_runner_are_exclusive() {
+        let err = parse_args(&s(&[
+            "run",
+            "m.json",
+            "--host-graph",
+            "--external-runner",
+            "/usr/bin/true",
+        ]))
+        .expect_err("must refuse mixing --host-graph and --external-runner");
+        assert!(
+            err.contains("--host-graph") && err.contains("--external-runner"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_iron_without_model_uses_default() {
+        let c = parse_args(&s(&["run", "--iron", "relu"])).expect("run --iron relu");
+        match c {
+            Command::Run {
+                model,
+                iron_kernel,
+                host_graph,
+                ..
+            } => {
+                assert_eq!(iron_kernel.as_deref(), Some("relu"));
+                assert!(!host_graph);
+                assert_eq!(model, DEFAULT_IRON_MODEL);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_host_graph_without_model_uses_default() {
+        let c = parse_args(&s(&["run", "--host-graph"])).expect("run --host-graph");
+        match c {
+            Command::Run {
+                model,
+                host_graph,
+                iron_kernel,
+                ..
+            } => {
+                assert!(host_graph);
+                assert!(iron_kernel.is_none());
+                assert_eq!(model, DEFAULT_HOST_GRAPH_MODEL);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_bare_is_usage() {
+        let err = parse_args(&s(&["run"])).expect_err("bare run must be usage");
+        assert!(
+            err.contains("usage"),
+            "bare run must mention usage, got: {err}"
+        );
+    }
+
+    #[test]
+    fn help_lists_iron_names_and_host_graph() {
+        let h = help_text();
+        assert!(h.contains("--iron"), "help must list --iron");
+        assert!(h.contains("vector_add"), "help must list vector_add");
+        assert!(h.contains("eltwise"), "help must list eltwise");
+        assert!(h.contains("relu"), "help must list relu");
+        assert!(h.contains("softmax"), "help must list softmax");
+        assert!(h.contains("gelu"), "help must list gelu");
+        assert!(h.contains("silu"), "help must list silu");
+        assert!(h.contains("eltwise_mul"), "help must list eltwise_mul");
+        assert!(h.contains("swiglu"), "help must list swiglu");
+        assert!(h.contains("scale_shift"), "help must list scale_shift");
+        assert!(h.contains("--host-graph"), "help must list --host-graph");
+        assert!(
+            h.contains("just npu-relu"),
+            "help must lead with just npu-relu"
+        );
+        assert!(h.contains("npu-swiglu"), "help lead must list npu-swiglu");
+        assert!(
+            h.contains("npu-scale-shift"),
+            "help lead must list npu-scale-shift"
+        );
+        assert!(
+            h.contains("--iron-export") || h.contains("npu-iron-export"),
+            "help must name the opt-in export path"
+        );
+        assert!(
+            h.contains("invent_pass=0"),
+            "help must hard-code invent_pass=0"
+        );
+        assert!(
+            h.contains("ran_on_npu=false"),
+            "help must hard-code ran_on_npu=false"
+        );
+        assert!(
+            h.contains("execution=host"),
+            "help must label host-graph execution=host"
+        );
+    }
+
+    #[test]
+    fn iron_run_skips_missing_dummy_model() {
+        use crate::backends::external_runner::{
+            ChildOutput, CommandRunner, ExternalRunnerBackend, ExternalRunnerConfig, INVENT_PASS,
+            RAN_ON_NPU, SpawnRequest,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct Scripted {
+            last: Mutex<Option<SpawnRequest>>,
+        }
+        impl CommandRunner for Scripted {
+            fn run(&self, request: &SpawnRequest) -> Result<ChildOutput, crate::DragonNpuError> {
+                *self.last.lock().expect("lock") = Some(request.clone());
+                Ok(ChildOutput {
+                    status_code: Some(0),
+                    stdout: "PASS!\n".into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "dragon_npu_iron_skip_compile_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("temp cwd");
+        let dummy = tmp.join(DEFAULT_IRON_MODEL);
+        assert!(
+            !dummy.is_file(),
+            "temp cwd must not contain the dummy fixture"
+        );
+        let npu = crate::DragonNpu::new().expect("npu");
+        npu.compile_model(
+            dummy.to_str().expect("utf8"),
+            DEFAULT_OPT_LEVEL,
+            DEFAULT_QUANT,
+        )
+        .expect_err("missing dummy must fail compile");
+
+        let program = if std::path::Path::new("/usr/bin/true").is_file() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        };
+        let cfg =
+            ExternalRunnerConfig::new(program, vec![], Some(tmp.to_string_lossy().into_owned()))
+                .expect("temp cwd is a directory");
+        let backend = ExternalRunnerBackend::with_runner(
+            cfg,
+            Arc::new(Scripted {
+                last: Mutex::new(None),
+            }),
+        );
+        let out = run_iron_without_host_model(&backend);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(out.exit, EXIT_OK);
+        assert!(!out.ran_on_npu);
+        assert_eq!(out.ran_on_npu, RAN_ON_NPU);
+        assert_eq!(out.invent_pass, INVENT_PASS);
+        assert_eq!(out.invent_pass, 0);
+        assert!(out.child_said_pass);
+        assert!(!out.compiled_host_model);
+        assert_eq!(out.parsed, [] as [f32; 0]);
+        assert!(out.report.is_some());
+        assert!(out.error.is_none());
+    }
+
+    #[cfg(feature = "amd-xdna2")]
+    #[test]
+    fn host_graph_fixture_returns_documented_pair() {
+        let path = format!(
+            "{}/tests/fixtures/host_matmul_relu_add.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let out =
+            evaluate_cli_host_graph(&path, &DEFAULT_HOST_GRAPH_INPUT).expect("host graph fixture");
+        assert_eq!(
+            out,
+            vec![0.5, 3.5],
+            "documented host linear: [-1, 2] -> [0.5, 3.5]"
+        );
+        assert_eq!(
+            format_host_graph_honesty_tokens(),
+            "execution=host ran_on_npu=false invent_pass=0"
+        );
+    }
+
+    #[cfg(feature = "amd-xdna2")]
+    #[test]
+    fn host_graph_default_model_resolves_from_crate_root() {
+        let tmp =
+            std::env::temp_dir().join(format!("dragon_npu_host_graph_cwd_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("temp cwd");
+        assert!(
+            !tmp.join(DEFAULT_HOST_GRAPH_MODEL).is_file(),
+            "temp cwd must not contain the fixture"
+        );
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resolved = resolve_cli_model_path_from(DEFAULT_HOST_GRAPH_MODEL, &tmp, crate_root)
+            .expect("crate-root fallback");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out = evaluate_cli_host_graph(&resolved, &DEFAULT_HOST_GRAPH_INPUT)
+            .expect("host graph after crate-root resolve");
+        assert_eq!(
+            out,
+            vec![0.5, 3.5],
+            "no-positional --host-graph must still return [0.5, 3.5] from crate root"
+        );
     }
 }

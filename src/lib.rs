@@ -1,4 +1,4 @@
-//! # DragonNPU
+//! # Earth Dragon NPU
 //!
 //! Production-quality Rust library for vendor-agnostic NPU (Neural Processing Unit)
 //! acceleration on Linux.
@@ -10,7 +10,7 @@
 //!
 //! ## Design Principles
 //!
-//! - **Library-first**: Core API is the product; optional `dragon-npu` binary is a thin Phase 8 wrapper.
+//! - **Library-first**: Core API is the product; optional `earth-dragon-npu` binary is a thin Phase 8 wrapper.
 //! - **TDD**: Tests are written first. Use `cargo test` as the primary loop.
 //! - **Zero panics in library code**: No `unwrap()`, `expect()`, `panic!()`,
 //!   or `unreachable!()`. Every fallible operation returns `Result<T, DragonNpuError>`.
@@ -25,11 +25,13 @@
 //!   **No** default silicon GEMM Pass / `ran_on_npu` without numerical verify.
 //! - Secondary features `intel-vpu` / `qualcomm-hexagon`: honest stubs only (not auto-selected).
 //! - Optional `xrt-bridge`: research refuse-stub only — never default or hot path.
-//! - Real ONNX + Phase 7 typed `DragonNpuIR`; Phase 8 CLI (`dragon-npu`).
+//! - Opt-in `external_runner` (IRON/eepy wrap): `execution=external_runner`,
+//!   `ran_on_npu` always false. Not selected by `DragonNpu::new`.
+//! - Real ONNX + Phase 7 typed `DragonNpuIR`; Phase 8 CLI (`earth-dragon-npu`).
 //!
 //! See `PLAN.md`, `AGENTS.md`, `docs/SECONDARY_BACKENDS.md`, `docs/PACKAGING.md`.
 
-/// Error types for the DragonNPU library.
+/// Error types for the Earth Dragon NPU library.
 ///
 /// See `src/error.rs` for the full `DragonNpuError` enum definition.
 pub mod error;
@@ -47,6 +49,9 @@ pub mod core;
 pub use core::{CompiledModel, DragonNpu, NpuStatus};
 
 pub mod backends;
+pub use backends::external_runner::{
+    EXECUTION_EXTERNAL_RUNNER, ExternalRunnerBackend, ExternalRunnerConfig, ExternalRunnerReport,
+};
 pub use backends::simulation::SimulationBackend;
 
 /// Compiler module (real ONNX loading with multi-dtype weights + bf16 raw, optimization passes with observable mutations, numeric weight data use in scoring and memory planning).
@@ -73,13 +78,13 @@ pub use ir::{
 /// See `docs/COLIBRI_ADAPTER.md`.
 pub const TIMED_OP_JSON_SCHEMA_VERSION: u32 = 1;
 
-/// CLI argv helpers for the optional `dragon-npu` binary (Phase 8).
+/// CLI argv helpers for the optional `earth-dragon-npu` binary (Phase 8).
 ///
 /// Pure parse/load helpers are unit-tested here so default `cargo test --lib`
 /// never opens `/dev/accel` or enables EXEC_CMD.
 pub mod cli;
 
-/// Re-exports for convenient `use dragon_npu::prelude::*;`
+/// Re-exports for convenient `use earth_dragon_npu::prelude::*;`
 pub mod prelude {
     pub use crate::CompiledModel;
     pub use crate::DragonNpu;

@@ -25,11 +25,10 @@ use std::fs;
 use std::io::Read;
 #[cfg(feature = "amd-xdna2")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "amd-xdna2")]
 use std::process::ExitCode;
 
 #[cfg(feature = "amd-xdna2")]
-use dragon_npu::backends::amd_xdna2::{
+use earth_dragon_npu::backends::amd_xdna2::{
     MAX_MLADF_LAB_FILE_BYTES, SiliconPassEval, SiliconPassEvidence, default_last_apply_path,
     evaluate_silicon_pass_evidence, format_silicon_pass_eval_note, last_apply_load_path_is_allowed,
     silicon_pass_evidence_from_last_apply,
@@ -39,7 +38,7 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "amd-xdna2"))]
     {
         eprintln!("c4_pass_check requires --features amd-xdna2");
-        return ExitCode::from(2);
+        ExitCode::from(2)
     }
     #[cfg(feature = "amd-xdna2")]
     {
