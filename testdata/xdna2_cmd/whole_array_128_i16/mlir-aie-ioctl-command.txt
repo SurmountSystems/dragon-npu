@@ -1,0 +1,10 @@
+# NOT executed.
+# Do not retry on failure.
+# Timeout 60.
+# Host opcode cite is the integer 3 at programming_examples/basic/matrix_multiplication/test.cpp:229 (`unsigned int opcode = 3;`). That integer is not named ERT_START_NPU. 18 is ERT_START_DPU and 20 is ERT_START_NPU. They are not the host opcode and are not stored.
+# Argument names only: opcode, instr, ninstr, A, B, C (test.cpp:232 and set_arg lines 234-239). Not address words.
+# EXEC_CMD packed request word is cited as 0xc0386446. Compiler stdout in /home/hunter/.agents/reports/dragon-npu-mlir-aie-macro-eval.md: installed and local both printed `DRM_IOCTL_AMDXDNA_EXEC_CMD decimal=3224921158 hex=0xc0386446`. That word is stored and is not issued. The cargo line below stays commented. This file was not run.
+# Still refused, so this file stays unexecuted: packed WAIT_CMD request, xclbin AIE_PARTITION partition info, amdxdna_cmd_start_npu numeric offsets, num_tiles from this xclbin, instruction CREATE_BO type code.
+# BO types 3, 4, and 9 are not stored. The instruction CREATE_BO choice is not one of those types.
+# The reason string is not an unlock. C_UNLOCK=2c9c12e8 stays CONSUMED.
+# timeout 60 env XDNA2_ALLOW_EXEC_CMD=1 cargo run --features amd-xdna2,xdna2-dangerous-exec-cmd --example mlir_aie_ioctl -- --reason "ioctl-native MLIR_AIE whole_array" --xclbin /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/final.xclbin --xclbin-sha256 0cadf32ec0472e3f55e9102a6175d005b1a95a8ea428907086e15ad44d825dad --insts /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/insts.bin --insts-sha256 ae692499a79c74b46175cb4841f235edb0059175144941522f792105b758dec3

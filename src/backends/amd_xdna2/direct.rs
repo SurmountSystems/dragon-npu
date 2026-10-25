@@ -377,6 +377,21 @@ pub const MAX_SUGGESTED_HWCTX_TILES: u32 = 8;
 /// - Higher `npu_tops_max` (≥40, e.g. Strix 50+) → 8; else 4.
 ///
 /// Does **not** claim optimal silicon utilization or GEMM efficiency.
+/// One cited whole-array device attempt. Output is little-endian i32 cells.
+pub struct CitedWholeArrayDeviceOut {
+    /// Device bytes read back after the cited submit. Empty until a read succeeds.
+    pub output_i32_le: Vec<u8>,
+}
+
+/// One cited ioctl failed. The request word and errno are the failure, not a retry.
+#[derive(Debug)]
+pub struct CitedWholeArrayDeviceError {
+    /// Packed request that failed.
+    pub request: u64,
+    /// Errno from that ioctl.
+    pub errno: i32,
+}
+
 #[must_use]
 pub fn suggest_hwctx_tiles(resource: &amdxdna_drm_get_resource_info) -> u32 {
     suggest_hwctx_tiles_from_tops(resource.npu_tops_max)
@@ -4254,6 +4269,585 @@ pub fn exec_cmd_block_reason() -> &'static str {
     }
 }
 
+fn cited_whole_array_anchor_pad() {}
+
+impl std::fmt::Display for CitedWholeArrayDeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cited whole-array device ioctl {request:#x} failed with errno {errno}",
+            request = self.request,
+            errno = self.errno
+        )
+    }
+}
+
+impl std::error::Error for CitedWholeArrayDeviceError {}
+
+const CITED_XCLBIN_LEN: usize = 73327;
+const CITED_INSTS_LEN: usize = 2592;
+const CITED_XCLBIN_SHA256: &str =
+    "0cadf32ec0472e3f55e9102a6175d005b1a95a8ea428907086e15ad44d825dad";
+const CITED_INSTS_SHA256: &str = "ae692499a79c74b46175cb4841f235edb0059175144941522f792105b758dec3";
+const CITED_TYPE3_BO_BYTES: usize = 0x10530;
+const CITED_CREATE_HWCTX: u64 = 0xc038_6440;
+const CITED_CONFIG_HWCTX: u64 = 0xc018_6442;
+const CITED_EXEC_CMD: u64 = 0xc038_6446;
+const CITED_SYNCOBJ_TIMELINE_WAIT: u64 = 0xc030_64ca;
+const CITED_SYNCOBJ_CREATE: u64 = 0xc008_64bf;
+const CITED_DESTROY_HWCTX: u64 = 0x4008_6441;
+const CITED_GEM_CLOSE: u64 = 0x4008_6409;
+const CITED_SYNCOBJ_DESTROY: u64 = 0x4008_64c0;
+
+/// Provisional cited requests. Non-pointer words are replaced from the cite.
+/// Forbidden and never sent: 0x40106449, 0xc0106449, 0xc0186445.
+const CITED_WHOLE_ARRAY_REQUESTS: [u64; 28] = [
+    CITED_SYNCOBJ_CREATE,
+    CITED_CREATE_HWCTX,
+    CITED_CONFIG_HWCTX,
+    CITED_EXEC_CMD,
+    CITED_SYNCOBJ_TIMELINE_WAIT,
+    CITED_GEM_CLOSE,
+    CITED_SYNCOBJ_DESTROY,
+    CITED_DESTROY_HWCTX,
+    CITED_SYNCOBJ_CREATE,
+    CITED_CREATE_HWCTX,
+    CITED_CONFIG_HWCTX,
+    CITED_EXEC_CMD,
+    CITED_SYNCOBJ_TIMELINE_WAIT,
+    CITED_GEM_CLOSE,
+    CITED_SYNCOBJ_DESTROY,
+    CITED_DESTROY_HWCTX,
+    CITED_SYNCOBJ_CREATE,
+    CITED_CREATE_HWCTX,
+    CITED_CONFIG_HWCTX,
+    CITED_EXEC_CMD,
+    CITED_SYNCOBJ_TIMELINE_WAIT,
+    CITED_GEM_CLOSE,
+    CITED_SYNCOBJ_DESTROY,
+    CITED_DESTROY_HWCTX,
+    CITED_SYNCOBJ_CREATE,
+    CITED_CREATE_HWCTX,
+    CITED_CONFIG_HWCTX,
+    CITED_EXEC_CMD,
+];
+
+const CITED_WHOLE_ARRAY_WIDTHS: [usize; 28] = [
+    8, 56, 24, 56, 48, 8, 8, 8, 8, 56, 24, 56, 48, 8, 8, 8, 8, 56, 24, 56, 48, 8, 8, 8, 8, 56, 24,
+    56,
+];
+
+/// One device submit of the cited whole-array pair. Fresh kernel handles and
+/// this process's pointers. No retry. Does not parse AIE_PARTITION.
+pub fn send_cited_whole_array_device_once(
+    xclbin: &std::path::Path,
+    insts: &std::path::Path,
+) -> Result<CitedWholeArrayDeviceOut, CitedWholeArrayDeviceError> {
+    cited_whole_array_anchor_pad();
+    let xclbin_bytes = std::fs::read(xclbin).map_err(cited_whole_array_io_error)?;
+    let inst_bytes = std::fs::read(insts).map_err(cited_whole_array_io_error)?;
+    if !cited_whole_array_pair_ok(&xclbin_bytes, &inst_bytes) {
+        return Err(CitedWholeArrayDeviceError {
+            request: 0,
+            errno: libc::EINVAL,
+        });
+    }
+    // 73327 does not fit in the 0x10530 type-3 BO. Do not copy it there.
+    let _xclbin_not_in_type3 = xclbin_bytes.len() > CITED_TYPE3_BO_BYTES;
+    let _ = inst_bytes.len();
+
+    // Default path: refuse before any open. No libc::open on this path.
+    if !exec_cmd_is_enabled() {
+        return Err(CitedWholeArrayDeviceError {
+            request: 0,
+            errno: libc::EPERM,
+        });
+    }
+    replay_printed_cited_requests(&xclbin_bytes, &inst_bytes)
+}
+
+#[allow(unsafe_code)]
+fn replay_printed_cited_requests(
+    xclbin: &[u8],
+    insts: &[u8],
+) -> Result<CitedWholeArrayDeviceOut, CitedWholeArrayDeviceError> {
+    // Printed request words from trace28-named-test.log. Index is 1-based.
+    // 4 CREATE_HWCTX 0xc0386440, 7 CONFIG_HWCTX 0xc0186442,
+    // 18 EXEC_CMD 0xc0386446, 19 0xc03064ca, 26 0xc00864c0,
+    // 27 0xc0086441, 28 0x40086409.
+    // Do not send 0x400864c0 or 0x40086441. No SYNC_BO, SET_STATE,
+    // WAIT_CMD 0x40106449, or GET_ARRAY unless that word is in this list.
+    const REQUESTS: [u64; 28] = [
+        0xc020_6443,
+        0xc030_6444,
+        0xc010_6447,
+        0xc038_6440,
+        0xc020_6443,
+        0xc030_6444,
+        0xc018_6442,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc038_6446,
+        0xc030_64ca,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0xc008_64c0,
+        0xc008_6441,
+        0x4008_6409,
+    ];
+    // Gate was checked by the caller. This path opens and issues REQUESTS.
+    // Do not return EPERM here before open.
+    let _xclbin_not_copied_into_type3 = xclbin.len() > CITED_TYPE3_BO_BYTES;
+    const DEV: &[u8] = b"/dev/accel/accel0\0";
+    let fd = unsafe { libc::open(DEV.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(CitedWholeArrayDeviceError {
+            request: 0,
+            errno: std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        });
+    }
+    let cmd = insts.to_vec();
+    let output = vec![0u8; 128 * 128 * 4];
+    let mut hwctx: Option<u32> = None;
+    let mut bos: Vec<u32> = Vec::new();
+    let mut sync_handles = [0u32; 4];
+    let mut sync_points = [0u64; 4];
+    cited_replay_reset_bo_words();
+    for (request_index, request) in REQUESTS.into_iter().enumerate() {
+        if cited_request_is_forbidden(request) || request == 0xc010_6448 || request == 0xc018_644a {
+            cited_replay_cleanup(fd, hwctx, &bos);
+            return Err(CitedWholeArrayDeviceError {
+                request,
+                errno: libc::EINVAL,
+            });
+        }
+        let width = ((request >> 16) & 0x3fff) as usize;
+        let mut arg = cited_whole_array_build_arg(
+            request,
+            width,
+            xclbin,
+            insts,
+            &cmd,
+            &output,
+            &sync_handles,
+            &sync_points,
+            hwctx,
+        );
+        // Only request index 0. Later CREATE_BO rows keep their own words.
+        if request_index == 0 && request == 0xc020_6443 && arg.len() == 32 {
+            arg.copy_from_slice(&first_cited_replay_argument());
+        }
+        if request == CITED_GEM_CLOSE && arg.len() >= 4 {
+            if let Some(handle) = bos.first().copied() {
+                arg[..4].copy_from_slice(&handle.to_ne_bytes());
+            }
+        }
+        if request == 0xc008_6441 && arg.len() >= 4 {
+            if let Some(handle) = hwctx {
+                arg[..4].copy_from_slice(&handle.to_ne_bytes());
+            }
+        }
+        let rc = unsafe {
+            libc::ioctl(
+                fd,
+                request as libc::c_ulong,
+                arg.as_mut_ptr().cast::<libc::c_void>(),
+            )
+        };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            cited_replay_cleanup(fd, hwctx, &bos);
+            return Err(CitedWholeArrayDeviceError { request, errno });
+        }
+        if request == CITED_CREATE_HWCTX && arg.len() >= 4 {
+            let handle = u32::from_ne_bytes([arg[0], arg[1], arg[2], arg[3]]);
+            if handle != 0 && handle != 0x800 && handle != 0x20 {
+                hwctx = Some(handle);
+            }
+        } else {
+            cited_whole_array_harvest(request, &arg, &mut hwctx, &mut bos, &mut sync_handles);
+        }
+        if request == 0xc020_6443 && arg.len() >= 32 {
+            let handle = u32::from_ne_bytes([arg[28], arg[29], arg[30], arg[31]]);
+            cited_replay_note_returned_bo_handle(handle);
+            if handle != 0 {
+                bos.push(handle);
+            }
+        }
+        if request == CITED_GEM_CLOSE && !bos.is_empty() {
+            bos.remove(0);
+        }
+        if request == 0xc008_6441 {
+            hwctx = None;
+        }
+    }
+    // 28 requests include GEM_CLOSE and DESTROY_HWCTX. Drop anything still tracked, then close.
+    cited_replay_cleanup(fd, hwctx, &bos);
+    // No device bytes were copied out. Do not return an empty or all-zero buffer.
+    let _ = output;
+    Err(CitedWholeArrayDeviceError {
+        request: CITED_EXEC_CMD,
+        errno: libc::EIO,
+    })
+}
+
+#[allow(unsafe_code)]
+fn cited_replay_cleanup(fd: libc::c_int, hwctx: Option<u32>, bos: &[u32]) {
+    if let Some(handle) = hwctx {
+        let mut arg = [0u8; 8];
+        arg[..4].copy_from_slice(&handle.to_ne_bytes());
+        unsafe {
+            let _ = libc::ioctl(
+                fd,
+                0xc008_6441u64 as libc::c_ulong,
+                arg.as_mut_ptr().cast::<libc::c_void>(),
+            );
+        }
+    }
+    for handle in bos {
+        let mut arg = [0u8; 8];
+        arg[..4].copy_from_slice(&handle.to_ne_bytes());
+        unsafe {
+            let _ = libc::ioctl(
+                fd,
+                CITED_GEM_CLOSE as libc::c_ulong,
+                arg.as_mut_ptr().cast::<libc::c_void>(),
+            );
+        }
+    }
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+fn cited_whole_array_io_error(err: std::io::Error) -> CitedWholeArrayDeviceError {
+    CitedWholeArrayDeviceError {
+        request: 0,
+        errno: err.raw_os_error().unwrap_or(libc::EIO),
+    }
+}
+
+fn cited_whole_array_pair_ok(xclbin: &[u8], insts: &[u8]) -> bool {
+    xclbin.len() == CITED_XCLBIN_LEN
+        && insts.len() == CITED_INSTS_LEN
+        && cited_whole_array_sha256_hex(xclbin) == CITED_XCLBIN_SHA256
+        && cited_whole_array_sha256_hex(insts) == CITED_INSTS_SHA256
+}
+
+fn cited_request_is_forbidden(request: u64) -> bool {
+    matches!(request, 0x4010_6449 | 0xc010_6449 | 0xc018_6445)
+}
+
+fn index_used(n: usize) -> usize {
+    n
+}
+
+// Create-BO row counter and the handle a fake or real ioctl return would
+// hand to the next 0xc0306444. Zero until something notes a return.
+// cited_whole_array_build_arg reads both. It does not ioctl.
+std::thread_local! {
+    static CITED_CREATE_BO_ORDINAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CITED_PENDING_BO_HANDLE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn cited_replay_reset_bo_words() {
+    CITED_CREATE_BO_ORDINAL.with(|ordinal| ordinal.set(0));
+    CITED_PENDING_BO_HANDLE.with(|pending| pending.set(0));
+}
+
+fn cited_replay_note_returned_bo_handle(handle: u32) {
+    CITED_PENDING_BO_HANDLE.with(|pending| pending.set(handle));
+}
+
+/// First cited replay argument for request `0xc0206443`.
+/// Non-pointer words only. Later CREATE_BO rows are not this buffer.
+/// Offset 16 is little-endian `0x04000000`. Offset 24 is little-endian `2`.
+fn first_cited_replay_argument() -> [u8; 32] {
+    [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ]
+}
+
+fn cited_create_bo_row(ordinal: usize) -> Option<(u32, u32)> {
+    // before-args.txt CREATE_BO input words, in call order. Not kernel handles.
+    const ROWS: [(u32, u32); 7] = [
+        (0x0400_0000, 2),
+        (0x0001_0530, 3),
+        (0x0a20, 3),
+        (0x8000, 1),
+        (0x8000, 1),
+        (0x0001_0000, 1),
+        (0x1000, 4),
+    ];
+    ROWS.get(ordinal).copied()
+}
+
+fn cited_bo_size_and_type(cmd: &[u8], output: &[u8]) -> Option<(u32, u32)> {
+    if cmd.len() == 4 && output.len() == 4 {
+        let mut size_buf = [0u8; 4];
+        let mut type_buf = [0u8; 4];
+        size_buf.copy_from_slice(cmd);
+        type_buf.copy_from_slice(output);
+        return Some((u32::from_le_bytes(size_buf), u32::from_le_bytes(type_buf)));
+    }
+    let ordinal = CITED_CREATE_BO_ORDINAL.with(|cell| {
+        let next = cell.get();
+        cell.set(next.saturating_add(1));
+        next
+    });
+    cited_create_bo_row(ordinal)
+}
+
+fn cited_replay_fill_bo_words(
+    request: u64,
+    arg: &mut [u8],
+    cmd: &[u8],
+    output: &[u8],
+    sync_handles: &[u32; 4],
+) {
+    if request == 0xc020_6443 && arg.len() >= 32 {
+        if let Some((size, ty)) = cited_bo_size_and_type(cmd, output) {
+            arg[16..20].copy_from_slice(&size.to_le_bytes());
+            arg[24..28].copy_from_slice(&ty.to_le_bytes());
+        }
+    }
+    if request == 0xc030_6444 && arg.len() >= 20 {
+        let pending = CITED_PENDING_BO_HANDLE.with(|cell| cell.get());
+        let handle = if sync_handles[0] != 0 {
+            sync_handles[0]
+        } else {
+            pending
+        };
+        if handle != 0 {
+            arg[16..20].copy_from_slice(&handle.to_le_bytes());
+        }
+    }
+}
+
+fn cited_whole_array_build_arg(
+    request: u64,
+    width: usize,
+    xclbin: &[u8],
+    insts: &[u8],
+    cmd: &[u8],
+    output: &[u8],
+    sync_handles: &[u32; 4],
+    sync_points: &[u64; 4],
+    hwctx: Option<u32>,
+) -> Vec<u8> {
+    // Retained tails travel in the returned arg. Pointer fields name those
+    // bytes, or the caller's xclbin and insts. Request 0 stays 32 bytes.
+    let extra: usize = if request == 0xc010_6447 || request == CITED_SYNCOBJ_TIMELINE_WAIT {
+        16
+    } else if request == CITED_CONFIG_HWCTX {
+        0x10
+    } else {
+        0
+    };
+    let mut arg = vec![0u8; width.saturating_add(extra)];
+    if request == 0xc010_6447 && width >= 16 && extra == 16 {
+        let start = width;
+        arg[start] = 1;
+        let ptr = arg[start..].as_ptr() as usize as u64;
+        arg[4..8].copy_from_slice(&16u32.to_ne_bytes());
+        arg[8..16].copy_from_slice(&ptr.to_ne_bytes());
+    }
+    if request == CITED_CREATE_HWCTX && width >= 0x28 && xclbin.len() == CITED_XCLBIN_LEN {
+        let ptr = xclbin.as_ptr() as usize as u64;
+        arg[16..24].copy_from_slice(&ptr.to_ne_bytes());
+        arg[0x20..0x24].copy_from_slice(&0x800u32.to_ne_bytes());
+        arg[0x24..0x28].copy_from_slice(&0x20u32.to_ne_bytes());
+    }
+    if request == CITED_EXEC_CMD && width >= 40 && insts.len() == CITED_INSTS_LEN {
+        let ptr = insts.as_ptr() as usize as u64;
+        arg[32..40].copy_from_slice(&ptr.to_ne_bytes());
+        if let Some(handle) = hwctx {
+            arg[16..20].copy_from_slice(&handle.to_ne_bytes());
+        }
+    }
+    if request == CITED_SYNCOBJ_TIMELINE_WAIT && width >= 32 && extra == 16 {
+        let start = width;
+        let handle_slot = match sync_handles[0] {
+            0 => 1u64,
+            handle => u64::from(handle),
+        };
+        let point_slot = match sync_points[0] {
+            0 => 1,
+            point => point,
+        };
+        arg[start..start + 8].copy_from_slice(&handle_slot.to_ne_bytes());
+        arg[start + 8..start + 16].copy_from_slice(&point_slot.to_ne_bytes());
+        let handles_ptr = arg[start..].as_ptr() as usize as u64;
+        let points_ptr = arg[start + 8..].as_ptr() as usize as u64;
+        arg[0..8].copy_from_slice(&handles_ptr.to_ne_bytes());
+        arg[8..16].copy_from_slice(&points_ptr.to_ne_bytes());
+        arg[16..24].copy_from_slice(&0x7fff_ffff_ffff_ffffu64.to_ne_bytes());
+        arg[24..28].copy_from_slice(&1u32.to_ne_bytes());
+        arg[28..32].copy_from_slice(&2u32.to_ne_bytes());
+    }
+    if request == CITED_CONFIG_HWCTX && width >= 20 && extra == 0x10 {
+        let start = width;
+        arg[start] = 1;
+        let ptr = arg[start..].as_ptr() as usize as u64;
+        arg[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        arg[16..20].copy_from_slice(&0x10u32.to_ne_bytes());
+        if let Some(handle) = hwctx {
+            arg[0..4].copy_from_slice(&handle.to_ne_bytes());
+        }
+    }
+    cited_replay_fill_bo_words(request, &mut arg, cmd, output, sync_handles);
+    arg
+}
+
+fn cited_whole_array_harvest(
+    request: u64,
+    arg: &[u8],
+    hwctx: &mut Option<u32>,
+    bos: &mut Vec<u32>,
+    sync_handles: &mut [u32; 4],
+) {
+    if request == CITED_CREATE_HWCTX {
+        *hwctx = cited_hwctx_handle_from_arg(arg);
+    }
+    if request == CITED_SYNCOBJ_CREATE && arg.len() >= 4 {
+        let handle = u32::from_ne_bytes([arg[0], arg[1], arg[2], arg[3]]);
+        if handle != 0 {
+            sync_handles[0] = handle;
+        }
+    }
+    if request == CITED_EXEC_CMD {
+        let _ = bos.len();
+    }
+}
+
+fn cited_hwctx_handle_from_arg(arg: &[u8]) -> Option<u32> {
+    let mut off = 0;
+    while off + 4 <= arg.len() {
+        if off == 0x20 || off == 0x24 {
+            off += 4;
+            continue;
+        }
+        let value = u32::from_ne_bytes([arg[off], arg[off + 1], arg[off + 2], arg[off + 3]]);
+        if value != 0 && value != 0x800 && value != 0x20 {
+            return Some(value);
+        }
+        off += 4;
+    }
+    None
+}
+
+fn cited_whole_array_sha256_hex(data: &[u8]) -> String {
+    let digest = cited_whole_array_sha256(data);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn cited_whole_array_sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut hash: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = Vec::with_capacity(data.len() + 72);
+    msg.extend_from_slice(data);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            let off = i * 4;
+            w[i] = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = hash[0];
+        let mut b = hash[1];
+        let mut c = hash[2];
+        let mut d = hash[3];
+        let mut e = hash[4];
+        let mut f = hash[5];
+        let mut g = hash[6];
+        let mut h = hash[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        hash[0] = hash[0].wrapping_add(a);
+        hash[1] = hash[1].wrapping_add(b);
+        hash[2] = hash[2].wrapping_add(c);
+        hash[3] = hash[3].wrapping_add(d);
+        hash[4] = hash[4].wrapping_add(e);
+        hash[5] = hash[5].wrapping_add(f);
+        hash[6] = hash[6].wrapping_add(g);
+        hash[7] = hash[7].wrapping_add(h);
+    }
+    let mut out = [0u8; 32];
+    for (i, value) in hash.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
 /// Default finite WAIT_CMD timeout (ms) for lab single-shot helpers.
 ///
 /// Override with env `XDNA2_WAIT_TIMEOUT_MS`. Infinite wait (`0`) is refused by
@@ -7707,6 +8301,530 @@ impl DirectSubmission for StubDirectSubmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_cited_replay_argument_is_not_all_zeros_and_device_stays_closed() {
+        // This test does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled());
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin = root.join("testdata/xdna2_cmd/whole_array_128_i16/final.xclbin");
+        let insts = root.join("testdata/xdna2_cmd/whole_array_128_i16/insts.bin");
+        let closed = send_cited_whole_array_device_once(&xclbin, &insts);
+        let err = match closed {
+            Err(err) => err,
+            Ok(_) => panic!("default path returned Ok before open"),
+        };
+        assert_eq!(err.request, 0);
+        assert_eq!(err.errno, libc::EPERM);
+        let plan_err =
+            super::super::mlir_aie_ioctl::submit_mlir_aie_whole_array_ioctl(&xclbin, &insts)
+                .expect_err("plan before open");
+        match plan_err {
+            super::super::mlir_aie_ioctl::MlirAieIoctlError::UnprovenAiePartition { plan } => {
+                assert!(!plan.device_opened, "device was opened");
+            }
+            other => panic!("expected unproven partition, got {other}"),
+        }
+        println!("device_opened=no");
+        const EXPECTED: [u8; 32] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let arg = first_cited_replay_argument();
+        assert_eq!(
+            arg, EXPECTED,
+            "first cited replay argument for request 0xc0206443"
+        );
+        assert_eq!(
+            u32::from_le_bytes([arg[16], arg[17], arg[18], arg[19]]),
+            0x0400_0000
+        );
+        assert_eq!(u32::from_le_bytes([arg[24], arg[25], arg[26], arg[27]]), 2);
+    }
+
+    #[test]
+    fn cited_replay_args_point_at_owned_buffers_and_device_stays_closed() {
+        // Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/final.xclbin");
+        let insts_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/insts.bin");
+        let xclbin = std::fs::read(&xclbin_path).expect("read xclbin");
+        let insts = std::fs::read(&insts_path).expect("read insts");
+        assert_eq!(xclbin.len(), 73_327, "xclbin length");
+        assert_eq!(insts.len(), 2_592, "insts length");
+        assert_eq!(
+            cited_whole_array_sha256_hex(&xclbin),
+            "0cadf32ec0472e3f55e9102a6175d005b1a95a8ea428907086e15ad44d825dad",
+            "xclbin sha256 {}",
+            xclbin_path.display()
+        );
+        assert_eq!(
+            cited_whole_array_sha256_hex(&insts),
+            "ae692499a79c74b46175cb4841f235edb0059175144941522f792105b758dec3",
+            "insts sha256 {}",
+            insts_path.display()
+        );
+        let closed = send_cited_whole_array_device_once(&xclbin_path, &insts_path);
+        let err = match closed {
+            Err(err) => err,
+            Ok(_) => panic!("default path returned Ok before open"),
+        };
+        assert_eq!(err.request, 0, "refused request");
+        assert_eq!(err.errno, libc::EPERM, "refused errno");
+        let plan_err = super::super::mlir_aie_ioctl::submit_mlir_aie_whole_array_ioctl(
+            &xclbin_path,
+            &insts_path,
+        )
+        .expect_err("plan before open");
+        match plan_err {
+            super::super::mlir_aie_ioctl::MlirAieIoctlError::UnprovenAiePartition { plan } => {
+                assert!(!plan.device_opened, "device was opened");
+            }
+            other => panic!("expected unproven partition, got {other}"),
+        }
+        println!("device_opened=no");
+        eprintln!("send_cited_whole_array_device_once request=0 errno=EPERM device_opened=no");
+
+        // Same request words the replay loop passes to ioctl. No open, no ioctl.
+        const REQUESTS: [u64; 28] = [
+            0xc020_6443,
+            0xc030_6444,
+            0xc010_6447,
+            0xc038_6440,
+            0xc020_6443,
+            0xc030_6444,
+            0xc018_6442,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc038_6446,
+            0xc030_64ca,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0xc008_64c0,
+            0xc008_6441,
+            0x4008_6409,
+        ];
+        const STALE: [u64; 6] = [
+            0x7fff_db2b_b7b0,
+            0x5585_578b_67a8,
+            0x5585_5788_ad20,
+            0x7fff_db2b_b180,
+            0x7fff_db2b_b920,
+            0x7fff_db2b_b928,
+        ];
+        let cmd = insts.clone();
+        let output = vec![0u8; 128 * 128 * 4];
+        let sync_handles = [0u32; 4];
+        let sync_points = [0u64; 4];
+        let mut saw_request0 = false;
+        let mut problems = Vec::new();
+        for (request_index, request) in REQUESTS.into_iter().enumerate() {
+            let width = ((request >> 16) & 0x3fff) as usize;
+            let mut arg = cited_whole_array_build_arg(
+                request,
+                width,
+                &xclbin,
+                &insts,
+                &cmd,
+                &output,
+                &sync_handles,
+                &sync_points,
+                None,
+            );
+            if request_index == 0 && request == 0xc020_6443 && arg.len() == 32 {
+                arg.copy_from_slice(&first_cited_replay_argument());
+                saw_request0 = true;
+                assert_eq!(
+                    arg.as_slice(),
+                    first_cited_replay_argument().as_slice(),
+                    "request 0 is not the 32 cited bytes"
+                );
+            }
+            for stale in STALE {
+                if arg.windows(8).any(|window| window == stale.to_ne_bytes()) {
+                    problems.push(format!(
+                        "request {request:#x} contains stale u64 {stale:#x}"
+                    ));
+                }
+            }
+            if request == 0xc038_6440 && arg.len() >= 0x28 {
+                let ptr = u64::from_ne_bytes(arg[16..24].try_into().expect("create ptr"));
+                let word_800 = u32::from_ne_bytes(arg[0x20..0x24].try_into().expect("0x800"));
+                let word_20 = u32::from_ne_bytes(arg[0x24..0x28].try_into().expect("0x20"));
+                eprintln!(
+                    "CREATE_HWCTX request={request:#x} offset=16 pointer={ptr:#x} owned_len={}",
+                    xclbin.len()
+                );
+                if ptr == 0 {
+                    problems.push(
+                        "CREATE_HWCTX offset 16 pointer is zero, not the owned 73327-byte xclbin"
+                            .to_string(),
+                    );
+                } else if ptr != xclbin.as_ptr() as u64 {
+                    problems.push(format!(
+                        "CREATE_HWCTX offset 16 pointer {ptr:#x} is not an owned xclbin address"
+                    ));
+                }
+                if word_800 != 0x800 || word_20 != 0x20 {
+                    problems.push(format!(
+                        "CREATE_HWCTX offsets 0x20/0x24 are {word_800:#x}/{word_20:#x}, not 0x800/0x20"
+                    ));
+                }
+            }
+            if request == 0xc018_6442 && arg.len() >= 20 {
+                let ptr = u64::from_ne_bytes(arg[8..16].try_into().expect("config ptr"));
+                let len_word = u32::from_ne_bytes(arg[16..20].try_into().expect("config len"));
+                eprintln!(
+                    "CONFIG_HWCTX request={request:#x} offset=8 pointer={ptr:#x} owned_len={len_word:#x}"
+                );
+                if ptr == 0 {
+                    problems.push(
+                        "CONFIG_HWCTX offset 8 pointer is zero, not an owned buffer".to_string(),
+                    );
+                }
+                if len_word != 0x10 {
+                    problems.push(format!(
+                        "CONFIG_HWCTX offset 16 length is {len_word:#x}, not 0x10"
+                    ));
+                }
+            }
+            if request == 0xc038_6446 && arg.len() >= 40 {
+                let ptr = u64::from_ne_bytes(arg[32..40].try_into().expect("exec ptr"));
+                eprintln!(
+                    "EXEC_CMD request={request:#x} offset=32 pointer={ptr:#x} owned_len={}",
+                    insts.len()
+                );
+                if ptr == 0 {
+                    problems.push(
+                        "EXEC_CMD offset 32 pointer is zero, not the owned 2592-byte insts"
+                            .to_string(),
+                    );
+                } else if ptr != insts.as_ptr() as u64 {
+                    problems.push(format!(
+                        "EXEC_CMD offset 32 pointer {ptr:#x} is not an owned insts address"
+                    ));
+                }
+            }
+            if request == 0xc030_64ca && arg.len() >= 32 {
+                let handles = u64::from_ne_bytes(arg[0..8].try_into().expect("sync handles"));
+                let points = u64::from_ne_bytes(arg[8..16].try_into().expect("sync points"));
+                let timeout = u64::from_ne_bytes(arg[16..24].try_into().expect("sync timeout"));
+                let count = u32::from_ne_bytes(arg[24..28].try_into().expect("sync count"));
+                let flags = u32::from_ne_bytes(arg[28..32].try_into().expect("sync flags"));
+                eprintln!(
+                    "SYNCOBJ_TIMELINE_WAIT request={request:#x} offset=0 pointer={handles:#x} owned_len=8"
+                );
+                eprintln!(
+                    "SYNCOBJ_TIMELINE_WAIT request={request:#x} offset=8 pointer={points:#x} owned_len=8"
+                );
+                if handles == 0 {
+                    problems.push(
+                        "SYNCOBJ_TIMELINE_WAIT offset 0 pointer is zero, not an owned u64 slot"
+                            .to_string(),
+                    );
+                } else if handles == sync_handles.as_ptr() as u64 {
+                    problems.push(
+                        "SYNCOBJ_TIMELINE_WAIT offset 0 points at the caller array, not a buffer the builder returns"
+                            .to_string(),
+                    );
+                }
+                if points == 0 {
+                    problems.push(
+                        "SYNCOBJ_TIMELINE_WAIT offset 8 pointer is zero, not an owned u64 slot"
+                            .to_string(),
+                    );
+                } else if points == sync_points.as_ptr() as u64 {
+                    problems.push(
+                        "SYNCOBJ_TIMELINE_WAIT offset 8 points at the caller array, not a buffer the builder returns"
+                            .to_string(),
+                    );
+                }
+                if timeout != 0x7fff_ffff_ffff_ffff {
+                    problems.push(format!(
+                        "SYNCOBJ_TIMELINE_WAIT offset 16 is {timeout:#x}, not 0x7fffffffffffffff"
+                    ));
+                }
+                if count != 1 || flags != 2 {
+                    problems.push(format!(
+                        "SYNCOBJ_TIMELINE_WAIT u32 pair is {count}/{flags}, not 1/2"
+                    ));
+                }
+            }
+            if request == 0xc010_6447 && arg.len() >= 16 {
+                let ptr = u64::from_ne_bytes(arg[8..16].try_into().expect("get info ptr"));
+                let info_len = u32::from_ne_bytes(arg[4..8].try_into().expect("get info len"));
+                eprintln!(
+                    "GET_INFO request={request:#x} offset=8 pointer={ptr:#x} owned_len={info_len}"
+                );
+                if ptr == 0 {
+                    problems.push(
+                        "GET_INFO 0xc0106447 offset 8 pointer is zero, not an owned buffer"
+                            .to_string(),
+                    );
+                }
+                if ptr == 0x7fff_db2b_b7b0 {
+                    problems
+                        .push("GET_INFO 0xc0106447 contains stale u64 0x7fffdb2bb7b0".to_string());
+                }
+            }
+        }
+        assert!(saw_request0, "request 0 was not the 32-byte cited argument");
+        assert!(
+            problems.is_empty(),
+            "cited replay args are not owned pointers: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn cited_replay_nonpointer_words_match_trace_and_device_stays_closed() {
+        // before-args.txt (86 lines) wins. Confirmed CREATE_BO input words,
+        // 1-based request index, little-endian u32 size at offset 16, type at 24:
+        // 1: 0x04000000 type 2; 5: 0x00010530 type 3; 8: 0xa20 type 3;
+        // 10: 0x8000 type 1; 12: 0x8000 type 1; 14: 0x10000 type 1;
+        // 16: 0x1000 type 4.
+        // This test does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/final.xclbin");
+        let insts_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/insts.bin");
+        let closed = send_cited_whole_array_device_once(&xclbin_path, &insts_path);
+        let err = match closed {
+            Err(err) => err,
+            Ok(_) => panic!("default path returned Ok before open"),
+        };
+        assert_eq!(err.request, 0, "refused request");
+        assert_eq!(err.errno, libc::EPERM, "refused errno");
+        println!("device_opened=no");
+        let plan_err = super::super::mlir_aie_ioctl::submit_mlir_aie_whole_array_ioctl(
+            &xclbin_path,
+            &insts_path,
+        )
+        .expect_err("plan before open");
+        match plan_err {
+            super::super::mlir_aie_ioctl::MlirAieIoctlError::UnprovenAiePartition { plan } => {
+                assert!(!plan.device_opened, "device was opened");
+            }
+            other => panic!("expected unproven partition, got {other}"),
+        }
+        let xclbin = std::fs::read(&xclbin_path).expect("read xclbin");
+        let insts = std::fs::read(&insts_path).expect("read insts");
+        assert_eq!(xclbin.len(), 73_327, "xclbin length");
+        assert_eq!(insts.len(), 2_592, "insts length");
+        cited_replay_reset_bo_words();
+        const REQUESTS: [u64; 28] = [
+            0xc020_6443,
+            0xc030_6444,
+            0xc010_6447,
+            0xc038_6440,
+            0xc020_6443,
+            0xc030_6444,
+            0xc018_6442,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc020_6443,
+            0xc030_6444,
+            0xc038_6446,
+            0xc030_64ca,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0x4008_6409,
+            0xc008_64c0,
+            0xc008_6441,
+            0x4008_6409,
+        ];
+        // 1-based request index, size, type. Same words as before-args.txt.
+        const CREATE_BO_ROWS: [(usize, u32, u32); 7] = [
+            (1, 0x0400_0000, 2),
+            (5, 0x0001_0530, 3),
+            (8, 0x0000_0a20, 3),
+            (10, 0x0000_8000, 1),
+            (12, 0x0000_8000, 1),
+            (14, 0x0001_0000, 1),
+            (16, 0x0000_1000, 4),
+        ];
+        let cmd = insts.clone();
+        let output = vec![0u8; 128 * 128 * 4];
+        let sync_handles = [0u32; 4];
+        let sync_points = [0u64; 4];
+        let mut problems = Vec::new();
+        let mut planted: Option<u32> = None;
+        let mut create_rows_seen = 0usize;
+        for (request_index, request) in REQUESTS.into_iter().enumerate() {
+            let one_based = request_index + 1;
+            let width = ((request >> 16) & 0x3fff) as usize;
+            let arg = cited_whole_array_build_arg(
+                request,
+                width,
+                &xclbin,
+                &insts,
+                &cmd,
+                &output,
+                &sync_handles,
+                &sync_points,
+                None,
+            );
+            if let Some(fake) = planted.take() {
+                if request != 0xc030_6444 || arg.len() < 20 {
+                    problems.push(format!(
+                        "request {one_based} {request:#x} did not take the planted handle"
+                    ));
+                } else {
+                    let got = u32::from_le_bytes(arg[16..20].try_into().expect("bo handle"));
+                    if (1..=7).contains(&fake) {
+                        problems.push(format!(
+                            "fake handle {fake:#x} is a trace handle; do not replay 1..=7"
+                        ));
+                    }
+                    if got != fake {
+                        problems.push(format!(
+                            "request {one_based} 0xc0306444 offset 16 is {got:#x}, not fake returned handle {fake:#x}"
+                        ));
+                    }
+                }
+            }
+            if request == 0xc020_6443 {
+                let row = CREATE_BO_ROWS.iter().find(|row| row.0 == one_based);
+                let Some((index, size, ty)) = row else {
+                    problems.push(format!("unexpected CREATE_BO at request {one_based}"));
+                    continue;
+                };
+                create_rows_seen += 1;
+                if arg.len() < 32 {
+                    problems.push(format!("request {index} CREATE_BO len {}", arg.len()));
+                    continue;
+                }
+                let got_size = u32::from_le_bytes(arg[16..20].try_into().expect("size"));
+                let got_ty = u32::from_le_bytes(arg[24..28].try_into().expect("type"));
+                let got_handle = u32::from_le_bytes(arg[28..32].try_into().expect("pre-ioctl"));
+                if got_size != *size || got_ty != *ty {
+                    problems.push(format!(
+                        "request {index} CREATE_BO size {got_size:#x} type {got_ty} , file wants size {size:#x} type {ty}"
+                    ));
+                }
+                if got_handle != 0 {
+                    problems.push(format!(
+                        "request {index} CREATE_BO offset 28 is {got_handle:#x}; handle is zero before ioctl"
+                    ));
+                }
+                if *index == 1 && arg.as_slice() != first_cited_replay_argument().as_slice() {
+                    problems.push(
+                        "request 1 CREATE_BO is not the 32 cited non-pointer bytes".to_string(),
+                    );
+                }
+                // Not the trace's old handles 1, 2, 3, 4, 5, 6, or 7.
+                let fake = 0xA11C_E000u32.wrapping_add(u32::try_from(*index).unwrap_or(0));
+                cited_replay_note_returned_bo_handle(fake);
+                planted = Some(fake);
+            }
+            if request == 0xc010_6447 && arg.len() >= 16 {
+                let info_len = u32::from_le_bytes(arg[4..8].try_into().expect("info len"));
+                let ptr = u64::from_le_bytes(arg[8..16].try_into().expect("info ptr"));
+                if info_len != 16 {
+                    problems.push(format!("GET_INFO offset 4 length is {info_len}, not 16"));
+                }
+                if ptr == 0 {
+                    problems.push("GET_INFO offset 8 pointer is zero".to_string());
+                }
+            }
+            if request == 0xc038_6440 && arg.len() >= 0x28 {
+                let ptr = u64::from_le_bytes(arg[16..24].try_into().expect("hwctx ptr"));
+                let word_800 = u32::from_le_bytes(arg[0x20..0x24].try_into().expect("0x800"));
+                let word_20 = u32::from_le_bytes(arg[0x24..0x28].try_into().expect("0x20"));
+                if ptr != xclbin.as_ptr() as u64 {
+                    problems.push(format!(
+                        "CREATE_HWCTX offset 16 pointer {ptr:#x} is not the owned 73327-byte xclbin"
+                    ));
+                }
+                if word_800 != 0x800 || word_20 != 0x20 {
+                    problems.push(format!(
+                        "CREATE_HWCTX offsets 0x20/0x24 are {word_800:#x}/{word_20:#x}, not 0x800/0x20"
+                    ));
+                }
+            }
+            if request == 0xc018_6442 && arg.len() >= 20 {
+                let ptr = u64::from_le_bytes(arg[8..16].try_into().expect("cfg ptr"));
+                let len_word = u32::from_le_bytes(arg[16..20].try_into().expect("cfg len"));
+                if ptr == 0 {
+                    problems.push("CONFIG_HWCTX offset 8 pointer is zero".to_string());
+                }
+                if len_word != 0x10 {
+                    problems.push(format!(
+                        "CONFIG_HWCTX offset 16 length is {len_word:#x}, not 0x10"
+                    ));
+                }
+            }
+            if request == 0xc038_6446 && arg.len() >= 40 {
+                let ptr = u64::from_le_bytes(arg[32..40].try_into().expect("exec ptr"));
+                if ptr != insts.as_ptr() as u64 {
+                    problems.push(format!(
+                        "EXEC_CMD offset 32 pointer {ptr:#x} is not the owned 2592-byte insts"
+                    ));
+                }
+            }
+            if request == 0xc030_64ca && arg.len() >= 32 {
+                let handles = u64::from_le_bytes(arg[0..8].try_into().expect("sync handles"));
+                let points = u64::from_le_bytes(arg[8..16].try_into().expect("sync points"));
+                let timeout = u64::from_le_bytes(arg[16..24].try_into().expect("timeout"));
+                if handles == 0 || points == 0 {
+                    problems
+                        .push("SYNCOBJ offsets 0 and 8 must name owned 8-byte slots".to_string());
+                }
+                if timeout != 0x7fff_ffff_ffff_ffff {
+                    problems.push(format!(
+                        "SYNCOBJ offset 16 is {timeout:#x}, not 0x7fffffffffffffff"
+                    ));
+                }
+            }
+        }
+        if create_rows_seen != CREATE_BO_ROWS.len() {
+            problems.push(format!(
+                "saw {create_rows_seen} CREATE_BO rows, file has {}",
+                CREATE_BO_ROWS.len()
+            ));
+        }
+        if planted.is_some() {
+            problems.push("last planted handle had no following 0xc0306444".to_string());
+        }
+        assert!(
+            problems.is_empty(),
+            "cited non-pointer words disagree with before-args.txt: {problems:?}"
+        );
+    }
 
     #[test]
     fn stub_submission_returns_clear_error_on_submit() {

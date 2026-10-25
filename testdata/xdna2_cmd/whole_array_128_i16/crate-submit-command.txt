@@ -1,0 +1,9 @@
+NOT executed.
+Do not retry on failure.
+Timeout 60.
+
+timeout 60 cargo run --example whole_array_i16_submit --features amd-xdna2 -- /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/final.xclbin /home/hunter/Projects/ai/dragon-npu/testdata/xdna2_cmd/whole_array_128_i16/insts.bin
+
+START_NPU raw ioctl path. Does not register the xclbin. Does not launch kernel MLIR_AIE.
+xclbin sha256 0cadf32ec0472e3f55e9102a6175d005b1a95a8ea428907086e15ad44d825dad
+insts sha256 ae692499a79c74b46175cb4841f235edb0059175144941522f792105b758dec3

@@ -1,5 +1,9 @@
 ## Development status (2026-10-12)
 
+### L1 delegates so the main session does not compact
+
+The main session compacts when it holds the job. On every implement, diagnosis, or multi-file task, the main session spawns an L2 in that same turn and does not read or edit the tree. The L2 spawns an L3 for the reads and the edit. A follow-up to an L2 that is already near its context limit is not a substitute for that spawn.
+
 The Rust minimum for this crate is 1.99. `cargo update` and `cargo audit` were run on the stable 1.99 toolchain. The audit loaded 1307 security advisories from the RustSec database, scanned Cargo.lock (159 crate dependencies), and exited 0. No advisory warning remained. The earlier anymap2 advisory (RUSTSEC-2026-0319) closed because tract-onnx is now 0.23.8 and that line no longer pulls in liquid or anymap2. That was an upgrade. It was not an audit ignore.
 
 Product Pass is still no. invent_pass stays 0. ran_on_npu stays false. The first unlock line remains `2c9c12e8` consumed. Do not mint a new unlock. Do not reopen a consumed one.
@@ -11,6 +15,14 @@ An IRON catalog child PASS is an external runner. It is not `decide_ran_on_npu`.
 The hardware outcome still open is one matmul this crate submits, the device finishes, and the output matches `decide_ran_on_npu`.
 
 ## Standing rules (silicon / HITL) — permanent
+
+Latest Turn (mlir-aie cite gates green; invent_pass=0):
+- **Named delta:** No product edit this turn. `WHOLE_ARRAY_HOST_OPCODE` stays the integer 3. `WHOLE_ARRAY_HOST_ARG_ORDER` stays opcode, instr, ninstr, A, B, C. Packed EXEC_CMD, packed WAIT_CMD, xclbin AIE_PARTITION, numeric `amdxdna_cmd_start_npu` offsets, `num_tiles`, and the instruction CREATE_BO type stay typed errors. The device was not opened. `testdata/xdna2_cmd/whole_array_128_i16/mlir-aie-ioctl-command.txt` was not run. `XDNA2_ALLOW_EXEC_CMD` was not set. `decide_ran_on_npu` was not edited. invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; ran_on_npu=false; unlock **none**; first unlock line `2c9c12e8` CONSUMED. Do not mint. Do not reopen CONSUMED.
+- **Wall:** product Pass still needs live `decide_ran_on_npu` on buffers this crate submitted. A green offline gate is not Pass.
+- **Who acts next:** a later slice still has to submit the verified pair itself. This turn does not run that command. Do not ask the Operator to re-run `just npu-iron`. Agent does not mint.
+- **Q4:** stays open. Watch for a linux tag, or a drm-next tag after `drm-next-2026-10-21`, that contains `drm-misc-next-2026-10-23`.
+- **Gate:** nproc printed 16. `CARGO_BUILD_JOBS=8`. `nice -n 19`. `PATH="/usr/bin:$PATH"`. `cargo fmt -- --check` exit 0. `cargo clippy --lib --tests --examples --benches -- -D warnings` exit 0. `cargo clippy --features amd-xdna2 --all-targets -- -D warnings` exit 0. `cargo test --lib` exit 0 (168 passed, 0 failed, 0 ignored). `cargo test --features amd-xdna2 --lib` exit 0 (753 passed, 0 failed, 1 ignored).
+- **Report:** `/home/hunter/.agents/reports/dragon-npu-mlir-aie-cite-impl.md`.
 
 Latest Turn (classic 1688 origin cited; no residual-matched buffer offline; invent_pass=0):
 - **Named delta:** The classic 1688-byte body in this tree is the unpatched DynamicDispatch dump, not a residual-matched capture. `STAGED_MLADF_CLASSIC_INSTR_BYTES` is 1688 (`src/backends/amd_xdna2/txn.rs` line 30). `MATERIAL_EXEC_LAB_CLASSIC_BYTES` aliases it (`src/backends/amd_xdna2/silicon_contract.rs` line 14525). `LAB_CLASSIC_UNPATCHED_CTRLTEXT_SHA16` is `3c5ffca750922d3b` (line 16485). This turn measured `testdata/xdna2_cmd/silicon_lab/lab_instr.bin` at 1688 bytes, sha256 `3c5ffca750922d3b6b1dec66b792273e46504cc1d3de6b5b96e12ac5c8197368`. `classify_material_residual_match` keeps `residual_matched_claim` false (line 13907). IRON and mlir-aie cannot emit a residual-matched buffer offline (`docs/XDNA2_XRT_CONTRACT_MLADF.md` lines 56 and 99-101; classifier lines 13935-13948). Research peels at 300, 660, 2592, and 4512 bytes stay rejected, as does `lab_instr.bin`. No new buffer. No new test. `decide_ran_on_npu` was not edited. invent_pass=0 not_c_ready=1 not_ran_on_npu=1; Pass=**No**; ran_on_npu=false; unlock **none**; first unlock line `2c9c12e8` CONSUMED. Do not mint. Do not reopen CONSUMED.

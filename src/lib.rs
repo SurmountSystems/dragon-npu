@@ -93,3 +93,12 @@ pub mod prelude {
     pub use crate::ModelCompiler;
     pub use crate::NpuStatus;
 }
+
+// The libtest `--exact` filter compares the full test path. The body lives
+// under backends::amd_xdna2::mlir_aie_ioctl::tests. This name is the filter
+// string, and it calls that body unchanged.
+#[cfg(all(test, feature = "amd-xdna2"))]
+#[test]
+fn submit_plans_only_cited_requests_for_whole_array_pair_then_refuses_before_open() {
+    crate::backends::amd_xdna2::mlir_aie_ioctl::tests::submit_plans_only_cited_requests_for_whole_array_pair_then_refuses_before_open();
+}

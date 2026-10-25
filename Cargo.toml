@@ -83,6 +83,8 @@ prost = "0.14"
 # Used only for the lightweight direct amdxdna driver path (under the amd-xdna2 feature).
 # This keeps the direct implementation minimal and avoids pulling in heavier runtimes.
 libc = { version = "0.2", optional = true }
+# SHA-256 of the cited whole-array pair. Only the dangerous exec feature uses it.
+sha2 = { version = "0.11.1", optional = true }
 
 [dev-dependencies]
 # Benchmarking and testing utilities (added when Phase 7 is reached)
@@ -96,7 +98,7 @@ amd-xdna2 = ["dep:libc"]   # AMD XDNA2 (Ryzen AI 300 / Strix Point & later) supp
 # (aie2_cmdlist_fill_slot) and wedged open(). NOT enabled by `amd-xdna2` alone.
 # Even with this feature, runtime still requires XDNA2_ALLOW_EXEC_CMD=1.
 # See docs/XDNA2_NEVER_AGAIN.md (L1 userspace permanent gate).
-xdna2-dangerous-exec-cmd = []
+xdna2-dangerous-exec-cmd = ["dep:sha2"]
 # Secondary vendors: honest stubs only (available=false, run refuses). Not default.
 # Not selected by DragonNpu::new. See docs/SECONDARY_BACKENDS.md.
 intel-vpu = []           # Intel VPU (Meteor Lake+) — stub until XDNA2 MVP green

@@ -51,11 +51,14 @@
 
 pub mod direct;
 pub mod host_graph;
+pub mod ioctl_interposer;
 pub mod lab_io;
 pub mod mladf_pack;
+pub mod mlir_aie_ioctl;
 pub mod numerical;
 pub mod silicon_contract;
 pub mod txn;
+pub mod whole_array_i16;
 
 /// Re-export feature-free colibrì schema version (defined on crate root).
 pub use crate::TIMED_OP_JSON_SCHEMA_VERSION;
