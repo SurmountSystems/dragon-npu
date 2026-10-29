@@ -20,6 +20,9 @@
 pub mod external_runner;
 pub mod iron_kernel;
 pub mod simulation;
+pub mod unix_open;
+
+pub use unix_open::unix_open_read_write_allowed;
 
 #[cfg(feature = "amd-xdna2")]
 pub mod amd_xdna2;

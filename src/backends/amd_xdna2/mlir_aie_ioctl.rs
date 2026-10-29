@@ -152,12 +152,33 @@ pub enum MlirAieIoctlAsk {
     InstructionCreateBoType,
 }
 
+/// Recorded userspace mmap of the device-heap GEM object. Not an ioctl.
+///
+/// `amdxdna_init_dev_bo` returns `-EAGAIN` while the heap user address is
+/// still invalid. The mmap sits after heap CREATE_BO and GET_BO_INFO and
+/// before CREATE_HWCTX. Size and alignment are 64 MiB (`0x4000000`).
+/// This record does not open `/dev/accel` and does not call `mmap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceHeapMmapRecord {
+    /// Heap CREATE_BO size. 64 MiB (`0x4000000`). Not a second heap size.
+    pub size: u64,
+    /// Heap CREATE_BO type. [`AMDXDNA_BO_DEV_HEAP`] is 2.
+    pub bo_type: u32,
+    /// Userspace VA alignment. 64 MiB (`0x4000000`), same integer as the size.
+    pub align: u64,
+}
+
 /// One cited amdxdna request the whole-array submit would send. Not issued.
+///
+/// A device-heap mmap row is not a request. Its `request` is 0 and
+/// [`CitedIoctlStep::device_heap_mmap`] is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CitedIoctlStep {
     /// Packed request word from the header cite and the dump line.
+    /// Zero on the recorded device-heap mmap, which is not an ioctl.
     pub request: u64,
     /// Argument size in bytes from that same cite.
+    /// Zero on the recorded device-heap mmap.
     pub size: u32,
     /// Byte offset of `num_tiles` inside `amdxdna_drm_create_hwctx`.
     /// Set only for CREATE_HWCTX. The cite puts the field at `0x24`.
@@ -165,6 +186,8 @@ pub struct CitedIoctlStep {
     /// `num_tiles` value at that offset. The cite is `0x20`.
     /// Set only for CREATE_HWCTX.
     pub num_tiles: Option<u32>,
+    /// Set only on the recorded device-heap mmap. Ioctl rows leave this empty.
+    pub device_heap_mmap: Option<DeviceHeapMmapRecord>,
 }
 
 /// Send plan for the recorded whole-array pair. The device stays closed.
@@ -401,8 +424,9 @@ fn send_cited_whole_array_once(xclbin: &Path, insts: &Path) -> Result<(), MlirAi
                 errno: err.errno,
             }
         })?;
-    let output_matches = whole_array_output_matches_host(&submitted.output_i32_le);
     let host = host_whole_array_i16_buffers()?;
+    let output_matches =
+        whole_array_output_matches_host(&submitted.output_i32_le, &host.golden_i32);
     let host_golden = i32_cells_as_f32(&host.golden_i32)?;
     let device_f32 = i32_le_bytes_as_f32(&submitted.output_i32_le)?;
     if host_golden.is_empty() || device_f32.is_empty() {
@@ -410,14 +434,17 @@ fn send_cited_whole_array_once(xclbin: &Path, insts: &Path) -> Result<(), MlirAi
             plan: cited_plan_for_whole_array_pair(xclbin, insts),
         });
     }
-    let verify = super::numerical::NumericalVerifyInput {
+    // This arm ran only after the accepted instruction file and an Ok device
+    // return. The fixture records that. `apply_whole_array_verify_flags` must
+    // forward those three bits. It must not invent a pass by itself.
+    let verify = apply_whole_array_verify_flags(super::numerical::NumericalVerifyInput {
         host_golden: &host_golden,
         device_or_candidate: &device_f32,
-        had_instruction_blob: false,
-        submit_wait_ok: false,
-        real_ioctl_path: false,
+        had_instruction_blob: true,
+        submit_wait_ok: true,
+        real_ioctl_path: true,
         criteria: super::numerical::NumericalVerifyCriteria::default(),
-    };
+    });
     let ran = super::numerical::decide_ran_on_npu(&verify);
     if !output_matches || !ran {
         return Err(MlirAieIoctlError::UnprovenAiePartition {
@@ -479,10 +506,33 @@ fn file_sha_len_matches(path: &Path, expect_hex: &str, expect_len: usize) -> boo
     hex_out == expect_hex
 }
 
-#[cfg(feature = "xdna2-dangerous-exec-cmd")]
-fn whole_array_output_matches_host(output_i32_le: &[u8]) -> bool {
-    let _ = output_i32_le;
-    false
+fn whole_array_output_matches_host(output_i32_le: &[u8], golden_i32: &[i32]) -> bool {
+    let Some(need) = golden_i32.len().checked_mul(4) else {
+        return false;
+    };
+    if golden_i32.is_empty() || output_i32_le.len() != need {
+        return false;
+    }
+    output_i32_le
+        .chunks_exact(4)
+        .zip(golden_i32.iter())
+        .all(|(chunk, cell)| {
+            let word = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            word == *cell
+        })
+}
+
+fn apply_whole_array_verify_flags<'a>(
+    input: super::numerical::NumericalVerifyInput<'a>,
+) -> super::numerical::NumericalVerifyInput<'a> {
+    super::numerical::NumericalVerifyInput {
+        host_golden: input.host_golden,
+        device_or_candidate: input.device_or_candidate,
+        had_instruction_blob: input.had_instruction_blob,
+        submit_wait_ok: input.submit_wait_ok,
+        real_ioctl_path: input.real_ioctl_path,
+        criteria: input.criteria,
+    }
 }
 
 fn empty_cited_plan() -> CitedSubmitPlan {
@@ -497,6 +547,44 @@ fn empty_cited_plan() -> CitedSubmitPlan {
     }
 }
 
+/// Cited device-heap CREATE_BO size and the recorded mmap length. 64 MiB.
+/// The whole-array heap row is `0x4000000`, type 2. Not a second size.
+const DEVICE_HEAP_MMAP_BYTES: u64 = 0x0400_0000;
+
+fn device_heap_uva_align_bytes() -> u64 {
+    DEVICE_HEAP_MMAP_BYTES
+}
+
+fn recorded_device_heap_mmap(record: DeviceHeapMmapRecord) -> bool {
+    // `tests` is nested, so `super` there is this module, not `amd_xdna2`.
+    // `super::direct` does not name the sibling. The crate path does.
+    // `0x0400_0000` is the same 64 MiB as `AIE2_DEV_HEAP_SIZE` (`0x4000000`).
+    record.size == 0x0400_0000
+        && record.size == DEVICE_HEAP_MMAP_BYTES
+        && record.size == crate::backends::amd_xdna2::direct::AIE2_DEV_HEAP_SIZE
+        && record.bo_type == AMDXDNA_BO_DEV_HEAP
+        && record.align == 0x0400_0000
+        && record.align == device_heap_uva_align_bytes()
+        && record.align == crate::backends::amd_xdna2::direct::AIE2_DEV_HEAP_SIZE
+        && record.align == record.size
+}
+
+fn device_heap_mmap_step() -> CitedIoctlStep {
+    // Same 64 MiB (`0x4000000`) as the heap CREATE_BO row. Not a second
+    // size. request 0 means this row is not an ioctl. Type 2.
+    CitedIoctlStep {
+        request: 0,
+        size: 0,
+        num_tiles_offset: None,
+        num_tiles: None,
+        device_heap_mmap: Some(DeviceHeapMmapRecord {
+            size: DEVICE_HEAP_MMAP_BYTES,
+            bo_type: AMDXDNA_BO_DEV_HEAP,
+            align: device_heap_uva_align_bytes(),
+        }),
+    }
+}
+
 fn cited_whole_array_steps() -> Vec<CitedIoctlStep> {
     // Argument `size` is the ioctl width, not a buffer-object byte length.
     // CREATE_HWCTX row: num_tiles 0x20 at offset 0x24. max_opc 0x800 at
@@ -505,6 +593,8 @@ fn cited_whole_array_steps() -> Vec<CitedIoctlStep> {
     // Buffer sizes and types, in CREATE_BO order: 0x4000000 type 2,
     // 0x10530 type 3, 0xa20 type 3, 0x8000 type 1, 0x8000 type 1,
     // 0x10000 type 1, 0x1000 type 4.
+    // The device-heap mmap is inserted after the first GET_BO_INFO (the
+    // heap one) and before CREATE_HWCTX. It is not one of these 28 requests.
     // GEM_CLOSE handles, in order: 6, 5, 4, 3, 7, 2, then 1 after
     // SYNCOBJ_DESTROY handle 1 and DESTROY_HWCTX context 1.
     // PACKED_WAIT_CMD_REQUEST is not a row. 0xc03064ca is not named.
@@ -538,16 +628,127 @@ fn cited_whole_array_steps() -> Vec<CitedIoctlStep> {
         (0xc008_6441, 8, None, None),
         (0x4008_6409, 8, None, None),
     ];
-    ROWS.into_iter()
+    let mut steps: Vec<CitedIoctlStep> = ROWS
+        .into_iter()
         .map(
             |(request, size, num_tiles_offset, num_tiles)| CitedIoctlStep {
                 request,
                 size,
                 num_tiles_offset,
                 num_tiles,
+                device_heap_mmap: None,
             },
         )
-        .collect()
+        .collect();
+    // Heap CREATE_BO is the first 0xc0206443. Its GET_BO_INFO is the first
+    // 0xc0306444. The mmap has to follow that pair and precede CREATE_HWCTX.
+    let heap_get_bo = steps.iter().position(|step| step.request == 0xc030_6444);
+    let create_hwctx = steps.iter().position(|step| step.request == 0xc038_6440);
+    if let (Some(get_bo), Some(hwctx)) = (heap_get_bo, create_hwctx) {
+        if get_bo < hwctx {
+            steps.insert(get_bo.saturating_add(1), device_heap_mmap_step());
+        }
+    }
+    steps
+}
+
+/// `XDNA2_STOP_AFTER_CREATE_HWCTX=1` asks the replay to stop at CREATE_HWCTX.
+pub(crate) fn stop_after_create_hwctx_asked() -> bool {
+    std::env::var("XDNA2_STOP_AFTER_CREATE_HWCTX")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// Steps `replay_printed_cited_requests` walks.
+///
+/// Unset `XDNA2_STOP_AFTER_CREATE_HWCTX` keeps the full list, including
+/// EXEC_CMD `0xc0386446`. `=1` selects the prefix that ends at the first
+/// CREATE_HWCTX `0xc0386440`.
+pub(crate) fn issued_replay_printed_cited_requests() -> Vec<CitedIoctlStep> {
+    replay_request_list(stop_after_create_hwctx_asked())
+}
+
+/// Pure replay list. `true` ends at the first CREATE_HWCTX `0xc0386440`
+/// and excludes EXEC_CMD `0xc0386446` and timeline wait `0xc03064ca`.
+/// `false` is the full shipped list. Does not open `/dev/accel`.
+pub(crate) fn replay_request_list(stop_after_create_hwctx: bool) -> Vec<CitedIoctlStep> {
+    let mut steps = issued_replay_full_printed_cited_requests();
+    if !stop_after_create_hwctx {
+        return steps;
+    }
+    let Some(at) = steps.iter().position(|step| step.request == 0xc038_6440) else {
+        return steps;
+    };
+    steps.truncate(at.saturating_add(1));
+    steps
+}
+
+/// Full shipped replay list. Not the helper list.
+///
+/// The 28 cited requests stay in order. The device-heap mmap is inserted
+/// after the first GET_BO_INFO and before CREATE_HWCTX. It is not an ioctl.
+/// Removing that insert makes
+/// `shipped_whole_array_steps_lack_device_heap_mmap_before_create_hwctx` fail.
+fn issued_replay_full_printed_cited_requests() -> Vec<CitedIoctlStep> {
+    // Same 28 request words as the live replay. Width comes from the request.
+    // CREATE_HWCTX keeps num_tiles 0x20 at offset 0x24. max_opc is not stored.
+    const REQUESTS: [u64; 28] = [
+        0xc020_6443,
+        0xc030_6444,
+        0xc010_6447,
+        0xc038_6440,
+        0xc020_6443,
+        0xc030_6444,
+        0xc018_6442,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc020_6443,
+        0xc030_6444,
+        0xc038_6446,
+        0x4010_6449,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0x4008_6409,
+        0xc008_64c0,
+        0xc008_6441,
+        0x4008_6409,
+    ];
+    let mut steps: Vec<CitedIoctlStep> = REQUESTS
+        .into_iter()
+        .map(|request| {
+            let size = u32::try_from((request >> 16) & 0x3fff).unwrap_or(0);
+            let (num_tiles_offset, num_tiles) = if request == 0xc038_6440 {
+                (Some(0x24_u32), Some(0x20_u32))
+            } else {
+                (None, None)
+            };
+            CitedIoctlStep {
+                request,
+                size,
+                num_tiles_offset,
+                num_tiles,
+                device_heap_mmap: None,
+            }
+        })
+        .collect();
+    let heap_get_bo = steps.iter().position(|step| step.request == 0xc030_6444);
+    let create_hwctx = steps.iter().position(|step| step.request == 0xc038_6440);
+    if let (Some(get_bo), Some(hwctx)) = (heap_get_bo, create_hwctx) {
+        if get_bo < hwctx {
+            steps.insert(get_bo.saturating_add(1), device_heap_mmap_step());
+        }
+    }
+    steps
 }
 
 fn cited_plan_for_whole_array_pair(xclbin: &Path, insts: &Path) -> CitedSubmitPlan {
@@ -703,6 +904,43 @@ fn row_major_i16_matmul(
     Ok(golden)
 }
 
+struct CreateHwctxTryRecord {
+    index: u32,
+    errno: i32,
+}
+
+const CREATE_HWCTX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn retry_create_hwctx<Issue, Sleep>(
+    argument: &[u8],
+    mut issue: Issue,
+    mut on_wait: Sleep,
+) -> Vec<CreateHwctxTryRecord>
+where
+    Issue: FnMut(u32, &[u8]) -> Result<(), i32>,
+    Sleep: FnMut(std::time::Duration),
+{
+    let mut records = Vec::new();
+    let mut tries_already_issued = 0u32;
+    loop {
+        let index = tries_already_issued.saturating_add(1);
+        let errno = match issue(index, argument) {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        };
+        tries_already_issued = tries_already_issued.saturating_add(1);
+        records.push(CreateHwctxTryRecord { index, errno });
+        if errno == 0 {
+            break;
+        }
+        match super::direct::create_hwctx_eagain_backoff(0xc038_6440, errno, tries_already_issued) {
+            Some(wait) => on_wait(wait),
+            None => break,
+        }
+    }
+    records
+}
+
 fn index_of(major: usize, stride: usize, minor: usize) -> Result<usize, MlirAieIoctlError> {
     product_len(major, stride)?
         .checked_add(minor)
@@ -713,13 +951,17 @@ fn index_of(major: usize, stride: usize, minor: usize) -> Result<usize, MlirAieI
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::numerical::{
+        NumericalVerifyCriteria, NumericalVerifyInput, decide_ran_on_npu,
+    };
     use super::{
         AMDXDNA_BO_DEV_HEAP, AMDXDNA_BO_SHARE, AMDXDNA_BO_SHMEM,
         AMDXDNA_CMD_START_NPU_MEMBER_ORDER, MlirAieIoctlAsk, MlirAieIoctlError,
         PACKED_EXEC_CMD_REQUEST, PACKED_WAIT_CMD_REQUEST, WHOLE_ARRAY_HOST_ARG_ORDER,
-        WHOLE_ARRAY_HOST_OPCODE, config_cu_from_caller, element_count_from_artifact_directory_name,
-        host_whole_array_i16_buffers, i32_as_f32_bits, mlir_aie_ioctl_ask, parse_whole_array_mkn,
-        submit_mlir_aie_whole_array_ioctl,
+        WHOLE_ARRAY_HOST_OPCODE, apply_whole_array_verify_flags, config_cu_from_caller,
+        element_count_from_artifact_directory_name, host_whole_array_i16_buffers, i32_as_f32_bits,
+        mlir_aie_ioctl_ask, parse_whole_array_mkn, submit_mlir_aie_whole_array_ioctl,
+        whole_array_output_matches_host,
     };
     use std::path::Path;
 
@@ -962,9 +1204,23 @@ pub(crate) mod tests {
                 index + 1
             ));
         }
+        let hwctx_at = plan
+            .steps
+            .iter()
+            .position(|step| step.request == 0xc038_6440)
+            .expect("CREATE_HWCTX 0xc0386440");
+        let heap_mmap_before = plan.steps[..hwctx_at]
+            .iter()
+            .filter(|step| step.device_heap_mmap.is_some())
+            .count();
+        assert_eq!(
+            heap_mmap_before, 1,
+            "device-heap mmap before CREATE_HWCTX (0xc0386440)"
+        );
         let actual: Vec<(u64, u32, Option<u32>, Option<u32>)> = plan
             .steps
             .iter()
+            .filter(|step| step.device_heap_mmap.is_none())
             .map(|step| {
                 (
                     step.request,
@@ -991,6 +1247,161 @@ pub(crate) mod tests {
             plan.steps
                 .iter()
                 .all(|step| step.request != PACKED_WAIT_CMD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn shipped_whole_array_steps_lack_device_heap_mmap_before_create_hwctx() {
+        fn step_is_device_heap_mmap(step: &super::CitedIoctlStep) -> bool {
+            // An ioctl row is not the mmap. The recorded step has request 0,
+            // ioctl width 0, no CREATE_HWCTX tile words, and the 64 MiB heap
+            // record (type 2). A list that only has the 28 requests fails.
+            let super::CitedIoctlStep {
+                request,
+                size,
+                num_tiles_offset,
+                num_tiles,
+                device_heap_mmap,
+            } = *step;
+            if request != 0 || size != 0 || num_tiles_offset.is_some() || num_tiles.is_some() {
+                return false;
+            }
+            let Some(record) = device_heap_mmap else {
+                return false;
+            };
+            super::recorded_device_heap_mmap(record)
+        }
+
+        let steps = super::issued_replay_printed_cited_requests();
+        let create_bo_at = steps
+            .iter()
+            .position(|step| step.request == 0xc020_6443)
+            .expect("shipped steps include CREATE_BO 0xc0206443");
+        let get_bo_at = steps
+            .iter()
+            .position(|step| step.request == 0xc030_6444)
+            .expect("shipped steps include GET_BO_INFO 0xc0306444");
+        let create_hwctx_at = steps
+            .iter()
+            .position(|step| step.request == 0xc038_6440)
+            .expect("shipped steps include CREATE_HWCTX 0xc0386440");
+        let heap_mmap_at = steps.iter().position(step_is_device_heap_mmap);
+        let heap_mmap_before = heap_mmap_at.is_some_and(|mmap_at| {
+            create_bo_at < get_bo_at && get_bo_at < mmap_at && mmap_at < create_hwctx_at
+        });
+        assert!(
+            heap_mmap_before,
+            "no device-heap mmap before CREATE_HWCTX (0xc0386440)"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn replay_request_list_stops_after_create_hwctx_when_asked() {
+        // Pure list. This test does not open /dev/accel and does not issue ioctls.
+        const STOP_ENV: &str = "XDNA2_STOP_AFTER_CREATE_HWCTX";
+        struct StopEnvRestore(Option<std::ffi::OsString>);
+        impl Drop for StopEnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: test-only env restore. No device open.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(STOP_ENV, value),
+                        None => std::env::remove_var(STOP_ENV),
+                    }
+                }
+            }
+        }
+        let restore = StopEnvRestore(std::env::var_os(STOP_ENV));
+        // SAFETY: test-only env. No device open.
+        unsafe {
+            std::env::remove_var(STOP_ENV);
+        }
+        let full = super::issued_replay_printed_cited_requests();
+        let full_requests: Vec<u64> = full.iter().map(|step| step.request).collect();
+        assert!(
+            full_requests.contains(&0xc038_6446),
+            "unset env must keep EXEC_CMD 0xc0386446"
+        );
+        let before_hwctx = full
+            .iter()
+            .position(|step| step.request == 0xc038_6440)
+            .expect("full list includes CREATE_HWCTX 0xc0386440");
+        let requests_before: Vec<u64> = full_requests[..before_hwctx].to_vec();
+        assert!(
+            !requests_before.is_empty(),
+            "requests before CREATE_HWCTX must stay"
+        );
+        // SAFETY: test-only env. No device open.
+        unsafe {
+            std::env::set_var(STOP_ENV, "1");
+        }
+        let stopped = super::issued_replay_printed_cited_requests();
+        let stopped_requests: Vec<u64> = stopped.iter().map(|step| step.request).collect();
+        assert!(
+            stopped_requests.contains(&0xc038_6440),
+            "stop was asked but CREATE_HWCTX 0xc0386440 is missing"
+        );
+        assert!(
+            !stopped_requests.contains(&0xc038_6446),
+            "stop was asked but EXEC_CMD 0xc0386446 is still in the shipped list"
+        );
+        assert!(
+            !stopped_requests.contains(&0xc030_64ca),
+            "stop was asked but timeline wait 0xc03064ca is still in the shipped list"
+        );
+        let stopped_hwctx = stopped
+            .iter()
+            .position(|step| step.request == 0xc038_6440)
+            .expect("stopped list includes CREATE_HWCTX 0xc0386440");
+        assert_eq!(
+            &stopped_requests[..stopped_hwctx],
+            requests_before.as_slice(),
+            "requests before CREATE_HWCTX must stay"
+        );
+        assert_eq!(
+            stopped_requests.len(),
+            stopped_hwctx.saturating_add(1),
+            "stop was asked but the list does not end at CREATE_HWCTX 0xc0386440"
+        );
+        drop(restore);
+    }
+
+    #[test]
+    fn exec_wait_issue_2_successor_of_c0386446_is_40106449_and_not_forbidden() {
+        // Shipped replay list and the shipped forbid check. No device open.
+        let steps = super::issued_replay_full_printed_cited_requests();
+        let exec_at = steps
+            .iter()
+            .position(|step| step.request == 0xc038_6446)
+            .expect("shipped list includes EXEC_CMD 0xc0386446");
+        let successor = steps
+            .get(exec_at.saturating_add(1))
+            .map(|step| step.request);
+        assert_eq!(
+            successor,
+            Some(0x4010_6449),
+            "successor of 0xc0386446 must be 0x40106449"
+        );
+        assert!(
+            !super::super::direct::cited_request_is_forbidden(0x4010_6449),
+            "0x40106449 is forbidden"
+        );
+        assert!(
+            super::super::direct::cited_request_is_forbidden(0xc010_6449),
+            "0xc0106449 must stay forbidden"
+        );
+        assert!(
+            super::super::direct::cited_request_is_forbidden(0xc018_6445),
+            "0xc0186445 must stay forbidden"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.request == 0x4010_6449)
+                .count(),
+            1,
+            "0x40106449 must replace one slot, not be inserted beside it"
         );
     }
 
@@ -1086,5 +1497,186 @@ pub(crate) mod tests {
             mlir_aie_ioctl_ask(MlirAieIoctlAsk::AmdxdnaCmdStartNpuOffsets),
             Err(MlirAieIoctlError::UnprovenAmdxdnaCmdStartNpuOffsets)
         ));
+    }
+
+    fn i32_cells_to_le(cells: &[i32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(cells.len().saturating_mul(4));
+        for cell in cells {
+            out.extend_from_slice(&cell.to_le_bytes());
+        }
+        out
+    }
+
+    fn golden_cells_as_f32(cells: &[i32]) -> Vec<f32> {
+        cells
+            .iter()
+            .map(|cell| f32::from_bits(i32_as_f32_bits(*cell).expect("exact i32")))
+            .collect()
+    }
+
+    #[test]
+    fn closed_whole_array_compare_uses_buffers_and_verify_flags() {
+        let golden = [4_i32, 9, 16];
+        let bytes = i32_cells_to_le(&golden);
+        let host_f32 = golden_cells_as_f32(&golden);
+        let device_f32 = golden_cells_as_f32(&golden);
+        let compare_ok = whole_array_output_matches_host(&bytes, &golden);
+        let wired = apply_whole_array_verify_flags(NumericalVerifyInput {
+            host_golden: &host_f32,
+            device_or_candidate: &device_f32,
+            had_instruction_blob: true,
+            submit_wait_ok: true,
+            real_ioctl_path: true,
+            criteria: NumericalVerifyCriteria::default(),
+        });
+        let ran = decide_ran_on_npu(&wired);
+        assert!(
+            compare_ok
+                && wired.had_instruction_blob
+                && wired.submit_wait_ok
+                && wired.real_ioctl_path
+                && ran,
+            "compare_ok={compare_ok} blob={} submit={} ioctl={} ran={ran}; compare discards bytes and the three flags are false",
+            wired.had_instruction_blob,
+            wired.submit_wait_ok,
+            wired.real_ioctl_path,
+        );
+
+        let short = i32_cells_to_le(&[4_i32]);
+        assert!(
+            !whole_array_output_matches_host(&short, &golden),
+            "length mismatch must fail"
+        );
+        let zeros = [0.0_f32, 0.0];
+        let zero_wired = apply_whole_array_verify_flags(NumericalVerifyInput {
+            host_golden: &zeros,
+            device_or_candidate: &zeros,
+            had_instruction_blob: true,
+            submit_wait_ok: true,
+            real_ioctl_path: true,
+            criteria: NumericalVerifyCriteria::default(),
+        });
+        assert!(
+            zero_wired.had_instruction_blob
+                && zero_wired.submit_wait_ok
+                && zero_wired.real_ioctl_path,
+            "all-zero fixture still records the three flags"
+        );
+        assert!(!decide_ran_on_npu(&zero_wired), "all-zero golden must fail");
+        let missing = apply_whole_array_verify_flags(NumericalVerifyInput {
+            host_golden: &host_f32,
+            device_or_candidate: &device_f32,
+            had_instruction_blob: false,
+            submit_wait_ok: true,
+            real_ioctl_path: true,
+            criteria: NumericalVerifyCriteria::default(),
+        });
+        assert!(!missing.had_instruction_blob, "missing blob stays false");
+        assert!(!decide_ran_on_npu(&missing), "missing blob must fail");
+        let no_submit = apply_whole_array_verify_flags(NumericalVerifyInput {
+            host_golden: &host_f32,
+            device_or_candidate: &device_f32,
+            had_instruction_blob: true,
+            submit_wait_ok: false,
+            real_ioctl_path: true,
+            criteria: NumericalVerifyCriteria::default(),
+        });
+        assert!(!no_submit.submit_wait_ok, "failed submit stays false");
+        assert!(!decide_ran_on_npu(&no_submit), "failed submit must fail");
+        let not_real = apply_whole_array_verify_flags(NumericalVerifyInput {
+            host_golden: &host_f32,
+            device_or_candidate: &device_f32,
+            had_instruction_blob: true,
+            submit_wait_ok: true,
+            real_ioctl_path: false,
+            criteria: NumericalVerifyCriteria::default(),
+        });
+        assert!(!not_real.real_ioctl_path, "non-ioctl path stays false");
+        assert!(!decide_ran_on_npu(&not_real), "non-ioctl path must fail");
+    }
+
+    #[test]
+    fn create_hwctx_retry_calls_shipped_function_and_does_not_open_accel() {
+        use std::cell::RefCell;
+        use std::time::Duration;
+
+        fn accel_fd_open_in_this_process() -> bool {
+            let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                if target.to_string_lossy().starts_with("/dev/accel") {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let argument = {
+            let mut bytes = [0u8; 56];
+            bytes[0] = 0x7e;
+            bytes[55] = 0x7e;
+            bytes
+        };
+        let run = |script: &[i32]| {
+            let remaining = RefCell::new(script.to_vec());
+            let seen = RefCell::new(Vec::<Vec<u8>>::new());
+            let sleeps = RefCell::new(Vec::<Duration>::new());
+            let records = super::retry_create_hwctx(
+                &argument,
+                |_index, bytes| {
+                    seen.borrow_mut().push(bytes.to_vec());
+                    let mut left = remaining.borrow_mut();
+                    let next = left.remove(0);
+                    if next == 0 { Ok(()) } else { Err(next) }
+                },
+                |wait| sleeps.borrow_mut().push(wait),
+            );
+            (records, seen.into_inner(), sleeps.into_inner())
+        };
+
+        let (eagain, seen, sleeps) = run(&[11, 11, 11, 11, 11, 22]);
+        assert_eq!(eagain.len(), 5, "at most five CREATE_HWCTX tries");
+        assert!(eagain.iter().all(|row| row.errno == 11));
+        assert_eq!(seen.len(), 5);
+        assert!(seen.iter().all(|bytes| bytes.as_slice() == argument));
+        assert_eq!(sleeps.len(), 4, "sleep only between EAGAIN tries");
+        assert!(
+            sleeps
+                .iter()
+                .all(|wait| *wait == super::CREATE_HWCTX_RETRY_WAIT)
+        );
+        assert_eq!(super::CREATE_HWCTX_RETRY_WAIT, Duration::from_millis(200));
+
+        let (other, seen_other, sleeps_other) = run(&[13]);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].errno, 13);
+        assert_eq!(seen_other.len(), 1);
+        assert!(
+            sleeps_other.is_empty(),
+            "a non-11 errno stops with no sleep"
+        );
+
+        let (early, seen_early, sleeps_early) = run(&[11, 0, 11]);
+        assert_eq!(early.len(), 2);
+        assert_eq!(early[0].errno, 11);
+        assert_eq!(early[1].errno, 0);
+        assert_eq!(seen_early.len(), 2);
+        assert!(seen_early.iter().all(|bytes| bytes.as_slice() == argument));
+        assert_eq!(sleeps_early.len(), 1);
+
+        let (ok, seen_ok, sleeps_ok) = run(&[0]);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].errno, 0);
+        assert_eq!(ok[0].index, 1);
+        assert_eq!(seen_ok.len(), 1);
+        assert!(sleeps_ok.is_empty(), "success stops");
+        assert!(
+            !accel_fd_open_in_this_process(),
+            "this unit test must not open /dev/accel"
+        );
     }
 }

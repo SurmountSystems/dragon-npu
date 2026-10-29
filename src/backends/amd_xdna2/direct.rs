@@ -4337,8 +4337,46 @@ const CITED_WHOLE_ARRAY_WIDTHS: [usize; 28] = [
     56,
 ];
 
+/// Some(200 ms) only for CREATE_HWCTX `0xc0386440` and errno 11, while fewer than five tries were already issued.
+pub fn create_hwctx_eagain_backoff(
+    request: u32,
+    errno: i32,
+    tries_already_issued: u32,
+) -> Option<std::time::Duration> {
+    if request == 0xc038_6440 && errno == 11 && tries_already_issued < 5 {
+        Some(std::time::Duration::from_millis(200))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod create_hwctx_eagain_backoff_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn create_hwctx_eagain_backoff_limits() {
+        assert_eq!(
+            super::create_hwctx_eagain_backoff(0xc038_6440, 11, 4),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(super::create_hwctx_eagain_backoff(0xc038_6440, 11, 5), None);
+        assert_eq!(super::create_hwctx_eagain_backoff(0xc038_6440, 22, 0), None);
+        assert_eq!(super::create_hwctx_eagain_backoff(0, 11, 0), None);
+    }
+}
+
+fn cited_unproven_partition_output_i32_le(mapped: &[u8]) -> Vec<u8> {
+    if mapped.len() == 128 * 128 * 4 {
+        mapped.to_vec()
+    } else {
+        vec![0u8; 128 * 128 * 4]
+    }
+}
+
 /// One device submit of the cited whole-array pair. Fresh kernel handles and
-/// this process's pointers. No retry. Does not parse AIE_PARTITION.
+/// this process's pointers. CREATE_HWCTX backs off on EAGAIN for at most five
+/// tries. Does not parse AIE_PARTITION.
 pub fn send_cited_whole_array_device_once(
     xclbin: &std::path::Path,
     insts: &std::path::Path,
@@ -4366,48 +4404,32 @@ pub fn send_cited_whole_array_device_once(
     replay_printed_cited_requests(&xclbin_bytes, &inst_bytes)
 }
 
+/// False only for WAIT_CMD `0x40106449` and errno 95. Every other pair is true.
+fn cited_ioctl_failure_skips_readback(request: u64, errno: i32) -> bool {
+    !(request == 0x40106449 && errno == 95)
+}
+
+/// False only for EXEC_CMD `0xc0386446` and errno 5. Every other pair is true.
+/// False means do not skip device readback.
+fn cited_exec_eio_failure_skips_readback(request: u64, errno: i32) -> bool {
+    !(request == 0xc038_6446 && errno == 5)
+}
+
 #[allow(unsafe_code)]
 fn replay_printed_cited_requests(
     xclbin: &[u8],
     insts: &[u8],
 ) -> Result<CitedWholeArrayDeviceOut, CitedWholeArrayDeviceError> {
-    // Printed request words from trace28-named-test.log. Index is 1-based.
-    // 4 CREATE_HWCTX 0xc0386440, 7 CONFIG_HWCTX 0xc0186442,
-    // 18 EXEC_CMD 0xc0386446, 19 0xc03064ca, 26 0xc00864c0,
-    // 27 0xc0086441, 28 0x40086409.
+    // Printed request words, plus the device-heap mmap after the first
+    // GET_BO_INFO and before CREATE_HWCTX. The mmap is not an ioctl.
     // Do not send 0x400864c0 or 0x40086441. No SYNC_BO, SET_STATE,
     // WAIT_CMD 0x40106449, or GET_ARRAY unless that word is in this list.
-    const REQUESTS: [u64; 28] = [
-        0xc020_6443,
-        0xc030_6444,
-        0xc010_6447,
-        0xc038_6440,
-        0xc020_6443,
-        0xc030_6444,
-        0xc018_6442,
-        0xc020_6443,
-        0xc030_6444,
-        0xc020_6443,
-        0xc030_6444,
-        0xc020_6443,
-        0xc030_6444,
-        0xc020_6443,
-        0xc030_6444,
-        0xc020_6443,
-        0xc030_6444,
-        0xc038_6446,
-        0xc030_64ca,
-        0x4008_6409,
-        0x4008_6409,
-        0x4008_6409,
-        0x4008_6409,
-        0x4008_6409,
-        0x4008_6409,
-        0xc008_64c0,
-        0xc008_6441,
-        0x4008_6409,
-    ];
-    // Gate was checked by the caller. This path opens and issues REQUESTS.
+    // Only requests in this list are issued. Stop-after-CREATE_HWCTX drops
+    // EXEC_CMD 0xc0386446 and timeline wait 0xc03064ca.
+    let steps = super::mlir_aie_ioctl::replay_request_list(
+        super::mlir_aie_ioctl::stop_after_create_hwctx_asked(),
+    );
+    // Gate was checked by the caller. This path opens and issues `steps`.
     // Do not return EPERM here before open.
     let _xclbin_not_copied_into_type3 = xclbin.len() > CITED_TYPE3_BO_BYTES;
     const DEV: &[u8] = b"/dev/accel/accel0\0";
@@ -4421,15 +4443,37 @@ fn replay_printed_cited_requests(
         });
     }
     let cmd = insts.to_vec();
-    let output = vec![0u8; 128 * 128 * 4];
     let mut hwctx: Option<u32> = None;
     let mut bos: Vec<u32> = Vec::new();
+    let mut c_handle: Option<u32> = None;
+    let mut output: Vec<u8> = Vec::new();
     let mut sync_handles = [0u32; 4];
     let mut sync_points = [0u64; 4];
     cited_replay_reset_bo_words();
-    for (request_index, request) in REQUESTS.into_iter().enumerate() {
+    let mut heap_handle = 0u32;
+    let mut heap_map_offset = 0u64;
+    let mut heap_map: Option<(*mut libc::c_void, usize)> = None;
+    let mut ioctl_ordinal = 0usize;
+    for step in steps {
+        if let Some(record) = step.device_heap_mmap {
+            let mapped = cited_replay_map_device_heap(fd, heap_handle, heap_map_offset, record);
+            match mapped {
+                Ok(mapped_heap) => heap_map = Some(mapped_heap),
+                Err(errno) => {
+                    cited_replay_cleanup(fd, hwctx, &bos, heap_map.take());
+                    return Err(CitedWholeArrayDeviceError {
+                        request: 0xc030_6444,
+                        errno,
+                    });
+                }
+            }
+            continue;
+        }
+        let request = step.request;
+        let request_index = ioctl_ordinal;
+        ioctl_ordinal = ioctl_ordinal.saturating_add(1);
         if cited_request_is_forbidden(request) || request == 0xc010_6448 || request == 0xc018_644a {
-            cited_replay_cleanup(fd, hwctx, &bos);
+            cited_replay_cleanup(fd, hwctx, &bos, heap_map.take());
             return Err(CitedWholeArrayDeviceError {
                 request,
                 errno: libc::EINVAL,
@@ -4461,33 +4505,89 @@ fn replay_printed_cited_requests(
                 arg[..4].copy_from_slice(&handle.to_ne_bytes());
             }
         }
-        let rc = unsafe {
-            libc::ioctl(
-                fd,
-                request as libc::c_ulong,
-                arg.as_mut_ptr().cast::<libc::c_void>(),
-            )
+        let arg_for_issue = arg.clone();
+        if request == CITED_CREATE_HWCTX {
+            // Submitted body, including the qos tail. gops is the first u32
+            // of that tail. Printed from the bytes that ioctl receives.
+            let body = arg_for_issue
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            eprintln!("replay create_hwctx submitted_body {body}");
+        }
+        let mut tries_already_issued = 0u32;
+        let mut fail_errno = 0i32;
+        let rc = loop {
+            arg.copy_from_slice(&arg_for_issue);
+            let rc = unsafe {
+                libc::ioctl(
+                    fd,
+                    request as libc::c_ulong,
+                    arg.as_mut_ptr().cast::<libc::c_void>(),
+                )
+            };
+            tries_already_issued = tries_already_issued.saturating_add(1);
+            if rc < 0 {
+                fail_errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                eprintln!(
+                    "replay ioctl try {tries_already_issued} request {request:#x} errno {fail_errno}"
+                );
+                // One try. Errno 11 on CREATE_HWCTX stops this process.
+                break rc;
+            } else {
+                eprintln!("replay ioctl try {tries_already_issued} request {request:#x} errno 0");
+                break rc;
+            }
         };
         if rc < 0 {
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO);
-            cited_replay_cleanup(fd, hwctx, &bos);
-            return Err(CitedWholeArrayDeviceError { request, errno });
-        }
-        if request == CITED_CREATE_HWCTX && arg.len() >= 4 {
-            let handle = u32::from_ne_bytes([arg[0], arg[1], arg[2], arg[3]]);
-            if handle != 0 && handle != 0x800 && handle != 0x20 {
-                hwctx = Some(handle);
+            if cited_ioctl_failure_skips_readback(request, fail_errno) {
+                cited_replay_cleanup(fd, hwctx, &bos, heap_map.take());
+                return Err(CitedWholeArrayDeviceError {
+                    request,
+                    errno: fail_errno,
+                });
             }
+            // WAIT_CMD errno 95 does not skip device readback. Leave this loop.
+            break;
+        }
+        if request_index == 0 && request == 0xc020_6443 && arg.len() >= 32 {
+            heap_handle = u32::from_ne_bytes([arg[28], arg[29], arg[30], arg[31]]);
+        }
+        if request_index == 1 && request == 0xc030_6444 && arg.len() >= 32 {
+            let mut offset_bytes = [0u8; 8];
+            offset_bytes.copy_from_slice(&arg[24..32]);
+            heap_map_offset = u64::from_ne_bytes(offset_bytes);
+        }
+        if request == CITED_CREATE_HWCTX {
+            hwctx = cited_hwctx_id_from_create_response(&arg);
         } else {
             cited_whole_array_harvest(request, &arg, &mut hwctx, &mut bos, &mut sync_handles);
         }
         if request == 0xc020_6443 && arg.len() >= 32 {
             let handle = u32::from_ne_bytes([arg[28], arg[29], arg[30], arg[31]]);
+            let size = u32::from_le_bytes([
+                arg_for_issue[16],
+                arg_for_issue[17],
+                arg_for_issue[18],
+                arg_for_issue[19],
+            ]);
+            let bo_type = u32::from_le_bytes([
+                arg_for_issue[24],
+                arg_for_issue[25],
+                arg_for_issue[26],
+                arg_for_issue[27],
+            ]);
             cited_replay_note_returned_bo_handle(handle);
             if handle != 0 {
                 bos.push(handle);
+                // C is the 0x0001_0000 type-1 row. Not the 0x0400_0000 heap.
+                // Not either 0x8000 type-1 row.
+                if size == 0x0001_0000 && bo_type == 1 {
+                    c_handle = Some(handle);
+                }
             }
         }
         if request == CITED_GEM_CLOSE && !bos.is_empty() {
@@ -4497,18 +4597,74 @@ fn replay_printed_cited_requests(
             hwctx = None;
         }
     }
-    // 28 requests include GEM_CLOSE and DESTROY_HWCTX. Drop anything still tracked, then close.
-    cited_replay_cleanup(fd, hwctx, &bos);
-    // No device bytes were copied out. Do not return an empty or all-zero buffer.
-    let _ = output;
-    Err(CitedWholeArrayDeviceError {
-        request: CITED_EXEC_CMD,
-        errno: libc::EIO,
+    // Copy C before GEM_CLOSE. One 65536-byte map of that BO, not the heap.
+    if let Some(handle) = c_handle {
+        let submission = RealDirectSubmission::new(fd);
+        if let Ok(mapped) = submission.read_bo_bytes_no_sync(fd, handle, 0, 0x0001_0000) {
+            output = cited_unproven_partition_output_i32_le(&mapped);
+        }
+    }
+    // Requests include GEM_CLOSE and DESTROY_HWCTX. Drop the heap map too.
+    cited_replay_cleanup(fd, hwctx, &bos, heap_map.take());
+    // Post-loop error is EXEC_CMD with EIO, not the wait ioctl.
+    // Errno 5 on that request continues to the caller's device readback.
+    let post_request = CITED_EXEC_CMD;
+    let post_errno = libc::EIO;
+    if cited_exec_eio_failure_skips_readback(post_request, post_errno) {
+        let _ = output;
+        return Err(CitedWholeArrayDeviceError {
+            request: post_request,
+            errno: post_errno,
+        });
+    }
+    Ok(CitedWholeArrayDeviceOut {
+        output_i32_le: output,
     })
 }
 
+/// Map the issued type-2 heap row. Size and align are the record, 64 MiB.
+/// Does not issue SYNC_BO, SET_STATE, WAIT_CMD, or GET_ARRAY.
+fn cited_replay_map_device_heap(
+    fd: libc::c_int,
+    heap_handle: u32,
+    heap_map_offset: u64,
+    record: super::mlir_aie_ioctl::DeviceHeapMmapRecord,
+) -> Result<(*mut libc::c_void, usize), i32> {
+    if heap_handle == 0
+        || record.bo_type != super::mlir_aie_ioctl::AMDXDNA_BO_DEV_HEAP
+        || record.size != AIE2_DEV_HEAP_SIZE
+        || record.align != AIE2_DEV_HEAP_SIZE
+    {
+        return Err(libc::EINVAL);
+    }
+    let Ok(size) = usize::try_from(record.size) else {
+        return Err(libc::EINVAL);
+    };
+    let Ok(align) = usize::try_from(record.align) else {
+        return Err(libc::EINVAL);
+    };
+    match mmap_dev_heap_drm_aligned(fd, heap_map_offset, size, align) {
+        Ok(ptr) => Ok((ptr, size)),
+        Err(_) => Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)),
+    }
+}
+
 #[allow(unsafe_code)]
-fn cited_replay_cleanup(fd: libc::c_int, hwctx: Option<u32>, bos: &[u32]) {
+fn cited_replay_cleanup(
+    fd: libc::c_int,
+    hwctx: Option<u32>,
+    bos: &[u32],
+    heap_map: Option<(*mut libc::c_void, usize)>,
+) {
+    if let Some((ptr, len)) = heap_map {
+        if !ptr.is_null() && len > 0 {
+            unsafe {
+                let _ = libc::munmap(ptr, len);
+            }
+        }
+    }
     if let Some(handle) = hwctx {
         let mut arg = [0u8; 8];
         arg[..4].copy_from_slice(&handle.to_ne_bytes());
@@ -4550,8 +4706,8 @@ fn cited_whole_array_pair_ok(xclbin: &[u8], insts: &[u8]) -> bool {
         && cited_whole_array_sha256_hex(insts) == CITED_INSTS_SHA256
 }
 
-fn cited_request_is_forbidden(request: u64) -> bool {
-    matches!(request, 0x4010_6449 | 0xc010_6449 | 0xc018_6445)
+pub(crate) fn cited_request_is_forbidden(request: u64) -> bool {
+    matches!(request, 0xc010_6449 | 0xc018_6445)
 }
 
 fn index_used(n: usize) -> usize {
@@ -4654,11 +4810,14 @@ fn cited_whole_array_build_arg(
     hwctx: Option<u32>,
 ) -> Vec<u8> {
     // Retained tails travel in the returned arg. Pointer fields name those
-    // bytes, or the caller's xclbin and insts. Request 0 stays 32 bytes.
+    // bytes, or the caller's insts. CREATE_HWCTX qos_p names a 24-byte tail
+    // whose first u32 is gops 0. Request 0 stays 32 bytes.
     let extra: usize = if request == 0xc010_6447 || request == CITED_SYNCOBJ_TIMELINE_WAIT {
         16
     } else if request == CITED_CONFIG_HWCTX {
         0x10
+    } else if request == CITED_CREATE_HWCTX && width >= 0x28 && xclbin.len() == CITED_XCLBIN_LEN {
+        24
     } else {
         0
     };
@@ -4670,8 +4829,17 @@ fn cited_whole_array_build_arg(
         arg[4..8].copy_from_slice(&16u32.to_ne_bytes());
         arg[8..16].copy_from_slice(&ptr.to_ne_bytes());
     }
-    if request == CITED_CREATE_HWCTX && width >= 0x28 && xclbin.len() == CITED_XCLBIN_LEN {
-        let ptr = xclbin.as_ptr() as usize as u64;
+    if request == CITED_CREATE_HWCTX
+        && width >= 0x28
+        && xclbin.len() == CITED_XCLBIN_LEN
+        && extra == 24
+    {
+        // Kernel copies 24 bytes at qos_p. gops is 0. The next five u32
+        // words stay the xclbin prefix. The xclbin file is not edited.
+        let start = width;
+        arg[start..start + 4].copy_from_slice(&0u32.to_ne_bytes());
+        arg[start + 4..start + 24].copy_from_slice(&xclbin[4..24]);
+        let ptr = arg[start..].as_ptr() as usize as u64;
         arg[16..24].copy_from_slice(&ptr.to_ne_bytes());
         arg[0x20..0x24].copy_from_slice(&0x800u32.to_ne_bytes());
         arg[0x24..0x28].copy_from_slice(&0x20u32.to_ne_bytes());
@@ -4681,6 +4849,17 @@ fn cited_whole_array_build_arg(
         arg[32..40].copy_from_slice(&ptr.to_ne_bytes());
         if let Some(handle) = hwctx {
             arg[16..20].copy_from_slice(&handle.to_ne_bytes());
+        }
+        // amdxdna_ctx.c returns EINVAL unless cmd_count at offset 40 is 1.
+        if arg.len() >= 44 {
+            arg[40..44].copy_from_slice(&1u32.to_le_bytes());
+        }
+        // Low 32 bits of cmd_handles. The pending cell is the last CREATE_BO
+        // handle. Zero is AMDXDNA_INVALID_BO_HANDLE and amdxdna_ctx.c returns
+        // -EINVAL for a user submission. Bytes 28..32 stay 0.
+        let cmd_bo = CITED_PENDING_BO_HANDLE.with(|cell| cell.get());
+        if cmd_bo != 0 && arg.len() >= 28 {
+            arg[24..28].copy_from_slice(&cmd_bo.to_le_bytes());
         }
     }
     if request == CITED_SYNCOBJ_TIMELINE_WAIT && width >= 32 && extra == 16 {
@@ -4712,6 +4891,18 @@ fn cited_whole_array_build_arg(
         if let Some(handle) = hwctx {
             arg[0..4].copy_from_slice(&handle.to_ne_bytes());
         }
+        // cu_bo is the DEV GEM noted by the CREATE_BO before this ioctl.
+        // Zero fails drm_gem_object_lookup in aie2_config_cu (-EINVAL).
+        let cu_bo = CITED_PENDING_BO_HANDLE.with(|cell| cell.get());
+        if cu_bo != 0 {
+            let at = start.saturating_add(8);
+            arg[at..at + 4].copy_from_slice(&cu_bo.to_ne_bytes());
+        }
+    }
+    if request == 0x4010_6449 && arg.len() >= 8 {
+        // amdxdna_drm_wait_cmd.timeout. A zero word is an infinite wait.
+        // Finite milliseconds only. Do not write hwctx at 0 or seq at 8.
+        arg[4..8].copy_from_slice(&5_000u32.to_le_bytes());
     }
     cited_replay_fill_bo_words(request, &mut arg, cmd, output, sync_handles);
     arg
@@ -4735,6 +4926,21 @@ fn cited_whole_array_harvest(
     }
     if request == CITED_EXEC_CMD {
         let _ = bos.len();
+    }
+}
+
+/// Id the replay reads from a CREATE_HWCTX response. The replay and the
+/// closed test both call this. Bytes 0..4 are not the handle field.
+/// The id is the little-endian u32 at byte offset 48.
+fn cited_hwctx_id_from_create_response(arg: &[u8]) -> Option<u32> {
+    if arg.len() < 52 {
+        return None;
+    }
+    let handle = u32::from_le_bytes([arg[48], arg[49], arg[50], arg[51]]);
+    if handle != 0 && handle != 0x800 && handle != 0x20 {
+        Some(handle)
+    } else {
+        None
     }
 }
 
@@ -8303,6 +8509,128 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_errno_95_continues_to_device_readback() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        assert!(!cited_ioctl_failure_skips_readback(0x40106449, 95));
+        assert!(cited_ioctl_failure_skips_readback(0x40106449, 22));
+        assert!(cited_ioctl_failure_skips_readback(0xc0386446, 95));
+        println!("device_opened=no");
+    }
+
+    #[test]
+    fn exec_errno_5_continues_to_device_readback() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        assert!(!cited_exec_eio_failure_skips_readback(0xc0386446, 5));
+        assert!(cited_exec_eio_failure_skips_readback(0xc0386446, 22));
+        assert!(cited_exec_eio_failure_skips_readback(0x40106449, 5));
+        assert!(cited_exec_eio_failure_skips_readback(0x40106449, 95));
+        assert!(cited_exec_eio_failure_skips_readback(0xc0206443, 5));
+        println!("device_opened=no");
+    }
+
+    #[test]
+    fn unproven_partition_readback_copies_mapped_output() {
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let mut mapped = vec![0u8; 128 * 128 * 4];
+        mapped[0] = 1;
+        let got = cited_unproven_partition_output_i32_le(&mapped);
+        assert_eq!(
+            got, mapped,
+            "post-replay output is the local zero vec, not the mapped NPU buffer"
+        );
+        println!("device_opened=no");
+    }
+
+    #[test]
+    fn cited_hwctx_id_from_create_response_offset_48_not_bytes_0() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let mut response = vec![0u8; 56];
+        response[48..52].copy_from_slice(&7u32.to_le_bytes());
+        let hwctx = cited_hwctx_id_from_create_response(&response);
+        assert_eq!(
+            hwctx,
+            Some(7),
+            "CREATE_HWCTX id is the little-endian u32 at offset 48, not bytes 0..4"
+        );
+        let request = CITED_CONFIG_HWCTX;
+        assert_eq!(request, 0xc018_6442);
+        let width = ((request >> 16) & 0x3fff) as usize;
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[0u32; 4],
+            &[0u64; 4],
+            hwctx,
+        );
+        assert!(arg.len() >= 4, "CONFIG_HWCTX body length {}", arg.len());
+        assert_eq!(
+            [arg[0], arg[1], arg[2], arg[3]],
+            7u32.to_le_bytes(),
+            "CONFIG_HWCTX bytes 0..4"
+        );
+    }
+
+    #[test]
+    fn cited_config_hwctx_cu_bo_is_the_pending_dev_handle() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        // aie2_config_cu returns -EINVAL when drm_gem_object_lookup misses cu_bo.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        cited_replay_reset_bo_words();
+        cited_replay_note_returned_bo_handle(99);
+        let request = CITED_CONFIG_HWCTX;
+        assert_eq!(request, 0xc018_6442);
+        let width = ((request >> 16) & 0x3fff) as usize;
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[0u32; 4],
+            &[0u64; 4],
+            Some(7),
+        );
+        assert!(
+            arg.len() >= 36,
+            "CONFIG_HWCTX argument length {}",
+            arg.len()
+        );
+        let cu_bo = u32::from_le_bytes(arg[32..36].try_into().expect("cu_bo bytes"));
+        assert_eq!(
+            cu_bo, 99,
+            "CONFIG_CU cu_bo is the pending AMDXDNA_BO_DEV handle, not 0"
+        );
+    }
+
+    #[test]
     fn first_cited_replay_argument_is_not_all_zeros_and_device_stays_closed() {
         // This test does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
         assert!(
@@ -8345,6 +8673,89 @@ mod tests {
             0x0400_0000
         );
         assert_eq!(u32::from_le_bytes([arg[24], arg[25], arg[26], arg[27]]), 2);
+    }
+
+    /// First `u32` at the `qos_p` this crate stored in the CREATE_HWCTX argument.
+    /// That word is what the kernel copies as QoS `gops`. This is not a packer.
+    fn gops_word_named_by_qos_p(arg: &[u8], xclbin: &[u8], qos_p: u64) -> u32 {
+        let xclbin_addr = xclbin.as_ptr() as u64;
+        if xclbin.len() >= 4 && qos_p == xclbin_addr {
+            let bytes: [u8; 4] = xclbin[..4].try_into().expect("xclbin gops bytes");
+            return u32::from_ne_bytes(bytes);
+        }
+        let arg_addr = arg.as_ptr() as u64;
+        if qos_p >= arg_addr {
+            let off = (qos_p - arg_addr) as usize;
+            if off.saturating_add(4) <= arg.len() {
+                let bytes: [u8; 4] = arg[off..off + 4].try_into().expect("arg gops bytes");
+                return u32::from_ne_bytes(bytes);
+            }
+        }
+        panic!(
+            "CREATE_HWCTX qos_p {qos_p:#x} does not name the owned xclbin ({xclbin_addr:#x}) or the returned argument"
+        );
+    }
+
+    #[test]
+    fn create_hwctx_qos_gops_is_zero_not_xclbin_prefix() {
+        // Closed path: build the CREATE_HWCTX request bytes only.
+        // Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/final.xclbin");
+        let insts_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/insts.bin");
+        let closed = send_cited_whole_array_device_once(&xclbin_path, &insts_path);
+        let err = match closed {
+            Err(err) => err,
+            Ok(_) => panic!("default path returned Ok before open"),
+        };
+        assert_eq!(err.request, 0, "refused request");
+        assert_eq!(err.errno, libc::EPERM, "refused errno");
+        let plan_err = super::super::mlir_aie_ioctl::submit_mlir_aie_whole_array_ioctl(
+            &xclbin_path,
+            &insts_path,
+        )
+        .expect_err("plan before open");
+        match plan_err {
+            super::super::mlir_aie_ioctl::MlirAieIoctlError::UnprovenAiePartition { plan } => {
+                assert!(!plan.device_opened, "device was opened");
+            }
+            other => panic!("expected unproven partition, got {other}"),
+        }
+        let xclbin = std::fs::read(&xclbin_path).expect("read xclbin");
+        let insts = std::fs::read(&insts_path).expect("read insts");
+        let request = CITED_CREATE_HWCTX;
+        let width = ((request >> 16) & 0x3fff) as usize;
+        let cmd = insts.clone();
+        let output = vec![0u8; 128 * 128 * 4];
+        let sync_handles = [0u32; 4];
+        let sync_points = [0u64; 4];
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &xclbin,
+            &insts,
+            &cmd,
+            &output,
+            &sync_handles,
+            &sync_points,
+            None,
+        );
+        assert!(
+            arg.len() >= 0x28,
+            "CREATE_HWCTX argument length {}",
+            arg.len()
+        );
+        let qos_p = u64::from_ne_bytes(arg[16..24].try_into().expect("qos_p"));
+        let gops = gops_word_named_by_qos_p(&arg, &xclbin, qos_p);
+        assert_eq!(
+            gops, 0u32,
+            "CREATE_HWCTX qos gops word is {gops:#010x}, expected 0"
+        );
     }
 
     #[test]
@@ -8595,6 +9006,174 @@ mod tests {
             problems.is_empty(),
             "cited replay args are not owned pointers: {problems:?}"
         );
+    }
+
+    #[test]
+    fn exec_field_cmd_count_rejects_zero() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        // Kernel amdxdna_ctx.c:708 returns -EINVAL unless cmd_count at offset 40 is 1.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/final.xclbin");
+        let insts_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/insts.bin");
+        let xclbin = std::fs::read(&xclbin_path).expect("read xclbin");
+        let insts = std::fs::read(&insts_path).expect("read insts");
+        assert_eq!(insts.len(), CITED_INSTS_LEN, "insts length");
+        cited_replay_reset_bo_words();
+        let request = CITED_EXEC_CMD;
+        let width = ((request >> 16) & 0x3fff) as usize;
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &xclbin,
+            &insts,
+            &insts,
+            &insts,
+            &[0u32; 4],
+            &[0u64; 4],
+            Some(1),
+        );
+        assert!(arg.len() >= 44, "EXEC_CMD arg shorter than cmd_count");
+        let cmd_count = u32::from_le_bytes([arg[40], arg[41], arg[42], arg[43]]);
+        println!(
+            "device_opened=no exec_cmd_offset_40_bytes={:02x} {:02x} {:02x} {:02x} cmd_count={cmd_count}",
+            arg[40], arg[41], arg[42], arg[43]
+        );
+        assert_eq!(
+            cmd_count, 1,
+            "cmd_count at offset 40 is {cmd_count}, kernel amdxdna_ctx.c:708 requires 1"
+        );
+    }
+
+    #[test]
+    fn exec_field_2_cmd_handles_rejects_zero() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        // Kernel amdxdna_ctx.c:621 returns -EINVAL when cmd_handles is 0 and drv_cmd is NULL.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/final.xclbin");
+        let insts_path = root.join("testdata/xdna2_cmd/whole_array_128_i16/insts.bin");
+        let xclbin = std::fs::read(&xclbin_path).expect("read xclbin");
+        let insts = std::fs::read(&insts_path).expect("read insts");
+        assert_eq!(insts.len(), CITED_INSTS_LEN, "insts length");
+        cited_replay_reset_bo_words();
+        // Last CREATE_BO before EXEC_CMD is the type-4 command BO. The closed
+        // test plants that handle. The builder must copy it to offset 24.
+        const PLANTED_CMD_BO: u32 = 0xA11C_E010;
+        cited_replay_note_returned_bo_handle(PLANTED_CMD_BO);
+        let request = CITED_EXEC_CMD;
+        let width = ((request >> 16) & 0x3fff) as usize;
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &xclbin,
+            &insts,
+            &insts,
+            &insts,
+            &[0u32; 4],
+            &[0u64; 4],
+            Some(1),
+        );
+        assert!(arg.len() >= 44, "EXEC_CMD arg shorter than cmd_count");
+        let cmd_count = u32::from_le_bytes([arg[40], arg[41], arg[42], arg[43]]);
+        assert_eq!(cmd_count, 1, "cmd_count at offset 40 must stay 1");
+        let cmd_handles = u32::from_le_bytes([arg[24], arg[25], arg[26], arg[27]]);
+        println!(
+            "device_opened=no exec_cmd_offset_24_bytes={:02x} {:02x} {:02x} {:02x} cmd_handles={cmd_handles:#x}",
+            arg[24], arg[25], arg[26], arg[27]
+        );
+        assert_eq!(
+            cmd_handles, PLANTED_CMD_BO,
+            "cmd_handles at offset 24 is {cmd_handles:#x}, kernel amdxdna_ctx.c:621 refuses 0"
+        );
+    }
+
+    #[test]
+    fn exec_wait_timeout_at_offset_4_is_5000() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        // amdxdna_drm_wait_cmd.timeout is the u32 at byte offset 4.
+        // A zero word is an infinite wait. The owed word is little-endian 5000.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let request: u64 = 0x4010_6449;
+        let width = ((request >> 16) & 0x3fff) as usize;
+        assert_eq!(width, 16, "WAIT_CMD size field");
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[0u32; 4],
+            &[0u64; 4],
+            None,
+        );
+        assert!(arg.len() >= 8, "WAIT_CMD argument shorter than timeout");
+        println!(
+            "device_opened=no wait_cmd_offset_4_bytes={:02x} {:02x} {:02x} {:02x}",
+            arg[4], arg[5], arg[6], arg[7]
+        );
+        assert_eq!(
+            [arg[4], arg[5], arg[6], arg[7]],
+            [0x88, 0x13, 0x00, 0x00],
+            "timeout at offset 4 is not yet 88 13 00 00"
+        );
+    }
+
+    #[test]
+    fn exec_wait_4_timeout_at_offset_4_is_finite() {
+        // Closed path. Does not open /dev/accel and does not set XDNA2_ALLOW_EXEC_CMD.
+        // amdxdna_drm_wait_cmd.timeout is the u32 at offset 4. Zero is an infinite
+        // wait (aie4_cmd_wait keeps MAX_SCHEDULE_TIMEOUT). The contract is 5000 ms.
+        assert!(
+            std::env::var_os("XDNA2_ALLOW_EXEC_CMD").is_none(),
+            "XDNA2_ALLOW_EXEC_CMD must stay unset"
+        );
+        assert!(!exec_cmd_is_enabled(), "exec_cmd_is_enabled");
+        let request: u64 = 0x4010_6449;
+        let width = ((request >> 16) & 0x3fff) as usize;
+        assert_eq!(width, 16, "WAIT_CMD size field");
+        let arg = cited_whole_array_build_arg(
+            request,
+            width,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[0u32; 4],
+            &[0u64; 4],
+            None,
+        );
+        assert_eq!(arg.len(), 16, "WAIT_CMD argument length");
+        let timeout = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]);
+        println!(
+            "device_opened=no wait_cmd_offset_4_bytes={:02x} {:02x} {:02x} {:02x} timeout={timeout}",
+            arg[4], arg[5], arg[6], arg[7]
+        );
+        assert_eq!(
+            &arg[4..8],
+            &5_000u32.to_le_bytes(),
+            "timeout at offset 4 is still {:02x} {:02x} {:02x} {:02x}, not 88 13 00 00",
+            arg[4],
+            arg[5],
+            arg[6],
+            arg[7]
+        );
+        assert_eq!(timeout, 5_000, "timeout milliseconds");
+        assert_eq!(&arg[0..4], &[0, 0, 0, 0], "hwctx at offset 0 stays 0");
+        assert_eq!(&arg[8..16], &[0u8; 8], "seq at offset 8 stays 0");
     }
 
     #[test]
